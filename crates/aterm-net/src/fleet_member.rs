@@ -2914,13 +2914,35 @@ pub fn bound_peers(state_dir: &Path) -> Vec<Peer> {
 /// most recently heard first, each address once.
 #[must_use]
 pub fn member_addrs(state_dir: &Path) -> Vec<IpAddr> {
+    member_addrs_with_denied(state_dir, &[], None)
+}
+
+/// [`member_addrs`], omitting any peer whose `node` or `key` is in `denied_nodes` or whose key
+/// `log` holds out.
+#[must_use]
+pub fn member_addrs_with_denied(
+    state_dir: &Path,
+    denied_nodes: &[String],
+    log: Option<&MemberKeys>,
+) -> Vec<IpAddr> {
     if crate::fleet::read_key_file(state_dir).is_err() {
         return Vec::new();
     }
     let own = read_node_id(state_dir).ok().flatten();
     let mut members: Vec<Peer> = bound_peers(state_dir)
         .into_iter()
-        .filter(|peer| peer.node.is_some() && peer.node != own)
+        .filter(|peer| {
+            peer.node.is_some()
+                && peer.node != own
+                && !peer
+                    .node
+                    .as_deref()
+                    .is_some_and(|node| crate::fleet::is_denied_node(node, denied_nodes))
+                && !peer.key.is_some_and(|key| {
+                    crate::fleet::is_denied_key(&key, denied_nodes)
+                        || log.is_some_and(|log| log.holds_out(&key))
+                })
+        })
         .collect();
     members.sort_by_key(|peer| std::cmp::Reverse(peer.seen_ms));
     let mut addrs: Vec<IpAddr> = Vec::new();

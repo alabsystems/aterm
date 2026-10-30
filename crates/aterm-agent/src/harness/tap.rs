@@ -810,11 +810,15 @@ pub fn run_carrying(
 pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd::Command> {
     use std::io::{Seek as _, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt as _;
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let path =
-        std::env::temp_dir().join(format!(".aterm-tap-stdin-{}-{stamp}", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        ".aterm-tap-stdin-{}-{seq}-{stamp}",
+        std::process::id()
+    ));
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

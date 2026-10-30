@@ -834,20 +834,30 @@ impl Build {
             "--no-run",
             "--message-format=json-render-diagnostics",
         ]);
+        let claim = crate::util::claim_build(&args, None, &crate::paths::paths().repo)
+            .map_err(|e| Fail::die(format!("the benches' build: {e}")))?;
         let started = Instant::now();
         // Its own process group: a lane that ends early stops the whole build ([`Drop`]).
-        let mut child = crate::util::targo(&args)
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| Fail::die(format!("targo: {e}")))?;
+        let (mut child, metered) = crate::util::spawn_claimed(
+            crate::util::targo(&args)
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(out))
+                .stderr(Stdio::inherit()),
+            claim,
+        )
+        .map_err(|e| Fail::die(format!("targo: {e}")))?;
         let pgid = child.id();
         let waiter = std::thread::spawn(move || {
-            child
-                .wait()
-                .map(|status| (status, started.elapsed()))
+            let ended = child.wait_with_rusage();
+            if let Some(m) = metered {
+                match &ended {
+                    Ok(u) => m.end(u.status.success(), u.maxrss),
+                    Err(_) => m.end(false, 0),
+                }
+            }
+            ended
+                .map(|u| (u.status, started.elapsed()))
                 .map_err(|e| format!("targo: {e}"))
         });
         Ok(Build {

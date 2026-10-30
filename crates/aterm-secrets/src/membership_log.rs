@@ -37,6 +37,7 @@ use crate::{Error, Result};
 use aterm_digest::Sha256;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub mod admission;
 pub mod entries;
@@ -47,7 +48,7 @@ pub mod store;
 pub use admission::{Gap, Signer, admission_audiences};
 pub use astream_wire::sync::MAX_PARENTS;
 pub use entries::{CommonsEpochView, OpenedAudienceEntries, OpenedEntries, epoch_commitment};
-pub use eval::{Member, Membership, NodeStanding, Quorum, Removal};
+pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
 pub use genesis::Proof;
 pub use store::{MAX_RECORDS_STREAM, Store, decode_records, encode_records};
 
@@ -444,13 +445,15 @@ impl Draft {
     }
 }
 
-/// One signed record of the membership log.
+/// One signed record of the membership log. A copy shares the record's parts rather than copying
+/// them: a copy of a [`Store`] copies no record's bytes, so a server that copies its store to
+/// try a POST against it (`server::post_records`) copies none of them, however large its store.
 #[derive(Clone, Debug)]
 pub struct Record {
     id: RecordId,
-    header: Header,
-    body: Body,
-    wire: Vec<u8>,
+    header: Arc<Header>,
+    body: Arc<Body>,
+    wire: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -580,9 +583,9 @@ impl Record {
             .map_err(|_| Error::new("membership record signature failed"))?;
         Ok(Self {
             id: Sha256::digest(wire),
-            header,
-            body,
-            wire: wire.to_vec(),
+            header: Arc::new(header),
+            body: Arc::new(body),
+            wire: Arc::from(wire),
         })
     }
 
@@ -595,19 +598,19 @@ impl Record {
         &self.wire
     }
     /// What the record does.
-    pub const fn kind(&self) -> Kind {
+    pub fn kind(&self) -> Kind {
         self.header.kind
     }
     /// What the record says.
-    pub const fn body(&self) -> &Body {
+    pub fn body(&self) -> &Body {
         &self.body
     }
     /// The network it belongs to; all zero for a genesis, whose own id is the network's.
-    pub const fn network(&self) -> &RecordId {
+    pub fn network(&self) -> &RecordId {
         &self.header.network
     }
     /// The network's genesis id: [`Record::id`] for a genesis, else [`Record::network`].
-    pub const fn network_id(&self) -> &RecordId {
+    pub fn network_id(&self) -> &RecordId {
         match self.header.kind {
             Kind::Genesis => &self.id,
             _ => &self.header.network,
@@ -639,15 +642,15 @@ impl Record {
         Ok(reader.at)
     }
     /// The signing member; all zero for a genesis.
-    pub const fn actor(&self) -> &MemberId {
+    pub fn actor(&self) -> &MemberId {
         &self.header.actor
     }
     /// The signer's sequence.
-    pub const fn sequence(&self) -> u64 {
+    pub fn sequence(&self) -> u64 {
         self.header.sequence
     }
     /// The signer's previous record.
-    pub const fn previous(&self) -> Option<&RecordId> {
+    pub fn previous(&self) -> Option<&RecordId> {
         self.header.previous.as_ref()
     }
     /// The records it follows, sorted.
@@ -655,7 +658,7 @@ impl Record {
         &self.header.parents
     }
     /// The signer's claimed wall clock, in UTC milliseconds.
-    pub const fn authored_ms(&self) -> u64 {
+    pub fn authored_ms(&self) -> u64 {
         self.header.authored_ms
     }
     /// The replication header astream's causal index takes (`astream_wire::sync::Index`).
@@ -1273,6 +1276,11 @@ impl Log {
     pub fn get(&self, id: &RecordId) -> Option<&Record> {
         self.held.get(id).map(|at| &self.order[*at])
     }
+    /// The topological index of a held record (`0` for the genesis, each record after its parents).
+    #[must_use]
+    pub fn record_index(&self, id: &RecordId) -> Option<usize> {
+        self.held.get(id).copied()
+    }
     /// Every held record, each after its parents.
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.order.iter()
@@ -1529,6 +1537,36 @@ impl Log {
     )]
     pub fn membership(&self) -> Membership {
         eval::evaluate(&self.order)
+    }
+
+    /// The cutoff of the quorum `Remove` of `actor` that F16's "Undo <actor>'s removals" row
+    /// signs a share of (§3.2, §3.3.7): `actor`'s last record before its first contested act, an
+    /// `Admit` or a `Remove` of another Mac that no independent Mac built on before it saw a later
+    /// act, else the record that let `actor` in. A Mac `actor`'s `Admit`s let in, directly or
+    /// through Macs those let in, is not independent, and a record that removes `actor` or follows
+    /// a removal of it contests rather than builds on. Where the Macs `actor` removed after that
+    /// cutoff could not make the quorum there, the acknowledgments at its highest acts are set
+    /// aside until they can, so a Mac left in to carry on and then removed never strands the lab.
+    /// Every honest Mac that holds the same records computes the same one, so their shares make
+    /// one quorum, and `Admit`s `actor` made where nobody saw them fall after it, so those Macs
+    /// never vote. `None` where `actor` has no contested act or no entry in this log.
+    #[must_use]
+    pub fn undo_cutoff(&self, actor: &MemberId) -> Option<RecordId> {
+        eval::undo_cutoff(&self.order, actor)
+    }
+
+    /// Where the quorum `Remove` of `actor` at [`Log::undo_cutoff`] stands: its voters, the
+    /// voters whose share this log holds, and whether it took effect. `None` where there is no
+    /// such cutoff.
+    #[must_use]
+    pub fn undo(&self, actor: &MemberId) -> Option<Undo> {
+        let mut undo = eval::undo(&self.order, actor)?;
+        undo.took_effect = self
+            .membership()
+            .quorums()
+            .iter()
+            .any(|q| q.member == *actor && q.cutoff == undo.cutoff);
+        Some(undo)
     }
 
     /// Return the minimal topologically ordered causal ancestor subgraph ending at `target`

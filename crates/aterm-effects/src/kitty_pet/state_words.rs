@@ -54,6 +54,17 @@ impl PetBrain {
             pair,
         );
         w.opt("pet.retired_flight_lift", self.retired_flight_lift, pair);
+        w.f32("pet.sink", self.sink);
+        w.f32("pet.sink_from", self.sink_from);
+        w.f32("pet.sink_to", self.sink_to);
+        w.f64("pet.sink_since", self.sink_since);
+        w.f32("pet.fit", self.fit);
+        w.f32("pet.fit_from", self.fit_from);
+        w.f32("pet.fit_to", self.fit_to);
+        w.opt("pet.sink_seat", self.sink_seat, |f, (at, over)| {
+            pair(f, at);
+            pair(f, over);
+        });
         w.f32("pet.land_t", self.land_t);
         w.flag("pet.hop_crouch", self.hop_crouch);
         w.f32("pet.coil_d", self.coil_d);
@@ -84,6 +95,7 @@ impl PetBrain {
             f.f32("run_cells", self.run_cells);
             f.f32("run_secs", self.run_secs);
             f.f32("run_step", self.run_step);
+            f.put("wide_steps", u64::from(self.wide_steps));
             f.f32("key_beat", self.key_beat);
             f.f32("key_pace", self.key_pace);
         });
@@ -658,7 +670,7 @@ mod tests {
         use super::super::PetMoteKind;
         let t0 = Instant::now();
         let base = words(&PetBrain::new(), t0);
-        let cases: [Case; 27] = [
+        let cases: [Case; 30] = [
             ("the surface", |p, _| p.surface = Some((7, true))),
             ("a held stand", |p, _| {
                 p.held_stash[1] = Some(HeldStand {
@@ -755,6 +767,12 @@ mod tests {
                     beneath: None,
                 });
             }),
+            ("the head law's sink", |p, _| {
+                p.sink_to = 0.78;
+                p.sink_seat = Some(((4.0, 5.0), (4.0, 7.5)));
+            }),
+            ("the head law's fit", |p, _| p.fit_to = 0.54),
+            ("the run's wide steps", |p, _| p.wide_steps = 2),
         ];
         for (what, set) in cases {
             let mut pet = PetBrain::new();

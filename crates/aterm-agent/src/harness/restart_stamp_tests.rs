@@ -257,6 +257,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };

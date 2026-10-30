@@ -65,7 +65,10 @@ impl Admin {
             }
             if let Some(reference) = &preparation.secret {
                 if reference.vault != self.config.name
-                    || Some(reference.signer) != self.config.signer
+                    || self.config.signer.is_none()
+                    || (self.config.signer != Some(reference.signer)
+                        && !self.config.followed.contains(&reference.signer)
+                        && self.custodian_signer().ok() != Some(reference.signer))
                 {
                     return Err(Error::new("account secret belongs to another vault"));
                 }

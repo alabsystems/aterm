@@ -16,7 +16,7 @@ use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 use crate::checks::Check;
 use crate::ladder::Report;
-use crate::memory::Book;
+use crate::memory::{Book, StageKey as _};
 use crate::plan::{StageId, StageSpec};
 use crate::{Ctx, EnvSnapshot, Scope, Seams, Show};
 
@@ -51,7 +51,7 @@ fn gui() -> Scope {
 }
 
 /// Keep `gib` GiB in `book` as stage `id`'s peak in a run over [`gui`] rooted at `root`
-/// ([`crate::memory::Key::of_run`]).
+/// ([`crate::memory::StageKey::of_run`]).
 fn keep(book: &Book, root: &Path, id: StageId, gib: u64) {
     let spec = crate::plan::declared(&gui())
         .into_iter()
@@ -255,6 +255,111 @@ fn a_stage_claims_its_memory_before_it_starts_and_holds_it_until_it_ends() {
     assert!(seen.asked.is_empty(), "{seen:?}");
     assert!(looked(&seen).is_empty(), "{seen:?}");
     assert!(!log.contains("memory: claimed"), "{log}");
+}
+
+static COVERS: Scratch = Scratch::new();
+
+/// What one stage of [`COVERS`]'s runs saw: its title, whether each claim held as it ran covers
+/// its tree's builds, the cover marker its children are handed over the run's ([`memory::cover`])
+/// with the claim it names then (its `what`), and the run's own.
+type CoverSeen = (
+    String,
+    Vec<bool>,
+    Option<(String, Option<String>)>,
+    Option<String>,
+);
+
+/// What each stage of [`COVERS`]'s runs saw ([`CoverSeen`]).
+static COVERS_SEEN: Mutex<Vec<CoverSeen>> = Mutex::new(Vec::new());
+
+fn covers_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
+    COVERS.admit(need, mode)
+}
+
+fn covers_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
+    let records: Vec<_> = COVERS
+        .ledger()
+        .list()
+        .expect("the ledger")
+        .into_iter()
+        .filter(|r| r.held.is_some())
+        .collect();
+    let held = records.iter().map(|r| r.need.covers).collect();
+    let stage = crate::memory::cover().map(|m| {
+        let named = records
+            .iter()
+            .find(|r| r.cover_marker() == *m)
+            .map(|r| r.need.what.clone());
+        (m.to_string(), named)
+    });
+    let run = ctx
+        .child_env_add
+        .iter()
+        .find(|(k, _)| k == aterm_capacity::COVER_ENV)
+        .map(|(_, v)| v.to_string_lossy().into_owned());
+    COVERS_SEEN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((spec.title.clone(), held, stage, run));
+    COVERS.stage(spec)
+}
+
+/// A stage's memory claim asks to cover the builds its children start (BUILD-ADMIT): the lint's
+/// claim, held as it runs, asked to cover its tree, and the lint's children are handed that
+/// claim's own cover marker, so a build its test runs is covered by it alone, never by another
+/// stage's (`aterm_capacity::covering` reads both; its coverage tests hold what they cover); the
+/// run's other children are handed `NO_COVER`, and a stage that claimed nothing none of its
+/// own. NEGATIVE CONTROL: a run measuring no memory hands its children no marker and holds no
+/// claim.
+#[test]
+fn a_stages_memory_claim_covers_the_builds_its_children_start() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    COVERS
+        .ledger
+        .set(dir.path().join("ledger"))
+        .expect("set once");
+    let seams = Seams {
+        stage: covers_stage,
+        admit_quiet: covers_admit,
+        admit_memory: covers_admit,
+    };
+    let (code, log) = run(dir.path(), Some(book(dir.path())), Admit::Wait, seams);
+    assert_eq!(code, crate::exit::PASS, "{log}");
+    let seen = std::mem::take(&mut *COVERS_SEEN.lock().unwrap_or_else(PoisonError::into_inner));
+    let lint = seen
+        .iter()
+        .find(|(title, ..)| title.starts_with("tippy lint"))
+        .expect("the lint ran");
+    assert_eq!(lint.1, [true], "{seen:?}");
+    let (marker, named) = lint.2.as_ref().expect("the lint's own marker");
+    assert_eq!(
+        named.as_deref(),
+        Some(format!("verify {}", lint.0).as_str()),
+        "{seen:?}"
+    );
+    assert_eq!(
+        aterm_capacity::Record::marker_holder(marker),
+        Some(std::process::id())
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, _, _, run)| run.as_deref() == Some(aterm_capacity::NO_COVER)),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .filter(|(_, held, ..)| held.is_empty())
+            .all(|(_, _, stage, _)| stage.is_none()),
+        "a stage that claimed nothing has no marker of its own: {seen:?}"
+    );
+    let (code, log) = run(dir.path(), None, Admit::Wait, seams);
+    assert_eq!(code, crate::exit::PASS, "{log}");
+    let seen = std::mem::take(&mut *COVERS_SEEN.lock().unwrap_or_else(PoisonError::into_inner));
+    assert!(
+        seen.iter()
+            .all(|(_, held, stage, run)| held.is_empty() && stage.is_none() && run.is_none()),
+        "{seen:?}"
+    );
 }
 
 static NEVER: Scratch = Scratch::new();

@@ -187,9 +187,9 @@ impl<K: Ord> CausalCut<K> {
         self.frontiers.is_empty()
     }
 
-    /// Iterate over `(stream, frontier)` pairs in ascending `K` order.
-    pub fn iter(&self) -> impl Iterator<Item = (&K, Offset)> {
-        self.frontiers.iter().map(|(k, &v)| (k, v))
+    /// Iterate over `(stream, &frontier)` pairs in ascending `K` order.
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, K, Offset> {
+        self.frontiers.iter()
     }
 
     /// True iff `self` includes every frontier in `other` (`∀ (k, off) ∈ other,

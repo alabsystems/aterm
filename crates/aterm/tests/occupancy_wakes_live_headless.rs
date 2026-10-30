@@ -72,12 +72,18 @@ fn a_tabs_own_tree_books_a_wake_and_a_client_outside_it_is_refused() {
     let aterm = aterm.display();
     let declared = inst.tmp.join("wake.out");
     let listed = inst.tmp.join("waits.out");
+    // The instance serves: each request's accept waits the hang detector, not the 10 s cap.
+    let accept = format!(
+        "{}={}",
+        aterm_ctl::ACCEPT_WITHIN_SEAM,
+        MUST_HAPPEN.as_millis()
+    );
     type_line(
         &inst,
         &sid,
         &format!(
-            "/bin/sh -c \"'{aterm}' ctl @self wake label=lunch when=in:1h \
-             >'{}' 2>&1; '{aterm}' ctl @self waits >'{}.part' 2>&1; \
+            "/bin/sh -c \"{accept} '{aterm}' ctl @self wake label=lunch when=in:1h \
+             >'{}' 2>&1; {accept} '{aterm}' ctl @self waits >'{}.part' 2>&1; \
              mv '{}.part' '{}'; read -r x\"",
             declared.display(),
             listed.display(),

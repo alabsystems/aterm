@@ -743,6 +743,10 @@ fn every_phase_survives_the_state_file() {
             hold_seen_s: 1_790_000_120,
             proc_start: "Mon Sep 21 11:59:00 2026".to_string(),
             own_work_at: 1_790_000_030,
+            own_since: 1_789_996_000,
+            tells: 2,
+            told_at: 1_790_000_010,
+            told_to: "2.1.283".to_string(),
             waits: vec![WaitNote {
                 at: 1_790_000_030,
                 word: "background".to_string(),
@@ -2577,6 +2581,7 @@ fn drive(dir: &Path) -> Opts {
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     }
@@ -2878,8 +2883,9 @@ fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_
         "7 s-g - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-\n",
         "8 s-h - live autopilot=off meta=1 window=1 supervisor=- autopilot=cruise upgrade=-",
     );
+    // Each fake answers: its roster read waits the hang detector, not the 2 s claims wait.
     let (mut c, server) = fake_tab(vec![ROSTER]);
-    let aside = roster_aside(&mut c, &[]);
+    let aside = roster_aside_within(&mut c, &[], aterm_spec::wait::MUST_HAPPEN);
     drop(c);
     assert_eq!(
         aside,
@@ -2892,7 +2898,11 @@ fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_
     );
     assert_eq!(server.join().expect("server"), vec!["sessions"]);
     let (mut c, _) = fake_tab(vec!["ERR denied"]);
-    assert_eq!(roster_aside(&mut c, &[]), None, "no roster");
+    assert_eq!(
+        roster_aside_within(&mut c, &[], aterm_spec::wait::MUST_HAPPEN),
+        None,
+        "no roster"
+    );
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -2918,7 +2928,7 @@ fn the_aside_of_every_instance_is_one() {
     )]);
     let (refused, _) = fake_tab(vec!["ERR denied"]);
     assert_eq!(
-        aside_of([a, refused, b], &[]),
+        aside_of_within([a, refused, b], &[], aterm_spec::wait::MUST_HAPPEN),
         Aside {
             claimed: ["s-a", "s-b"].map(str::to_string).into(),
             off: ["s-o"].map(str::to_string).into(),
@@ -2940,10 +2950,18 @@ fn a_switched_off_agents_tab_is_set_aside_as_its_switchs_on_status() {
         )])
         .0
     };
-    let aside = aside_of([roster()], &[aterm_phase::Program::Codex]);
+    let aside = aside_of_within(
+        [roster()],
+        &[aterm_phase::Program::Codex],
+        aterm_spec::wait::MUST_HAPPEN,
+    );
     assert_eq!(aside.agent_off, ["s-x"].map(str::to_string).into());
     assert_eq!(aside.off, ["s-c", "s-x"].map(str::to_string).into());
-    assert!(aside_of([roster()], &[]).agent_off.is_empty());
+    assert!(
+        aside_of_within([roster()], &[], aterm_spec::wait::MUST_HAPPEN)
+            .agent_off
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]
@@ -7929,11 +7947,58 @@ fn the_upgrade_owns_turn_ends_only_while_its_step_says_so() {
     }
 }
 
+/// How long the agent's own work has held the round ([`St::own_since`]): from the first look that
+/// finds it so, through every own-work wait and a tell, until a person or a limit holds it.
+#[test]
+fn the_own_work_hold_runs_from_its_first_look_until_a_person_or_a_limit() {
+    let mut st = St::default();
+    for (word, at, since) in [
+        ("background", 100, 100),
+        ("not-idle:busy", 200, 100),
+        ("status-stale", 250, 100),
+        ("background", 300, 100),
+        ("box", 400, 0),
+        ("background", 500, 500),
+        ("limited", 600, 0),
+        ("background-terminal", 700, 700),
+        ("attended", 800, 0),
+        ("no-shell-integration", 850, 0),
+    ] {
+        st.note_wait(word, at);
+        assert_eq!(st.own_since, since, "{word} at {at}");
+    }
+    st.note_step("told:background", "busy", 900);
+    assert_eq!(
+        (st.wait.as_str(), st.own_since),
+        ("background", 900),
+        "a tell is a look its work holds"
+    );
+    st.note_step("told:background", "busy", 950);
+    assert_eq!(st.wait_since, 900, "the same wait, unbroken");
+}
+
 /// Under the quiet flow a wait on the agent's own work owns no turn end and bounds none
 /// ([`owns_turn_ends_as`], [`bounded_wait_as`]).
 #[test]
 fn a_quiet_wait_on_the_agents_work_owns_no_turn_end() {
     const GRACE: u32 = 120;
+    let told = "told:background";
+    for quiet in [true, false] {
+        assert!(
+            !owns_turn_ends_as(told, 0, GRACE, quiet),
+            "a tell owns no turn end"
+        );
+    }
+    assert!(typed(told) && moved(told), "a tell is a typed turn");
+    assert_eq!(
+        host_turn(told),
+        Some(crate::supervise::policy::turn_end::HostTurn::Fact),
+        "and a fact's: its answer is no done report"
+    );
+    assert!(
+        matches!(after(told, 0), After::Later(_)),
+        "looked at again later"
+    );
     let drain = "wait:background";
     assert!(!owns_turn_ends_as(drain, 0, GRACE, true));
     assert!(!bounded_wait_as(drain, true));
@@ -19924,6 +19989,8 @@ fn an_age_belongs_to_one_process() {
         streak_why: upgrade::GAVE_UP.to_string(),
         stop_streak: 3,
         own_work_at: 80,
+        own_since: 70,
+        tells: 1,
         ..minted("2.1.274", "A", Phase::Failed(upgrade::GAVE_UP.to_string()))
     };
     let next = St::for_target(Some(of_a), &from, &target, None, proc("B"), 900);
@@ -19937,6 +20004,11 @@ fn an_age_belongs_to_one_process() {
         ),
         (Phase::Pending, 900, 0, 0, 0),
         "another process starts afresh"
+    );
+    assert_eq!(
+        (next.own_since, next.tells),
+        (0, 0),
+        "its hold and tells too"
     );
     assert_eq!(next.proc_start, "B");
 }
@@ -19960,6 +20032,10 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         streak_why: upgrade::GAVE_UP.to_string(),
         stop_streak: 2,
         own_work_at: 700,
+        own_since: 640,
+        tells: 1,
+        told_at: 700,
+        told_to: "2.1.284".to_string(),
         waits: vec![WaitNote {
             at: 650,
             word: "background".to_string(),
@@ -19983,6 +20059,11 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         (next.streak_why.as_str(), next.stop_streak, next.own_work_at),
         (upgrade::GAVE_UP, 2, 700),
         "and the rounds it answered not yet"
+    );
+    assert_eq!(
+        (next.own_since, next.tells, next.told_to.as_str()),
+        (640, 1, "2.1.284"),
+        "and how long its own work has held it, the tell naming the build it told"
     );
     assert_eq!(next.waits.len(), 1, "and why it has waited");
     let refused = St {
@@ -21195,6 +21276,289 @@ fn a_quiet_pending_round_types_the_release_it_owes_where_work_holds_its_restart(
         );
         assert!(h.typed().is_empty(), "{name}: {:?}", h.typed());
     }
+}
+
+/// A quiet round the agent's own work has held past [`upgrade::OWN_TELL_S`] at the land rung, in a
+/// session its autopilot carries: at a break, one line tells the agent what waits; nothing it
+/// runs is signalled; and nothing more is typed within [`upgrade::RETELL_S`], each look reading
+/// the record back from disk.
+#[cfg(unix)]
+#[test]
+fn a_quiet_round_held_by_its_own_work_tells_the_agent_once_and_ends_nothing() {
+    let held = || St {
+        tab: TAB.to_string(),
+        pending_since: now_s() - upgrade::RUNG_LAND_S - 60,
+        own_since: now_s() - upgrade::OWN_TELL_S - 60,
+        ..unsettled()
+    };
+    let rig = |name: &str, tell: Tell, st: St, answers: Answers| {
+        let mut h = quietly(|| Parked::new(name, answers, st, 3600));
+        set_status(&mut h, "shell");
+        h.opts.background = true;
+        h.opts.tell = tell;
+        h
+    };
+    let mut h = rig("quiet-told", Tell::Verb, held(), Answers::default());
+    let shells = shells_under(&h);
+    assert_eq!(
+        h.visit_with(dead_pid(), &shells).step,
+        "told:background",
+        "typed: {:?}",
+        h.typed()
+    );
+    let typed = h.typed();
+    assert_eq!(typed.len(), 1, "{typed:?}");
+    for part in [
+        upgrade::TELL_HEAD.trim_end(),
+        "9.9.9 is installed",
+        "runs 1.0.0",
+        "aterm ctl @self restart",
+    ] {
+        assert!(typed[0].contains(part), "{part}: {typed:?}");
+    }
+    assert!(
+        h.agent
+            .as_mut()
+            .is_some_and(|a| a.try_wait().is_ok_and(|ended| ended.is_none())),
+        "nothing it runs is ended"
+    );
+    let kept = load(&h.opts, SESSION).expect("state");
+    assert_eq!(kept.phase, Phase::Pending, "{kept:?}");
+    assert_eq!(
+        (kept.tells, kept.told_to.as_str()),
+        (1, "9.9.9"),
+        "{kept:?}"
+    );
+    assert_eq!(kept.wait, "background", "{kept:?}");
+    assert_eq!(kept.held_by.len(), 2, "who holds it stays named: {kept:?}");
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:background");
+    assert_eq!(h.typed().len(), 1, "once within the rest");
+    drop(h);
+
+    let h = rig("quiet-told-fact", Tell::Fact, held(), Answers::default());
+    let shells = shells_under(&h);
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "told:background");
+    let typed = h.typed();
+    assert!(
+        typed.len() == 1 && !typed[0].contains("aterm ctl"),
+        "no verb where the tab offers none: {typed:?}"
+    );
+    drop(h);
+
+    let retargeted = |ago: u64| St {
+        tells: upgrade::MAX_TELLS,
+        told_at: now_s() - ago,
+        told_to: "8.8.8".to_string(),
+        ..held()
+    };
+    let h = rig(
+        "quiet-told-anew",
+        Tell::Fact,
+        retargeted(upgrade::RETELL_S + 60),
+        Answers::default(),
+    );
+    let shells = shells_under(&h);
+    assert_eq!(
+        h.visit_with(dead_pid(), &shells).step,
+        "told:background",
+        "a new target is told anew"
+    );
+    assert_eq!(load(&h.opts, SESSION).expect("state").tells, 1);
+    drop(h);
+    let h = rig(
+        "quiet-told-anew-resting",
+        Tell::Fact,
+        retargeted(60),
+        Answers::default(),
+    );
+    let shells = shells_under(&h);
+    assert_eq!(
+        h.visit_with(dead_pid(), &shells).step,
+        "wait:background",
+        "the rest runs from a tell about the build before"
+    );
+    assert!(h.typed().is_empty(), "{:?}", h.typed());
+    drop(h);
+
+    let quiet_for = |name: &str, tell: Tell, st: St, dry: bool| {
+        let mut h = rig(name, tell, st, Answers::default());
+        h.opts.dry_run = dry;
+        let shells = shells_under(&h);
+        let step = h.visit_with(dead_pid(), &shells).step;
+        (step, h.typed())
+    };
+    for (name, tell, st, dry) in [
+        ("quiet-tell-off", Tell::Off, held(), false),
+        ("quiet-tell-viewed", Tell::Verb, held(), true),
+        (
+            "quiet-tell-early",
+            Tell::Verb,
+            St {
+                own_since: now_s() - upgrade::OWN_TELL_S + 60,
+                ..held()
+            },
+            false,
+        ),
+        (
+            "quiet-tell-resting",
+            Tell::Verb,
+            St {
+                tells: 1,
+                told_at: now_s() - 60,
+                told_to: "9.9.9".to_string(),
+                ..held()
+            },
+            false,
+        ),
+        (
+            "quiet-tell-capped",
+            Tell::Verb,
+            St {
+                tells: upgrade::MAX_TELLS,
+                told_at: now_s() - upgrade::RETELL_S - 60,
+                told_to: "9.9.9".to_string(),
+                ..held()
+            },
+            false,
+        ),
+    ] {
+        let (step, typed) = quiet_for(name, tell, st, dry);
+        assert_eq!(step, "wait:background", "{name}");
+        assert!(typed.is_empty(), "{name}: {typed:?}");
+    }
+
+    let h = rig("quiet-tell-owes", Tell::Verb, held(), Answers::default());
+    let owed = St {
+        release: "retargeted".to_string(),
+        notice_pid: h.sf.pid,
+        notice_start: squash(&h.sf.proc_start),
+        asked: vec!["ATERM-UPGRADE-READY-0badf00d".to_string()],
+        ..held()
+    };
+    std::fs::write(state_path(&h.opts, SESSION), owed.to_json()).expect("state");
+    let shells = shells_under(&h);
+    assert_eq!(
+        h.visit_with(dead_pid(), &shells).step,
+        "released:retargeted",
+        "a release owed goes first"
+    );
+    let typed = h.typed();
+    assert!(
+        typed.len() == 1
+            && typed[0].contains(upgrade::RELEASE_HEAD.trim_end())
+            && !typed[0].contains(upgrade::TELL_HEAD.trim_end()),
+        "{typed:?}"
+    );
+    drop(h);
+
+    let skipped = Answers {
+        turn: vec!["OK 0 turn skipped reason=changed submitted=0 seq=78 id=1"],
+        ..Answers::default()
+    };
+    let h = rig("quiet-tell-refused", Tell::Verb, held(), skipped);
+    let shells = shells_under(&h);
+    let step = h.visit_with(dead_pid(), &shells).step;
+    assert!(step.starts_with("wait:"), "{step}");
+    assert_eq!(
+        load(&h.opts, SESSION).expect("state").tells,
+        0,
+        "a line the host typed none of is not spent"
+    );
+    drop(h);
+
+    // A reply that comes back after the keys went (the whole line typed, its submit refused)
+    // keeps the count spent: the line is not typed again within the rest.
+    let lost = Answers {
+        turn: vec!["ERR key delivery failed sink=busy"],
+        ..Answers::default()
+    };
+    let h = rig("quiet-tell-lost", Tell::Verb, held(), lost);
+    let shells = shells_under(&h);
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:ERR-key");
+    let kept = load(&h.opts, SESSION).expect("state");
+    assert_eq!(
+        (kept.tells, kept.told_to.as_str()),
+        (1, "9.9.9"),
+        "{kept:?}"
+    );
+    let typed = h.typed().len();
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:background");
+    assert_eq!(h.typed().len(), typed, "not typed again within the rest");
+    drop(h);
+
+    // A person's key within their grace (a minute ago: past the land rung's keys gap, which the
+    // move waits on alone) holds the line, and restarts the hold.
+    let near = Answers {
+        screen: idle_screen().replace(r#""human_ms":null"#, r#""human_ms":60000"#),
+        ..Answers::default()
+    };
+    let h = rig("quiet-tell-near", Tell::Verb, held(), near);
+    let shells = shells_under(&h);
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:background");
+    assert!(h.typed().is_empty(), "{:?}", h.typed());
+    assert_eq!(
+        load(&h.opts, SESSION).expect("state").own_since,
+        0,
+        "a person seen restarts the hold"
+    );
+    drop(h);
+
+    // A target whose first probe did not end goes ahead for aterm's move, but the agent's own
+    // restart relaunches only onto a build proved to start: the line names the move alone.
+    let _ = probe_finds(build_start::Probe::TimedOut);
+    let h = rig(
+        "quiet-tell-unproved",
+        Tell::Verb,
+        held(),
+        Answers::default(),
+    );
+    let shells = shells_under(&h);
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "told:background");
+    let typed = h.typed();
+    assert!(
+        typed.len() == 1 && !typed[0].contains("aterm ctl"),
+        "no restart where the build is not proved: {typed:?}"
+    );
+    drop(h);
+
+    // A shell the relaunch line cannot be typed into: the move could not be planned, so the
+    // line that promises it is not typed.
+    let _ = probe_finds(build_start::Probe::Starts);
+    let h = rig(
+        "quiet-tell-unplanned",
+        Tell::Verb,
+        held(),
+        Answers::default(),
+    );
+    let shell = dead_pid();
+    let mut table: Vec<ProcRow> = vec![(shell, 1, "dash".into())];
+    table.extend(shells_under(&h));
+    let r = visit(
+        &h.opts,
+        &h.sf,
+        &table,
+        &newer(),
+        &Script::new(shell, usize::MAX, None),
+    );
+    assert_eq!(r.step, "wait:background");
+    assert!(h.typed().is_empty(), "{:?}", h.typed());
+    drop(h);
+
+    // A target whose start failed is no move aterm will make, so it is not promised.
+    let ran = probe_finds(build_start::Probe::NoExec);
+    let h = rig(
+        "quiet-tell-unstartable",
+        Tell::Verb,
+        held(),
+        Answers::default(),
+    );
+    failed_start_saved(&h.opts, "0badf00d-9999-2222-3333-444455556666", "9.9.9", 34);
+    let shells = shells_under(&h);
+    assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:build-fails");
+    assert!(h.typed().is_empty(), "{:?}", h.typed());
+    assert_eq!(load(&h.opts, SESSION).expect("state").tells, 0);
+    assert!(ran.get() >= 1, "the probe a move would run");
+    let _ = probe_finds(build_start::Probe::Starts);
 }
 
 /// The owner's `--now` moves a quiet session whose status only lags (`shell` over an idle screen,

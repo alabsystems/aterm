@@ -176,27 +176,6 @@ fn no_local_connection_names_the_remote_slot_and_no_carry_writes_it() {
 }
 
 #[test]
-fn a_hold_under_the_all_grant_names_the_issuers_peers_rm_never_one_here() {
-    let node = "03".repeat(16);
-    let here = remote_lifts("s-1", "mac-03", &node, RmLifts::Here);
-    assert!(
-        here.contains(&format!(
-            "`aterm fleet peers rm {node}` there once that node left"
-        )) && here.contains("a lower `aterm fleet allow` there"),
-        "{here}"
-    );
-    let issuer = remote_lifts("s-1", "mac-03", &node, RmLifts::Issuer);
-    assert!(
-        issuer.contains(&format!(
-            "`aterm fleet peers rm {node}` on the fleet's issuer"
-        )) && issuer.contains("(`aterm fleet peers` there reads it now)")
-            && issuer.contains("Take Over, or a lower `aterm fleet allow` there")
-            && !issuer.contains(&format!("peers rm {node}` there")),
-        "{issuer}"
-    );
-}
-
-#[test]
 fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
     let store = new_store();
     let (sid, ctx) = registered_as(&store, 1);
@@ -220,10 +199,6 @@ fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
             && refused.contains(&format!(
                 "`aterm ctl --host <this session's Mac> hold {sid} off` run on mac-03 (node \
                  03030303), or the person at this session's Mac"
-            ))
-            && refused.contains(&format!(
-                "`aterm fleet peers rm {}` there once that node left",
-                m03.node
             ))
             && refused.contains(&format!("`aterm ctl hold {sid} off` on this session's Mac")),
         "the refusal names who holds it and what lifts it: {refused}"

@@ -87,6 +87,10 @@ pub struct BeamRodConfig {
     pub theme_bg: u32,
     /// [`Self::color`] is a pinned cursor colour.
     pub pinned: bool,
+    /// [`Self::color`] is one the user chose (a pinned cursor colour, or the trail colour):
+    /// paper darkens it in its own hue and saturation, never saturates it
+    /// ([`crate::color_math::light_caret_fill`]).
+    pub chosen: bool,
 }
 
 /// What a tick produced.
@@ -120,7 +124,7 @@ pub struct CursorBeamRod {
     /// Cached `((color, theme_fg, theme_bg), ink)` for [`Self::emit_rod_light`].
     light_ink_memo: Option<((u32, u32, u32), u32)>,
     /// Cached `((color, theme_bg, e_bits), fill)` for the light-theme emitter block.
-    light_fill_memo: Option<((u32, u32, u32), u32)>,
+    light_fill_memo: Option<((u32, u32, u32, bool), u32)>,
 }
 
 impl Default for CursorBeamRod {
@@ -205,14 +209,14 @@ impl CursorBeamRod {
                 lerp_rgb(cfg.color, 0x00FF_FFFF, 0.10 + 0.35 * e)
             } else {
                 let bg = cfg.theme_bg & 0x00FF_FFFF;
-                let key = (cfg.color, bg, e.to_bits());
+                let key = (cfg.color, bg, e.to_bits(), cfg.chosen);
                 if let Some((cached_key, cached_fill)) = self.light_fill_memo
                     && cached_key == key
                 {
                     cached_fill
                 } else {
                     let solved = crate::color_math::floor_contrast_keeping_hue(
-                        crate::color_math::light_body_fill(cfg.color, e),
+                        crate::color_math::light_caret_fill(cfg.color, e, cfg.chosen),
                         bg,
                         LIGHT_EMITTER_CONTRAST,
                     );
@@ -510,6 +514,7 @@ mod tests {
             theme_fg: 0x00C8_C8D2,
             theme_bg: 0x0010_1016,
             pinned: false,
+            chosen: false,
         }
     }
 
@@ -806,6 +811,7 @@ mod tests {
                 &BeamRodConfig {
                     color: pinned,
                     pinned: true,
+                    chosen: true,
                     dark_theme: false,
                     theme_fg: 0x001F_2328,
                     theme_bg: 0x00FF_FFFF,

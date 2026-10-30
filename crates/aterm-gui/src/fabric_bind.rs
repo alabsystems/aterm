@@ -9,6 +9,57 @@ use aterm_session::SessionId;
 
 pub(crate) use aterm_gui_fabric::*;
 
+/// One worker observes atomic mailbox replacements, including writes by a handoff peer
+/// after this process adopted the session. GUI readers only use the cached metadata.
+#[cfg(all(unix, not(test)))]
+pub(crate) fn watch_direct_mail(ctx: &Arc<crate::SessionCtx>) {
+    use std::sync::{Mutex, Weak, mpsc};
+    type Sender = mpsc::Sender<Weak<crate::SessionCtx>>;
+    static WORKER: Mutex<Option<Sender>> = Mutex::new(None);
+    let mut worker = WORKER.lock().unwrap_or_else(|p| p.into_inner());
+    if worker
+        .as_ref()
+        .is_some_and(|tx| tx.send(Arc::downgrade(ctx)).is_ok())
+    {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    if std::thread::Builder::new()
+        .name("fleet-mail-watch".to_owned())
+        .spawn(move || {
+            use std::os::unix::fs::MetadataExt;
+            let mut sessions = Vec::new();
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(ctx) => sessions.push((ctx, None)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                sessions.retain_mut(|(weak, seen): &mut (Weak<crate::SessionCtx>, _)| {
+                    let Some(ctx) = weak.upgrade() else {
+                        return false;
+                    };
+                    let stamp = ctx
+                        .fleet_mail_path()
+                        .and_then(|path| std::fs::symlink_metadata(path).ok())
+                        .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
+                    if stamp != *seen && crate::fabric::fleet_mail::restore(&*ctx) {
+                        *seen = stamp;
+                    }
+                    true
+                });
+            }
+        })
+        .is_ok()
+    {
+        let _ = tx.send(Arc::downgrade(ctx));
+        *worker = Some(tx);
+    }
+}
+
+#[cfg(all(not(unix), not(test)))]
+pub(crate) fn watch_direct_mail(_ctx: &Arc<crate::SessionCtx>) {}
+
 impl FabricSession for crate::SessionCtx {
     fn self_id(&self) -> &SessionId {
         &self.self_id
@@ -27,6 +78,7 @@ impl FabricSession for crate::SessionCtx {
 
     fn fabric_changed(&self) {
         crate::presence::post_fabric_changed(&self.self_id);
+        self.watchers.ring_watchers();
     }
 
     fn holder_token(&self) -> Option<String> {
@@ -36,6 +88,21 @@ impl FabricSession for crate::SessionCtx {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(|l| l.driving_token(now))
+    }
+
+    fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
+        #[cfg(unix)]
+        {
+            aterm_types::dirs::state_dir().map(|state| {
+                state
+                    .join("fleet-mail")
+                    .join(format!("{}.toml", self.self_id.as_str()))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 }
 

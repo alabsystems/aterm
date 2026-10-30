@@ -441,8 +441,9 @@ fn parse_server_heard_line(fields: &[(String, String)]) -> Result<ServerHeardFac
 fn touch_or_read_window_last(state_dir: &Path, window: bool, now: u64) -> Option<u64> {
     static LAST_FLUSHED: Mutex<Option<(std::path::PathBuf, u64)>> = Mutex::new(None);
     let path = state_dir.join(WINDOW_LAST_FILE);
-    let stored = std::fs::read_to_string(&path)
+    let stored = crate::harness::accounts::read_bounded(&path, 256)
         .ok()
+        .flatten()
         .and_then(|s| s.trim().parse::<u64>().ok());
     if !window {
         return stored;
@@ -461,25 +462,51 @@ fn touch_or_read_window_last(state_dir: &Path, window: bool, now: u64) -> Option
             _ => stored.is_none_or(|prev| effective.saturating_sub(prev) >= WINDOW_LAST_FLUSH_SECS),
         }
     };
-    if flush_due && std::fs::create_dir_all(state_dir).is_ok() {
-        let tmp = state_dir.join(format!(".{WINDOW_LAST_FILE}.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, format!("{effective}\n")).is_ok()
-            && std::fs::rename(&tmp, &path).is_ok()
-        {
-            let mut guard = LAST_FLUSHED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = Some((state_dir.to_path_buf(), effective));
-        } else {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    if flush_due
+        && crate::harness::upgrade_models::write_atomic(&path, &format!("{effective}\n")).is_ok()
+    {
+        let mut guard = LAST_FLUSHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some((state_dir.to_path_buf(), effective));
     }
     Some(effective)
 }
 
+#[cfg(unix)]
+fn local_roster_denial(home: Option<&Path>) -> (Vec<String>, bool) {
+    let Some(home) = home else {
+        return (Vec::new(), false);
+    };
+    let paths = aterm_secrets::client::Paths::for_home(home);
+    let recipient_denied = aterm_secrets::client::local_recipient_denied_in_roster(&paths);
+    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(&paths) else {
+        return (Vec::new(), recipient_denied);
+    };
+    (roster.deny_labels, recipient_denied)
+}
+
+#[cfg(not(unix))]
+fn local_roster_denial(_home: Option<&Path>) -> (Vec<String>, bool) {
+    (Vec::new(), false)
+}
+
 fn resolve_machine_label(env: &Env) -> Option<String> {
+    let (deny_labels, recipient_denied) = local_roster_denial(env.home.as_deref());
+    if recipient_denied {
+        return None;
+    }
+    let is_denied_label = |candidate: &str| {
+        #[cfg(unix)]
+        let canon = aterm_secrets::swarm_roster::leading_m_label(candidate)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| candidate.trim().to_ascii_lowercase());
+        #[cfg(not(unix))]
+        let canon = candidate.trim().to_ascii_lowercase();
+        deny_labels.iter().any(|d| d.eq_ignore_ascii_case(&canon))
+    };
     if let Some(config_path) = env.config.as_deref()
-        && let Ok(text) = std::fs::read_to_string(config_path)
+        && let Ok(Some(text)) = crate::harness::accounts::read_bounded(config_path, 1024 * 1024)
         && let Ok(table) = aterm_toml::from_str::<aterm_toml::Value>(&text)
     {
         for (section, key) in [
@@ -494,13 +521,13 @@ fn resolve_machine_label(env: &Env) -> Option<String> {
                 .and_then(|t| t.get(key))
                 .and_then(aterm_toml::Value::as_str)
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !is_denied_label(s))
             {
                 return Some(machine.to_owned());
             }
         }
     }
-    resolve_vault_host_label(env)
+    resolve_vault_host_label(env).filter(|h| !is_denied_label(h))
 }
 
 #[cfg(unix)]
@@ -509,6 +536,13 @@ fn resolve_vault_host_label(env: &Env) -> Option<String> {
     let paths = aterm_secrets::client::Paths::for_home(home);
     if let Ok(Some(label)) = aterm_secrets::client::resolve_local_swarm_label(&paths, &[]) {
         return Some(label);
+    }
+    if aterm_secrets::client::swarm_roster(&paths)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return None;
     }
     let status = aterm_secrets::client::status(&paths).ok()?;
     status
@@ -629,16 +663,14 @@ pub fn ssh_host_key_fingerprint_in(dir: &Path) -> Option<String> {
         "ssh_host_rsa_key.pub",
     ] {
         let path = dir.join(file);
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(Some(text)) = crate::harness::accounts::read_bounded(&path, SSH_PUBKEY_MAX as u64)
+        else {
             continue;
         };
-        if bytes.is_empty() || bytes.len() > SSH_PUBKEY_MAX {
+        if text.is_empty() {
             continue;
         }
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        if let Some(fp) = parse_openssh_pubkey_sha256(text) {
+        if let Some(fp) = parse_openssh_pubkey_sha256(&text) {
             return Some(fp);
         }
     }
@@ -917,5 +949,143 @@ mod tests {
             touch_or_read_window_last(&state, false, 1_793_160_300),
             Some(1_793_160_000)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_machine_label_enforces_roster_deny_lists_and_rejects_non_canonical_vault_host() {
+        use aterm_secrets::swarm_roster::{ROSTER_ENTRY, SwarmMember, SwarmRoster};
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let state = dir.path().join("state");
+        let config = dir.path().join("aterm.toml");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        let srv_dir = aterm_tempfile::tempdir().expect("server dir");
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let running = aterm_secrets::server::start(
+            socket,
+            &aterm_secrets::server::Options {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                store: srv_dir.path().to_path_buf(),
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(50),
+                keep_awake: false,
+            },
+        )
+        .expect("start server");
+        let url = format!("http://{}/v1/test", running.addr);
+        let paths = aterm_secrets::client::Paths::for_home(&home);
+        aterm_secrets::client::create(&paths, &url, None, Some("mac-mini-m4"))
+            .expect("create vault");
+        let rec = aterm_secrets::client::machine_identity(&paths)
+            .expect("identity")
+            .recipient()
+            .to_bech32();
+
+        // 1. When a SwarmRoster exists and this recipient is not yet listed (and `cfg.host` is
+        //    `"Mac-mini-M4"`), `resolve_vault_host_label` must NOT return `"Mac-mini-M4"`, and
+        //    a denied `[swarm] label = "m4"` in `aterm.toml` must also be rejected.
+        let roster = SwarmRoster {
+            members: vec![SwarmMember {
+                recipient: "age1other".to_owned(),
+                vault_name: "m22".to_owned(),
+                label: "m22".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 1,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: None,
+            }],
+            deny_labels: vec!["m4".to_owned()],
+            deny_nodes: Vec::new(),
+        };
+        let adm = aterm_secrets::client::admin_open(&paths).expect("admin open");
+        let mut doc = adm.doc.clone();
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            ROSTER_ENTRY,
+            roster.to_toml().as_bytes(),
+        )
+        .expect("set roster");
+        aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish roster");
+        aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+
+        std::fs::write(&config, "[swarm]\nlabel = \"m4\"\n").unwrap();
+        let facts_denied = SwarmSurveyFacts::collect_at(
+            &state,
+            Some(&home),
+            Some(&config),
+            0,
+            false,
+            None,
+            1_793_160_000,
+        );
+        assert_eq!(facts_denied.label, None);
+
+        // 2. When this recipient IS in the roster with a denied node_key, even a valid `[swarm] label = "m100"`
+        //    in `aterm.toml` is rejected.
+        let adm2 = aterm_secrets::client::admin_open(&paths).expect("admin open");
+        let mut doc2 = adm2.doc.clone();
+        let roster_denied_node = SwarmRoster {
+            members: vec![SwarmMember {
+                recipient: rec.clone(),
+                vault_name: "m100".to_owned(),
+                label: "m100".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 1,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some("ab".repeat(32)),
+            }],
+            deny_labels: Vec::new(),
+            deny_nodes: vec!["ab".repeat(32)],
+        };
+        doc2.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            ROSTER_ENTRY,
+            roster_denied_node.to_toml().as_bytes(),
+        )
+        .expect("set roster");
+        aterm_secrets::client::admin_publish(&paths, &adm2, &doc2).expect("publish roster");
+        aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+        std::fs::write(&config, "[swarm]\nlabel = \"m100\"\n").unwrap();
+        let facts_denied_node = SwarmSurveyFacts::collect_at(
+            &state,
+            Some(&home),
+            Some(&config),
+            0,
+            false,
+            None,
+            1_793_160_000,
+        );
+        assert_eq!(facts_denied_node.label, None);
+
+        // 3. Once the node_key is not denied, `m100` resolves cleanly even without `aterm.toml`.
+        let _ = std::fs::remove_file(&config);
+        let adm3 = aterm_secrets::client::admin_open(&paths).expect("admin open");
+        let mut doc3 = adm3.doc.clone();
+        let mut roster_ok = roster_denied_node;
+        roster_ok.deny_nodes.clear();
+        doc3.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            ROSTER_ENTRY,
+            roster_ok.to_toml().as_bytes(),
+        )
+        .expect("set roster");
+        aterm_secrets::client::admin_publish(&paths, &adm3, &doc3).expect("publish roster");
+        aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+        let facts_ok =
+            SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1_793_160_000);
+        assert_eq!(facts_ok.label.as_deref(), Some("m100"));
+
+        running.stop();
     }
 }

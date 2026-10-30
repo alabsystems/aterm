@@ -79,6 +79,12 @@ mod twins;
 pub mod capfile;
 #[cfg(test)]
 mod capfile_tests;
+pub mod ceiling;
+pub use ceiling::{
+    ceiling_mode_subsumes, ceiling_mode_subsumes_code, ceiling_rule_index_clamp,
+    ceiling_rule_within_cap, CeilingViolation, CeilingViolationKind, GrantCeiling,
+    MAX_CEILING_RULES, MAX_RING_CAPS,
+};
 
 use astream_digest::{hmac_sha256_parts, Sha256};
 use astream_wire::{Filter, Subject};

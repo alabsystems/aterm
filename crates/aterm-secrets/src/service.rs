@@ -938,6 +938,63 @@ pub fn check_program_starts(program: &Path) -> crate::Result<()> {
     program_started(program, ran)
 }
 
+/// The release reported by the executable a job would actually run. Build metadata does
+/// not order releases. A running helper's version is not evidence about this destination.
+/// # Errors
+/// The executable fails to start, times out, or reports no three-part aterm release.
+pub fn program_release(program: &Path) -> crate::Result<ProgramRelease> {
+    let mut command = aterm_uds::spawnfd::command(program);
+    command.arg("--version");
+    let out = aterm_uds::deadline::output_within(&mut command, STARTS_WITHIN)
+        .map_err(|error| Error::new(error.to_string()))?;
+    program_started(program, Ok(out.clone()))?;
+    release_answer(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+        Error::new(format!(
+            "{} --version named no three-part aterm release",
+            program.display()
+        ))
+    })
+}
+
+/// A reported major, minor and patch release, without build metadata.
+pub type ProgramRelease = (u64, u64, u64);
+
+fn release_answer(stdout: &str) -> Option<ProgramRelease> {
+    let release = stdout.lines().next()?.strip_prefix("aterm ")?.trim();
+    let mut parts = release
+        .split(['+', '-'])
+        .next()?
+        .split('.')
+        .map(str::parse::<u64>);
+    let core = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    parts.next().is_none().then_some(core)
+}
+
+pub(crate) fn require_program_release(
+    program: &Path,
+    minimum: ProgramRelease,
+    release_of: &dyn Fn(&Path) -> Result<ProgramRelease, String>,
+) -> crate::Result<()> {
+    let actual = release_of(program).map_err(Error::new)?;
+    if actual < minimum {
+        return Err(Error::new(format!(
+            "refusing to move a service onto {}: its release {}.{}.{} is older than required {}.{}.{}",
+            program.display(),
+            actual.0,
+            actual.1,
+            actual.2,
+            minimum.0,
+            minimum.1,
+            minimum.2
+        )));
+    }
+    Ok(())
+}
+
 /// [`check_program_starts`]'s verdict on what `program --version` gave.
 fn program_started(program: &Path, ran: Result<std::process::Output, String>) -> crate::Result<()> {
     let refused = |why: String| {
@@ -1376,6 +1433,96 @@ pub fn repair_server(
         &|| daemon_state_for_home(home),
         |args| install_job(home, Job::Server, &program()?, args, false),
     )
+}
+
+/// Start an absent or stopped member server without changing a held program or clearing
+/// an Off or pin decision. The unit is read again under the same lock as explicit On/Off.
+/// # Errors
+/// The policy or existing unit is unreadable, or the retained/chosen program cannot start.
+pub(crate) fn ensure_server(
+    home: &Path,
+    program: &Path,
+    args: &[String],
+    minimum: ProgramRelease,
+) -> crate::Result<Option<String>> {
+    check_own_home(home)?;
+    ensure_server_with(
+        home,
+        program,
+        args,
+        &|| daemon_state_for_home(home),
+        &|to| {
+            require_program_release(to, minimum, &|path| {
+                program_release(path).map_err(|e| e.to_string())
+            })
+        },
+        &mut |to, argv| {
+            check_program_starts(to)?;
+            install_job(home, Job::Server, to, argv, false)
+        },
+    )
+}
+
+pub(crate) fn ensure_server_with(
+    home: &Path,
+    program: &Path,
+    args: &[String],
+    daemon: &dyn Fn() -> crate::Result<State>,
+    candidate: &dyn Fn(&Path) -> crate::Result<()>,
+    install: &mut dyn FnMut(&Path, &[String]) -> crate::Result<String>,
+) -> crate::Result<Option<String>> {
+    let _decision = JobDecision::take(home, Job::Server)?;
+    if crate::fsx::kind(&server_off_path(home))? != crate::fsx::Kind::Missing
+        || matches!(daemon()?, State::Installed { .. })
+    {
+        return Ok(None);
+    }
+    let unit = unit_file(home, Job::Server);
+    let pin = if crate::fsx::kind(&pin_path(home, Job::Server))? == crate::fsx::Kind::Missing {
+        None
+    } else {
+        Some(
+            pinned_to(home, Job::Server)
+                .ok_or_else(|| Error::new("cannot safely read the server pin"))?,
+        )
+    };
+    match crate::fsx::kind(&unit)? {
+        crate::fsx::Kind::Missing => {
+            if pin.is_some() {
+                return Ok(None);
+            }
+            candidate(program)?;
+            install(program, args).map(Some)
+        }
+        _ => {
+            let text = std::fs::read_to_string(&unit)?;
+            if cfg!(target_os = "macos") && text.contains("<key>Disabled</key>") {
+                return Ok(None);
+            }
+            let argv = if cfg!(target_os = "macos") {
+                plist_argv(&text)
+            } else {
+                exec_argv(&text)
+            }
+            .ok_or_else(|| Error::new("cannot safely read the existing server job"))?;
+            let (kept, argv) = argv
+                .split_first()
+                .ok_or_else(|| Error::new("existing server job has no program"))?;
+            if argv
+                .get(..2)
+                .is_none_or(|words| words != ["secrets", "serve"])
+            {
+                return Err(Error::new("existing server job is not a secrets server"));
+            }
+            let kept = Path::new(kept);
+            let canonical =
+                |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+            if pin.is_some_and(|pin| canonical(&pin) != canonical(kept)) {
+                return Ok(None);
+            }
+            install(kept, argv).map(Some)
+        }
+    }
 }
 
 /// [`repair_server`], `exists` saying whether anything is at a path, `daemon` reading the system
@@ -2064,6 +2211,142 @@ pub fn daemon_state_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destination_release_is_actual_and_ignores_build_metadata() {
+        assert_eq!(release_answer("aterm 0.147.0+g1234\n"), Some((0, 147, 0)));
+        assert_eq!(release_answer("aterm 0.91.0\n"), Some((0, 91, 0)));
+        for bad in [
+            "atermx 0.147.0",
+            "aterm 0.147",
+            "aterm 0.147.0.1",
+            "aterm nonsense",
+        ] {
+            assert_eq!(release_answer(bad), None);
+        }
+        let target = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        for version in [(0, 91, 0), (0, 146, 0)] {
+            assert!(
+                require_program_release(target, (0, 147, 0), &|path| {
+                    assert_eq!(path, target);
+                    Ok(version)
+                })
+                .is_err()
+            );
+        }
+        for version in [(0, 147, 0), (0, 148, 0)] {
+            assert!(require_program_release(target, (0, 147, 0), &|_| Ok(version)).is_ok());
+        }
+        assert!(
+            require_program_release(target, (0, 147, 0), &|_| Err("unreadable".to_owned()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_server_restart_preserves_held_program_and_rechecks_off_and_pin() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let unit = unit_file(home, Job::Server);
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        let kept = Path::new("/kept/aterm-0.148");
+        let proposed = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let args: Vec<String> = ["secrets", "serve", "--advertise", "kept-name"]
+            .map(String::from)
+            .into();
+        let unit_text = if cfg!(target_os = "macos") {
+            plist_text(Job::Server.label(), kept, &args, Path::new("/tmp/log"))
+        } else {
+            systemd_unit(Job::Server.description(), kept, &args)
+        };
+        std::fs::write(&unit, &unit_text).unwrap();
+        let absent = || Ok(State::Absent);
+        let not_a_candidate =
+            |_: &Path| -> crate::Result<()> { panic!("a retained program is not a new candidate") };
+        let calls = std::cell::Cell::new(0);
+        let mut install = |program: &Path, argv: &[String]| {
+            calls.set(calls.get() + 1);
+            assert_eq!(
+                program, kept,
+                "a stopped held program is restarted, not replaced"
+            );
+            assert_eq!(argv, args);
+            Ok("restarted".to_owned())
+        };
+        assert!(
+            ensure_server_with(home, proposed, &[], &absent, &not_a_candidate, &mut install)
+                .unwrap()
+                .is_some()
+        );
+        record_pin(home, Job::Server, kept).unwrap();
+        assert!(
+            ensure_server_with(home, proposed, &[], &absent, &not_a_candidate, &mut install)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(calls.get(), 2);
+        // A preceding eligibility read is now stale: a new Off or pin must win under the
+        // repair lock, and automatic repair must not clear the person's decision.
+        record_server_off(home).unwrap();
+        assert!(
+            ensure_server_with(home, proposed, &[], &absent, &not_a_candidate, &mut install)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server_turned_off(home));
+        clear_server_off(home).unwrap();
+        record_pin(home, Job::Server, Path::new("/new/persons-pin")).unwrap();
+        assert!(
+            ensure_server_with(home, proposed, &[], &absent, &not_a_candidate, &mut install)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read_to_string(&unit).unwrap(), unit_text);
+        clear_pin(home, Job::Server).unwrap();
+        assert!(
+            ensure_server_with(
+                home,
+                proposed,
+                &[],
+                &absent,
+                &not_a_candidate,
+                &mut |program, _| {
+                    assert_eq!(program, kept);
+                    Err(Error::new("kept program cannot start"))
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&unit).unwrap(), unit_text);
+        std::fs::remove_file(&unit).unwrap();
+        assert!(
+            ensure_server_with(
+                home,
+                proposed,
+                &[],
+                &absent,
+                &|_| Err(Error::new("candidate is too old")),
+                &mut |_, _| panic!("a rejected new candidate must not install")
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_server_with(
+                home,
+                proposed,
+                &[],
+                &absent,
+                &|_| Ok(()),
+                &mut |program, _| {
+                    assert_eq!(program, proposed);
+                    Ok("new job".to_owned())
+                }
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
 
     /// A job is pointed only at a program that starts as aterm; one macOS kills at launch is
     /// named: a loose copy of the app's executable (as m22's first snapshot swap met on

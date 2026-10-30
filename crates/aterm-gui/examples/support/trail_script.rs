@@ -9,9 +9,9 @@
 //!
 //! A script is a statement a line; a line starting `#` is a comment. Setup directives say how the window is
 //! set up, and each `run <until_ms>` first applies what they changed, in one order (the config,
-//! the grid, the panes and their focus, the panel rate, the ramp cost), at the instant the last
-//! run ended. It then draws a frame every present interval up to `until_ms`, each after the
-//! timed events (`at <ms> …`) due by its instant, at their own instants.
+//! the grid, the panes, their themes and their focus, the panel rate, the ramp cost), at the
+//! instant the last run ended. It then draws a frame every present interval up to `until_ms`,
+//! each after the timed events (`at <ms> …`) due by its instant, at their own instants.
 //! `foreach-scheme dark|light { … }` runs the script once per built-in and pack theme of that
 //! polarity (`aterm_render::theme_is_dark` of its background), each on a fresh rig.
 //!
@@ -89,8 +89,8 @@ pub(crate) enum Setup {
     Theme { fg: u32, bg: u32 },
     /// `panes <n>`: split the window until it shows `n` panes, side by side.
     Panes(usize),
-    /// `pane <i> theme <fg> <bg>`: recorded, not honoured; a pane's own session theme lands at
-    /// 1.3 with the configured-colour seams.
+    /// `pane <i> theme <fg> <bg>`: pane `i`'s session wears a theme of those colours as its own,
+    /// as `theme session set` gives a tab its theme ([`pane_theme_id`], `TrailRig::pane_theme`).
     PaneTheme { pane: usize, fg: u32, bg: u32 },
     /// `focus-pane <i>`: focus pane `i`, counted from the first.
     FocusPane(usize),
@@ -98,8 +98,8 @@ pub(crate) enum Setup {
     Hz(u32),
     /// `ramp never|always`: the glow's ramp cost, in place of the shipped one.
     Ramp(Ramp),
-    /// `page opaque|translucent|wallpaper`: the page under the grid. `wallpaper` is recorded,
-    /// not honoured: the corpus's wallpaper fixture lands with P0.6, its reader at 1.9.
+    /// `page opaque|translucent|wallpaper`: the page under the grid; `wallpaper` lays the rig's
+    /// picture under it (`TrailRig::wallpaper`, the config's `wallpaper`).
     Page(Page),
     /// `intensity <x>`: `cursor_trail_intensity`.
     Intensity(f32),
@@ -124,8 +124,13 @@ pub(crate) enum Page {
     Opaque,
     /// A translucent page ([`TRANSLUCENT_OPACITY`]).
     Translucent,
-    /// A wallpaper under the page.
+    /// A wallpaper under the page: the rig's picture (`TrailRig::wallpaper`).
     Wallpaper,
+}
+
+/// The id the theme `pane <i> theme` installs for pane `pane`.
+fn pane_theme_id(pane: usize) -> String {
+    format!("trail-pane-{pane}")
 }
 
 /// `live`'s preview level.
@@ -767,8 +772,8 @@ impl Config {
         }
     }
 
-    /// The `aterm.toml` this config is.
-    fn toml(&self) -> String {
+    /// The `aterm.toml` this config is, its wallpaper the picture at `wallpaper`.
+    fn toml(&self, wallpaper: Option<&str>) -> String {
         let mut t = String::from("trail_sounds = true\n");
         let style = match (self.pet, self.style.strip_suffix(" pet")) {
             (Some(_), None) => format!("{} pet", self.style),
@@ -790,7 +795,12 @@ impl Config {
             Some(Page::Translucent) => {
                 let _ = writeln!(t, "background_opacity = {TRANSLUCENT_OPACITY:?}");
             }
-            Some(Page::Wallpaper) | None => {}
+            Some(Page::Wallpaper) => {
+                if let Some(path) = wallpaper {
+                    let _ = writeln!(t, "wallpaper = {path:?}");
+                }
+            }
+            None => {}
         }
         if let Some(name) = self.scheme {
             let _ = writeln!(t, "theme = {name:?}");
@@ -822,6 +832,10 @@ struct Runner {
     ramp: Option<Ramp>,
     /// The `live` level not yet handed to the rig.
     live: Option<Live>,
+    /// The `pane <i> theme` colours not yet given their panes.
+    pane_themes: Vec<(usize, u32, u32)>,
+    /// The wallpaper picture's path, once `page wallpaper` wrote it.
+    wallpaper: Option<String>,
     /// Events not yet due, in time order (ties in script order).
     events: Vec<(u64, Event)>,
     /// Where the last run ended, in ms after `t0`.
@@ -845,6 +859,8 @@ impl Runner {
             hz: None,
             ramp: None,
             live: None,
+            pane_themes: Vec::new(),
+            wallpaper: None,
             events: Vec::new(),
             ran_to: 0,
             next_frame: Duration::ZERO,
@@ -895,19 +911,30 @@ impl Runner {
             Setup::Page(page) => self.config.page = Some(*page),
             Setup::Intensity(x) => self.config.intensity = Some(*x),
             Setup::Live(live) => self.live = Some(*live),
-            // Recorded, not honoured: each variant's doc names the phase that wires it.
-            Setup::Font(_) | Setup::PaneTheme { .. } => {}
+            Setup::PaneTheme { pane, fg, bg } => self.pane_themes.push((*pane, *fg, *bg)),
+            // Recorded, not honoured: the variant's doc names the phase that wires it.
+            Setup::Font(_) => {}
         }
     }
 
     /// Apply what the setup changed since the last run, at `at`.
     fn apply_setup(&mut self, at: std::time::Instant) -> Result<(), String> {
-        let config_changed = self.applied.as_ref() != Some(&self.config);
+        let pane_themes = std::mem::take(&mut self.pane_themes);
+        for &(pane, fg, bg) in &pane_themes {
+            let text = format!("foreground = #{fg:06x}\nbackground = #{bg:06x}\n");
+            self.rig.install_theme(&pane_theme_id(pane), &text)?;
+        }
+        if self.config.page == Some(Page::Wallpaper) && self.wallpaper.is_none() {
+            self.wallpaper = Some(self.rig.wallpaper()?);
+        }
+        // A theme installed since the last admission is discovered by the next.
+        let config_changed = self.applied.as_ref() != Some(&self.config) || !pane_themes.is_empty();
         if config_changed {
             if let Some(seed) = self.config.pet {
                 self.rig.kitty_seed(seed);
             }
-            self.rig.configure(&self.config.toml(), at)?;
+            self.rig
+                .configure(&self.config.toml(self.wallpaper.as_deref()), at)?;
             self.applied = Some(self.config.clone());
         }
         if self.grid != self.grid_applied
@@ -925,6 +952,9 @@ impl Runner {
         }
         while self.rig.panes() < self.panes {
             self.rig.split(at)?;
+        }
+        for &(pane, ..) in &pane_themes {
+            self.rig.pane_theme(pane, &pane_theme_id(pane), at)?;
         }
         if let Some(pane) = self.focus_pane.take() {
             self.rig.focus_pane(pane, at)?;
@@ -971,7 +1001,8 @@ impl Runner {
                     let _ = amp;
                     if let Some(motion) = motion {
                         self.config.motion = motion;
-                        self.rig.configure(&self.config.toml(), at)?;
+                        self.rig
+                            .configure(&self.config.toml(self.wallpaper.as_deref()), at)?;
                         self.applied = Some(self.config.clone());
                     }
                     if let Some(focus) = focus {

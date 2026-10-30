@@ -293,6 +293,11 @@ fn decgra_only_within_cap_uses_declared_geometry() {
     for &p in img.pixels() {
         assert_eq!(p, 0, "no data painted → fully transparent");
     }
+
+    let omitted_pan = decode(b"\";1;4;6").expect("omitted Pan keeps Ph/Pv in slots 2/3");
+    assert_eq!((omitted_pan.width(), omitted_pan.height()), (4, 6));
+    let omitted_both = decode(b"\";;5;7").expect("omitted Pan and Pad keep Ph/Pv in slots 2/3");
+    assert_eq!((omitted_both.width(), omitted_both.height()), (5, 7));
 }
 
 #[test]
@@ -317,6 +322,13 @@ fn compose_pads_declared_edges_transparent() {
 fn semicolon_flood_keeps_params_bounded() {
     let mut d = SixelDecoder::new();
     d.hook();
+    for &b in b"99;88" {
+        d.put(b);
+    }
+    assert!(
+        d.params.is_empty(),
+        "digits and semicolons outside an introducer must not populate params"
+    );
     d.put(b'#');
     for _ in 0..100_000 {
         d.put(b';');
@@ -325,6 +337,14 @@ fn semicolon_flood_keeps_params_bounded() {
         d.params.len() <= SIXEL_MAX_PARAMS,
         "params capped at {SIXEL_MAX_PARAMS}, got {}",
         d.params.len()
+    );
+    for &b in b"999" {
+        d.put(b);
+    }
+    assert_eq!(
+        d.params.last().copied(),
+        Some(0),
+        "digits past SIXEL_MAX_PARAMS must not mutate the last kept slot"
     );
 }
 

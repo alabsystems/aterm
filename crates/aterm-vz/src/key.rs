@@ -32,18 +32,25 @@ pub fn fresh() -> io::Result<Key> {
 /// It could not be removed, made or written.
 pub fn write_disk(path: &Path, key: &Key) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stage = aterm_tempfile::Builder::new()
+        .prefix(".key-")
+        .tempdir_in(parent)?;
+    let staged = stage.path().join("key.img");
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&staged)?;
     f.write_all(&aterm_vz_agent::key::sector(key))?;
-    f.set_len(DISK_BYTES)
+    f.set_len(DISK_BYTES)?;
+    aterm_durable::durable(&f)?;
+    drop(f);
+    std::fs::rename(&staged, path)
 }
 
 #[cfg(test)]

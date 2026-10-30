@@ -110,6 +110,15 @@ impl CursorGlow {
         }
     }
 
+    /// A test's negative control: the frame's combining marks unread
+    /// (`on`), a marked cell short by its base letter alone
+    /// ([`Self::observe_frame_text_marked`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_frame_marks_unread(&mut self, on: bool) {
+        self.frame_marks_unread = on;
+    }
+
     /// Host observation: the cells of the frame about to be presented, the
     /// window's own ([`Self::observe_frame_text_at`] at `(0, 0)`).
     #[inline]
@@ -166,6 +175,30 @@ impl CursorGlow {
         (at, cols): ((u16, u16), usize),
         now: Instant,
     ) {
+        self.observe_frame_text_marked(cur, (cells, &[]), (at, cols), now);
+    }
+
+    /// [`Self::observe_frame_text_at`] with the frame's combining marks
+    /// (`RenderInput::combining`: per row of `cells`, sparse `(col, marks)`):
+    /// a cell that carries a mark is not a short glyph, its accent drawn over
+    /// the x-height ([`FrameText::short`]). Read by its base letter alone, a
+    /// decomposed `e` + U+0301 (a macOS filename's NFD) counted as a short
+    /// `e`, and the tall ribbon's foot rail dipped onto its accent at 2.6:1
+    /// (looks9's review).
+    #[inline]
+    pub fn observe_frame_text_marked(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        (cells, marks): (&[Vec<aterm_core::terminal::RenderCell>], &[RowMarks]),
+        (at, cols): ((u16, u16), usize),
+        now: Instant,
+    ) {
+        #[cfg(any(test, debug_assertions))]
+        let marks = if self.frame_marks_unread {
+            &[][..]
+        } else {
+            marks
+        };
         /// The most rows one frame reads: a leap longer than this keeps its
         /// far rows unknown.
         const MAX_ROWS: i32 = 256;
@@ -239,19 +272,25 @@ impl CursorGlow {
         match pet_rows {
             Some((a, b)) => {
                 let (a, b) = clamp_row_span(a, b.min(a + MAX_ROWS - 1), r0, cells.len());
-                read_text(&mut self.pet_text, cells, (a, b), c0, r0, now);
+                read_text(&mut self.pet_text, (cells, marks), (a, b), (c0, r0), now);
             }
-            None => read_text(&mut self.pet_text, cells, (1, 0), c0, r0, now),
+            None => read_text(&mut self.pet_text, (cells, marks), (1, 0), (c0, r0), now),
         }
         if lo > hi {
-            read_text(&mut self.frame_text, cells, (1, 0), c0, r0, now);
+            read_text(&mut self.frame_text, (cells, marks), (1, 0), (c0, r0), now);
             return;
         }
         let lo = (lo - 1 - Self::FRAME_TEXT_RISE).max(r0);
         let hi = (hi + 1 + Self::FRAME_TEXT_FALL)
             .min(r0 + cells.len() as i32 - 1)
             .min(lo + MAX_ROWS - 1);
-        read_text(&mut self.frame_text, cells, (lo, hi), c0, r0, now);
+        read_text(
+            &mut self.frame_text,
+            (cells, marks),
+            (lo, hi),
+            (c0, r0),
+            now,
+        );
     }
 
     /// Host observation: what the face the frame's text is drawn in lays down of each glyph
@@ -461,16 +500,21 @@ impl CursorGlow {
     }
 }
 
+/// One row's combining marks, as `RenderInput::combining` holds them: sparse
+/// `(col, marks)`, a cell's marks drawn over its base letter
+/// ([`CursorGlow::observe_frame_text_marked`]).
+pub type RowMarks = Vec<(usize, Box<[char]>)>;
+
 /// Read rows `lo..=hi` (window rows; none when `lo > hi`) of `cells`, whose
-/// first cell is window cell `(r0, c0)`, into `ft`: each row's lettered span
-/// and every cell's `(ink, ground)`.
+/// first cell is window cell `(r0, c0)`, into `ft`: each row's lettered span,
+/// every cell's `(ink, ground)`, and whether it is a short glyph (a cell
+/// `marks` gives a combining mark is not).
 #[inline]
 fn read_text(
     ft: &mut FrameText,
-    cells: &[Vec<aterm_core::terminal::RenderCell>],
+    (cells, marks): (&[Vec<aterm_core::terminal::RenderCell>], &[RowMarks]),
     (lo, hi): (i32, i32),
-    c0: i32,
-    r0: i32,
+    (c0, r0): (i32, i32),
     now: Instant,
 ) {
     ft.rows.clear();
@@ -506,6 +550,9 @@ fn read_text(
     let mut row = lo;
     while row <= hi {
         let line = cells[(row - r0) as usize].as_slice();
+        let row_marks = marks
+            .get((row - r0) as usize)
+            .map_or(&[][..], Vec::as_slice);
         let mut first_glyph: Option<i32> = None;
         let mut last_glyph: i32 = 0;
         let n_cols = line.len().min(ft.cols);
@@ -528,9 +575,14 @@ fn read_text(
                 },
                 pack_rgb(cell.bg),
             )));
+            // Combining marks lay ink the base glyph's own raster does not (an accent over
+            // the `e` of `é`): a marked cell is neither short nor the base glyph's ink.
+            let marked = row_marks
+                .iter()
+                .any(|&(col, ref m)| col == c && !m.is_empty());
             ft.short
-                .push(is_glyph && !cell.wide && super::emit::is_short_glyph(cell.ch));
-            ft.glyph.push(if cell.wide {
+                .push(is_glyph && !cell.wide && !marked && super::emit::is_short_glyph(cell.ch));
+            ft.glyph.push(if cell.wide || marked {
                 aterm_render::GlyphInk::OTHER
             } else {
                 aterm_render::GlyphInk::index(cell.ch, cell.bold)

@@ -918,7 +918,7 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
                 addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 port: 7101,
                 version: Some("0.147.0".to_owned()),
-                seen_ms: Some(now_s * 1_000),
+                seen_ms: Some((now_s - 10) * 1_000),
                 via: Via::Joined,
                 fleet: Some(mark),
                 signed: None,
@@ -977,8 +977,8 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
         .unwrap();
     assert_eq!(read_pushed_facts(&state).len(), 1);
 
-    // This Mac is m1, by its `aterm.toml`: without one the census names this Mac from the host's
-    // name, which on a fleet Mac is an `m<N>` label of its own and a member more than this counts.
+    // This Mac is m1, by its `aterm.toml`: this crate's tests read no host name
+    // (`ai_pool::system_hostnames`), so a test that names no home names no Mac.
     let home = dir.path().join("home");
     std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
     std::fs::write(
@@ -1066,7 +1066,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
                 addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 port: 7101,
                 version: Some("0.147.0".to_owned()),
-                seen_ms: Some(now_s * 1_000),
+                seen_ms: Some((now_s - 10) * 1_000),
                 via: Via::Joined,
                 fleet: Some(mark),
                 signed: None,
@@ -1121,10 +1121,12 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
         "prune_pushed_facts must remove peer facts when peer's 64-hex node_key is in denied_nodes"
     );
 
+    let mut log_admitted = sample_member("m2", &[], "age1m2", None);
+    log_admitted.node_key = Some(good_id.key().hex());
     let mut bad_member = sample_member("m8", &[], "age1m8", None);
     bad_member.node_key = Some(denied_id.key().hex());
-    // This Mac is m1, by its `aterm.toml`: without one the census names this Mac from the host's
-    // name, which on a fleet Mac is an `m<N>` label of its own and a member more than this counts.
+    // This Mac is m1, by its `aterm.toml`: this crate's tests read no host name
+    // (`ai_pool::system_hostnames`), so a test that names no home names no Mac.
     let home = dir.path().join("home");
     std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
     std::fs::write(
@@ -1132,24 +1134,90 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
         "[swarm]\nlabel = \"m1\"\n",
     )
     .unwrap();
-    let mut inputs = collect_local_census_inputs(&state, Some(&home), Vec::new(), now_s);
-    inputs.steward = Some("m1".to_owned());
-    inputs.roster = SwarmRoster {
-        members: vec![
-            sample_member("m1", &[], "age1m1", Some(good_id.node())),
-            bad_member,
-        ],
+    let srv_dir = aterm_tempfile::tempdir().expect("server dir");
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let running = aterm_secrets::server::start(
+        socket,
+        &aterm_secrets::server::Options {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: srv_dir.path().to_path_buf(),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(50),
+            keep_awake: false,
+        },
+    )
+    .expect("start server");
+    let url = format!("http://{}/v1/test", running.addr);
+    let paths = aterm_secrets::client::Paths::for_home(&home);
+    aterm_secrets::client::create(&paths, &url, None, Some("m1")).expect("create vault");
+    let seeded_roster = SwarmRoster {
+        members: vec![log_admitted, bad_member],
         deny_labels: Vec::new(),
         deny_nodes: vec![denied_id.key().hex()],
     };
+    let adm = aterm_secrets::client::admin_open(&paths).expect("admin open");
+    let mut doc = adm.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        seeded_roster.to_toml().as_bytes(),
+    )
+    .expect("set roster");
+    aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish roster");
+    aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+
+    let mut inputs = collect_local_census_inputs(&state, Some(&home), Vec::new(), now_s);
+    inputs.steward = None;
+    let shared_key = crate::harness::claims::LeaseKey::new("claude", "shared@example.com").unwrap();
+    inputs.claims = crate::harness::claims::Book::of([
+        crate::harness::claims::Row {
+            machine: "00000000000000000000000000000008".to_owned(),
+            label: "m8".to_owned(),
+            counter: 1,
+            until: (now_s + 3_600) as i64,
+            claims: vec![crate::harness::claims::Claim {
+                key: shared_key.clone(),
+                kind: crate::harness::claims::Kind::Lease,
+                since: (now_s - 500) as i64,
+            }],
+        },
+        crate::harness::claims::Row {
+            machine: "00000000000000000000000000000002".to_owned(),
+            label: "m2".to_owned(),
+            counter: 1,
+            until: (now_s + 3_600) as i64,
+            claims: vec![crate::harness::claims::Claim {
+                key: shared_key,
+                kind: crate::harness::claims::Kind::Lease,
+                since: (now_s - 100) as i64,
+            }],
+        },
+    ]);
+    inputs.server_heard.push(ServerHeardFact {
+        vault: "test".to_owned(),
+        subject: "age1m2".to_owned(),
+        at: now_s - 2,
+    });
+    inputs.server_heard.push(ServerHeardFact {
+        vault: "test".to_owned(),
+        subject: "age1m8".to_owned(),
+        at: now_s - 1,
+    });
     let census = SwarmCensus::compute(&inputs);
     assert_eq!(
         census
             .members
             .iter()
-            .map(|m| m.label.as_str())
+            .map(|m| (
+                m.label.as_str(),
+                m.node.as_deref(),
+                m.last_seen,
+                m.accounts.leased
+            ))
             .collect::<Vec<_>>(),
-        vec!["m1"],
-        "member whose node_key is in deny_nodes must be excluded from census"
+        vec![("m2", Some(good_id.node()), Some(now_s - 2), 1)],
+        "log-admitted member with node_key must bind node_id, resolve age1 recipient in server_heard, and count its lease without being shadowed by denied m8"
     );
+    running.stop();
 }

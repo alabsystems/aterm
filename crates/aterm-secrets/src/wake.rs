@@ -3,7 +3,8 @@
 
 //! One process's "network moved" signal (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2). The
 //! kernel's route socket ([`hear_routes`]) and the standing `_alab-vault._tcp` browse
-//! ([`crate::discover::Watch`]) each ring a [`Bell`]. A consumer (the server's advert, the
+//! ([`crate::discover::Watch`]) each ring a [`Bell`], and the server's advert's also rings at
+//! this Mac's wake from sleep ([`aterm_uds::power`]). A consumer (the server's advert, the
 //! subscriber's error nap) naps on that bell, and the nap says which source woke it. Nothing
 //! carries the signal between processes: each process hears its own sources.
 
@@ -21,6 +22,9 @@ pub enum Wake {
     Browse,
     /// The server stored a new version, which its advert names.
     Put,
+    /// This Mac woke from a sleep ([`aterm_uds::power::Power::Woke`]), before which the server
+    /// ended its registrations.
+    Resumed,
     /// The consumer is ending.
     Stop,
 }
@@ -34,6 +38,7 @@ impl Wake {
             Wake::Route => "a route change",
             Wake::Browse => "a vault server the browse heard",
             Wake::Put => "a new version stored",
+            Wake::Resumed => "this Mac waking from sleep",
             Wake::Stop => "its end",
         }
     }

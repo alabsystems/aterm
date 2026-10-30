@@ -295,6 +295,84 @@ pub const fn federation_seq_clamp(src_offset: u64, max_seq: u64) -> u64 {
     }
 }
 
+/// `failover_epoch_advance` as `failover_island.rs` defines it in Clean:
+/// `if cur_epoch < proposed_epoch then proposed_epoch else cur_epoch`.
+#[must_use]
+pub const fn failover_epoch_advance(cur_epoch: u64, proposed_epoch: u64) -> u64 {
+    if cur_epoch < proposed_epoch {
+        proposed_epoch
+    } else {
+        cur_epoch
+    }
+}
+
+/// `failover_quorum_clamp` as `failover_island.rs` defines it in Clean:
+/// `if votes < cluster_size then votes else cluster_size`.
+#[must_use]
+pub const fn failover_quorum_clamp(votes: u64, cluster_size: u64) -> u64 {
+    if votes < cluster_size {
+        votes
+    } else {
+        cluster_size
+    }
+}
+
+/// `refill_join_cursor_max` as `refill_island.rs` defines it in Clean:
+/// `if inbox_oldest < lane_from then lane_from else inbox_oldest`.
+#[must_use]
+pub const fn refill_join_cursor_max(lane_from: u64, inbox_oldest: u64) -> u64 {
+    if inbox_oldest < lane_from {
+        lane_from
+    } else {
+        inbox_oldest
+    }
+}
+
+/// `refill_debt_clamp` as `refill_island.rs` defines it in Clean:
+/// `if debt < slack then debt else slack`.
+#[must_use]
+pub const fn refill_debt_clamp(debt: u64, slack: u64) -> u64 {
+    if debt < slack {
+        debt
+    } else {
+        slack
+    }
+}
+
+/// `sticky_fence_min_seq` as `sticky_fence_island.rs` defines it in Clean:
+/// `if cur_fence < failed_seq then cur_fence else failed_seq`.
+#[must_use]
+pub const fn sticky_fence_min_seq(cur_fence: u64, failed_seq: u64) -> u64 {
+    if cur_fence < failed_seq {
+        cur_fence
+    } else {
+        failed_seq
+    }
+}
+
+/// `sticky_fence_seq_allowed` as `sticky_fence_island.rs` defines it in Clean:
+/// `if fence_seq < req_seq then 0 else 1`.
+#[must_use]
+pub const fn sticky_fence_seq_allowed(fence_seq: u64, req_seq: u64) -> u64 {
+    if fence_seq < req_seq {
+        0
+    } else {
+        1
+    }
+}
+
+/// `sticky_fence_admits_code_isl` as `sticky_fence_island.rs` defines it in Clean:
+/// `if 0 < fenced then sticky_fence_seq_allowed fence_seq req_seq else 1`.
+#[cfg(test)]
+#[must_use]
+pub const fn sticky_fence_admits_code(fenced: u64, fence_seq: u64, req_seq: u64) -> u64 {
+    if 0 < fenced {
+        sticky_fence_seq_allowed(fence_seq, req_seq)
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -418,6 +496,10 @@ mod tests {
             answers(|[a, b]| super::federation_cursor_advance(a, b)),
             want
         );
+        assert_eq!(answers(|[a, b]| crate::failover_epoch_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::failover_epoch_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::refill_join_cursor_max(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::refill_join_cursor_max(a, b)), want);
         let want = "000011012";
         assert_eq!(answers(|[a, b]| crate::sharded_clamp_index(a, b)), want);
         assert_eq!(answers(|[a, b]| super::sharded_clamp_index(a, b)), want);
@@ -429,6 +511,30 @@ mod tests {
         assert_eq!(answers(|[a, b]| super::rate_tokens_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::federation_seq_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| super::federation_seq_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::failover_quorum_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::failover_quorum_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::refill_debt_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::refill_debt_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::sticky_fence_min_seq(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::sticky_fence_min_seq(a, b)), want);
+        let want = "100110111";
+        assert_eq!(
+            answers(|[a, b]| crate::sticky_fence_seq_allowed(a, b)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b]| super::sticky_fence_seq_allowed(a, b)),
+            want
+        );
+        let want = "111111111100110111100110111";
+        assert_eq!(
+            answers(|[a, b, c]| crate::sticky_fence_admits_code(a, b, c)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b, c]| super::sticky_fence_admits_code(a, b, c)),
+            want
+        );
     }
 
     // Not vacuous: `group_commit_monotone` with its branches swapped answers otherwise.

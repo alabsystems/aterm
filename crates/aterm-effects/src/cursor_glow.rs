@@ -116,6 +116,8 @@ struct Particle {
     hue: f32,
     cov_scale: f32,
     born: Instant,
+    /// What its paints decided, kept for its life ([`ParticleLatch`]).
+    latch: ParticleLatch,
     /// The effects box's edge cut it once, so it is left out whole for the
     /// rest of its life ([`CursorGlow::emit_particles`]). Carried by the
     /// particle, the latch moves with it through a scroll, which rewrites
@@ -136,6 +138,49 @@ impl Particle {
     fn origin(&self) -> (Instant, u32, u32) {
         (self.born, self.x0.to_bits(), self.y0.to_bits())
     }
+}
+
+/// What a particle's paints decided, kept for the rest of its life
+/// ([`CursorGlow::emit_particles`]): no particle is shown or hidden frame by
+/// frame from where its flight has carried it. Judged by where it drifts
+/// each frame, a Comet grain went out in one frame as it drifted within two
+/// columns of the next row's letters, and a Laser spark rising into a
+/// filled row's margin went out halfway up (looks9's review).
+#[derive(Clone, Copy, PartialEq)]
+struct ParticleLatch {
+    /// Whether its first paint has judged its flight.
+    judged: bool,
+    /// The age, in seconds, it ends at: its life, or where its first paint
+    /// found its flight meets a filled row (a Laser spark's dash, a Water
+    /// drop: it fades out to there), or the age a change of the page under
+    /// it put it out at. It never comes back.
+    end: f32,
+    /// A Comet grain's seat in the dust beside a typed row.
+    seat: DustSeat,
+}
+
+impl ParticleLatch {
+    /// Unjudged: its life is its own.
+    const FRESH: Self = Self {
+        judged: false,
+        end: f32::INFINITY,
+        seat: DustSeat::Unseated,
+    };
+}
+
+/// A Comet grain's seat beside the typed row it was shed by, taken the first
+/// frame it floats in a row's glyph band and kept for its life: its row, and
+/// whether the air beside the row (a row blank across, on the page's own
+/// ground) takes it, and how deep. The row is kept as its top's offset from
+/// the grain's shed height, so a scroll that moves the one moves the other.
+#[derive(Clone, Copy, PartialEq)]
+enum DustSeat {
+    /// Not seated (yet): drawn along its own flight.
+    Unseated,
+    /// In the typed row's leading, no air beside it.
+    Leading { top_dy: f32 },
+    /// Floating out into `rows` rows (1 or 2) of air beside the typed row.
+    Air { top_dy: f32, rows: u8 },
 }
 
 #[derive(Clone, Copy)]
@@ -481,6 +526,11 @@ pub struct CursorGlow {
     /// luminance in the air too, no [`bed::AirLight`].
     #[cfg(any(test, debug_assertions))]
     bed_air_off: bool,
+    /// A test's negative control: the frame's combining marks unread, a
+    /// marked cell short by its base letter alone, as looks9 read it
+    /// ([`Self::observe_frame_text_marked`]).
+    #[cfg(any(test, debug_assertions))]
+    frame_marks_unread: bool,
     /// A test's negative control: a sample in the air by its own cell
     /// alone, beside a letter too ([`bed::air_lit`]).
     #[cfg(any(test, debug_assertions))]
@@ -588,6 +638,18 @@ pub struct CursorGlow {
     /// round 3's comet split; [`Self::comet_plume_unseeded`]'s successor).
     #[cfg(test)]
     comet_plume_drifting: bool,
+    /// A test's negative control: Comet's dark dust takes the air of a row
+    /// holding no letter within two cells of the grain's column, on the
+    /// page's ground there, as looks9 read it, not only a row blank across
+    /// on the page's ground ([`DustSeat`]).
+    #[cfg(test)]
+    comet_air_by_column: bool,
+    /// A test's negative control: a Comet grain's seat judged afresh every
+    /// frame, its row from its height and its air from that frame's read,
+    /// as looks9 laid it, not kept from the frame it was seated
+    /// ([`DustSeat`]).
+    #[cfg(test)]
+    comet_seat_unlatched: bool,
     /// A test's negative control: every lettered cell of the companion's
     /// keep-out a whole cell tall, a short glyph's blank top too (looks9 round
     /// 2's Q9; [`super::emit::SHORT_GLYPH_TOP_CH`]).
@@ -622,6 +684,11 @@ pub struct CursorGlow {
     /// [`Self::emit_particles`]).
     #[cfg(test)]
     laser_spark_head_only: bool,
+    /// A test's negative control: a Laser spark or Water drop put out the
+    /// frame its flight meets a filled row, as looks9 Q8 culled it, not
+    /// faded out to there from its first paint ([`ParticleLatch::end`]).
+    #[cfg(test)]
+    bars_cut_per_frame: bool,
     /// A test's negative control: a Laser strike's forks and channel laid
     /// as forged, a fork cut at its pane's edge to a fragment (looks9 round
     /// 2's Q8, [`Self::keep_strike_in_grid`]).
@@ -682,6 +749,22 @@ pub struct CursorGlow {
     /// round 3 kept it ([`Self::keep_strike_in_grid`]).
     #[cfg(test)]
     bolt_window_edge: bool,
+    /// A test's negative control: a Laser bolt's keepers read its corona as
+    /// a fifth of a row thick across its height alone, as looks9 round 3 read
+    /// it, not the girth [`Self::emit_bolts`] lays each segment
+    /// ([`Self::bolt_meets_a_bar`]).
+    #[cfg(test)]
+    bolt_girth_narrow: bool,
+    /// A test's negative control: a Laser bolt's keepers read each segment
+    /// between its ends alone, not the pixel past each that its slabs' tiling
+    /// lays ([`Self::bolt_meets_a_bar`]).
+    #[cfg(test)]
+    bolt_ends_unread: bool,
+    /// A test's negative control: a crackle the typing forges laid as it
+    /// was forged, its keeper ([`Self::keep_crackle_off_bars`]) not run on
+    /// the spawn path.
+    #[cfg(test)]
+    crackle_unkept: bool,
     /// A test's negative control: the light Comet's typing wedge as short as
     /// looks8 laid it (looks9 Q2, [`Self::COMET_LIGHT_WEDGE_CELLS`]).
     #[cfg(test)]
@@ -811,6 +894,11 @@ pub struct CursorGlow {
     neighbour_hold_hard: bool,
     #[cfg(test)]
     veil_unbound: bool,
+    /// A test's negative control: a paper landing reads a colour the user
+    /// chose as a style's own, brought to a clean hue as it was (review9fix
+    /// round 1, [`Self::paper_landing_pin`]).
+    #[cfg(test)]
+    paper_pin_unread: bool,
     light_verts: Vec<aterm_render::RibbonVertex>,
     light_band_run: Vec<CometSample>,
     bed_scratch: BedScratch,
@@ -942,12 +1030,16 @@ pub struct CursorGlow {
     /// The yield's scratch and caps ([`glass_yield::GlassYield`]), light only.
     glass_yield: glass_yield::GlassYield,
     /// The step instant and the report of the last yield that cut
-    /// ([`Self::yield_glass`]), light only.
+    /// ([`Self::yield_glass`]), light only: forgotten with the glass, on every step that lays
+    /// none ([`Self::forget_glass`]).
     yielded: Option<(Instant, glass_yield::YieldReport)>,
-    /// The step instant whose glass a word publish has yielded ([`Self::yield_glass`]): each
-    /// step's glass is cut once, so a later publish before the next step leaves its input as it
-    /// is. Light only.
+    /// The step instant whose glass a word publish cut ([`Self::yield_glass`]), beside
+    /// [`Self::yield_left`]. Light only: forgotten with the glass ([`Self::forget_glass`]).
     yield_spent: Option<Instant>,
+    /// The under stream, quads and ramps, that cut left: a publish handed it again (a host's
+    /// second word pass over its own frame) leaves it as it is, where a copy of the step's uncut
+    /// glass (a retained projection's) is cut. Light only: forgotten with the glass.
+    yield_left: (Vec<GlowQuad>, GlowRamps),
     /// The word icons' sprite sources, one per [`Self::word_icons`] entry
     /// ([`Self::note_word_icon_sprites`]; empty: each icon is its box).
     word_icon_src: Vec<icon_shade::IconSrc>,
@@ -1658,6 +1750,13 @@ impl CursorGlow {
     /// The share of its life a grain of Comet's dark dust beside a filled or
     /// lettered row keeps its seat in the leading: a spray at the head.
     const COMET_DARK_SEAT_LIFE: f32 = 0.35;
+    /// The step, in seconds, a Laser spark's or Water drop's first paint
+    /// reads its flight in for a filled row it would meet ([`ParticleLatch`]).
+    const BAR_SCAN_S: f32 = 0.004;
+    /// A Laser spark or Water drop whose flight meets a filled row sooner
+    /// than this, in seconds, after its first paint is not drawn at all: it
+    /// would only blink.
+    const BAR_SHOWN_MIN: f32 = 0.06;
     /// THE DENSE ROW'S SEATS: where the caret's row has no air above or
     /// below it (a powerline bar over it, a selection under it), Sparkle's
     /// and Fire's dark particles, which fly out of the row into the filled
@@ -2059,7 +2158,7 @@ impl CursorGlow {
         self.under_ramps.clear();
         self.out_ramps.clear();
         self.ink_ledger.clear_rails();
-        self.glass_laid.clear();
+        self.forget_glass();
         self.char_out.clear();
         self.fire_halo_out.clear();
         self.v2_beams.clear();
@@ -2206,7 +2305,11 @@ impl CursorGlow {
         self.fire_halo_out.clear();
         self.ink_ledger.close();
         self.ink_ledger.clear_rails();
-        self.glass_laid.clear();
+        self.forget_glass();
+        if !cfg.light.on() {
+            // The light left: the yield's memo of caps goes with it (§10.1).
+            self.glass_yield.forget();
+        }
         if self.frame_text.at != Some(now) {
             self.frame_text.rows.clear();
             self.frame_text.pairs.clear();
@@ -2367,6 +2470,7 @@ impl CursorGlow {
                 crate::classic_wake::WakeInk {
                     text: TextView::new(spans, Some(&self.frame_text)),
                     ledger: &mut self.ink_ledger,
+                    chosen: self.colour_pins.trail && cfg.style.draws_trail_color(),
                     feet: (feet.as_slice(), soles),
                 },
             );

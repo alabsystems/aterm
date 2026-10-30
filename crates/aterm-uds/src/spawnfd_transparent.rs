@@ -16,6 +16,8 @@ pub type TransparentChild = LaneChild;
 pub struct TransparentCommand {
     program: OsString,
     args: Vec<OsString>,
+    /// Variables set over this process's environment, in the order they were set.
+    env: Vec<(OsString, OsString)>,
 }
 
 /// A [`TransparentCommand`] for `program`.
@@ -24,6 +26,7 @@ pub fn transparent(program: impl AsRef<OsStr>) -> TransparentCommand {
     TransparentCommand {
         program: program.as_ref().to_owned(),
         args: Vec::new(),
+        env: Vec::new(),
     }
 }
 
@@ -45,6 +48,15 @@ impl TransparentCommand {
         self
     }
 
+    /// Set `key` to `value` in the child's environment, over this process's own (the rest of
+    /// which the child inherits, as `std::process::Command::env` does); a later set of the same
+    /// key wins.
+    pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        self.env
+            .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+        self
+    }
+
     /// The program, as it was named.
     #[must_use]
     pub fn get_program(&self) -> &OsStr {
@@ -62,7 +74,13 @@ impl TransparentCommand {
     /// does not exist, `PermissionDenied` for one that may not be run, and
     /// whatever else the spawn answers.
     pub fn spawn(&mut self) -> io::Result<TransparentChild> {
-        let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        for (key, value) in &self.env {
+            match env.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1.clone_from(value),
+                None => env.push((key.clone(), value.clone())),
+            }
+        }
         let image = Image::build(&self.program, &self.args, &env)?;
         let pid = platform::spawn(
             &image,

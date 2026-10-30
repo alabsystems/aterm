@@ -151,18 +151,8 @@ impl JobsPass {
         // Each age is the probe's as its reading starts.
         let probe_ms = read_ms();
         let read = self.reader.read_all(&reqs);
-        // A tab's root's pid version tells the engine it ran a program anew (`exec zsh`).
         let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
-        let procs: Vec<JobProc> = read
-            .iter()
-            .map(|p| JobProc {
-                version: roots
-                    .contains(&p.pid)
-                    .then(|| (readers.exec)(p.pid))
-                    .flatten(),
-                ..job_proc(p, stand_in)
-            })
-            .collect();
+        let procs = job_procs(&read, &roots, stand_in, readers.exec);
         let read_ms = read_ms();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
@@ -1006,6 +996,23 @@ fn fd(f: &probe::FdReading) -> Fd {
         probe::FdKind::Other => FdKind::Other,
     };
     Fd { fd: f.fd, kind }
+}
+
+/// The engine's readings of `read` ([`job_proc`]), each of a tab's root (`roots`) with its pid
+/// version (`exec`, asked of those roots alone): it tells the engine the root ran a program anew
+/// (`exec zsh`).
+fn job_procs(
+    read: &[ProcFacts],
+    roots: &BTreeSet<u32>,
+    stand_in: Option<u32>,
+    exec: impl Fn(u32) -> Option<u64>,
+) -> Vec<JobProc> {
+    read.iter()
+        .map(|p| JobProc {
+            version: roots.contains(&p.pid).then(|| exec(p.pid)).flatten(),
+            ..job_proc(p, stand_in)
+        })
+        .collect()
 }
 
 /// The engine's reading of `p`, held at macOS's program check where [`member_start`] reads it so
@@ -1882,6 +1889,75 @@ pub(crate) mod tests {
             (2, 0),
             "aterm's: the two in this process's coalition, not 23 in another"
         );
+    }
+
+    /// With this process's coalition unread, no held program outside every job counts as aterm's:
+    /// one whose own coalition is unread too is no match.
+    #[test]
+    fn with_this_process_coalition_unread_no_held_program_is_aterms() {
+        const ME: u32 = 501;
+        let row = |pid, cpu_ms: u64| ProcessReading {
+            pid,
+            uid: Some(ME),
+            cpu_ns: Some(cpu_ms * 1_000_000),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        };
+        let mut pass = JobsPass::new();
+        pass.held = HeldReaders {
+            start: |_, _| Some(AtStart::Held),
+            coalition: |_| None,
+            ..HeldReaders::INERT
+        };
+        let view = pass
+            .tick(
+                10_000,
+                || 10_000,
+                Some(&[row(10, 400), row(20, 2)]),
+                &[],
+                &[],
+                &[],
+                10,
+                false,
+                true,
+            )
+            .expect("a view");
+        assert_eq!(
+            view.findings
+                .program_check
+                .iter()
+                .map(|n| n.pid)
+                .collect::<Vec<_>>(),
+            [20],
+            "held"
+        );
+        assert_eq!(view.findings.program_check_aterm.0, 0, "not aterm's");
+    }
+
+    /// Only a tab's root is asked its pid version, and only its reading carries one.
+    #[test]
+    fn only_a_tabs_root_is_asked_its_pid_version() {
+        use std::cell::RefCell;
+        let read = [
+            ProcFacts {
+                pid: 10,
+                ..ProcFacts::default()
+            },
+            ProcFacts {
+                pid: 11,
+                ..ProcFacts::default()
+            },
+        ];
+        let asked = RefCell::new(Vec::new());
+        let procs = job_procs(&read, &BTreeSet::from([10]), None, |pid| {
+            asked.borrow_mut().push(pid);
+            Some(u64::from(pid) * 100 + 7)
+        });
+        assert_eq!(
+            procs.iter().map(|p| (p.pid, p.version)).collect::<Vec<_>>(),
+            [(10, Some(1007)), (11, None)]
+        );
+        assert_eq!(asked.into_inner(), [10]);
     }
 
     /// The stand-in reads held only where the reading judged a start (never a zombie's or another

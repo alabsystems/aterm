@@ -39,89 +39,50 @@ pub struct LogIdentity {
     pub generation: u64,
 }
 
-const fn decode_lower_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0' => Some(0),
-        b'1' => Some(1),
-        b'2' => Some(2),
-        b'3' => Some(3),
-        b'4' => Some(4),
-        b'5' => Some(5),
-        b'6' => Some(6),
-        b'7' => Some(7),
-        b'8' => Some(8),
-        b'9' => Some(9),
-        b'a' => Some(10),
-        b'b' => Some(11),
-        b'c' => Some(12),
-        b'd' => Some(13),
-        b'e' => Some(14),
-        b'f' => Some(15),
-        _ => None,
+const INVALID_HEX_SENTINEL: u16 = 0x0100;
+
+const fn decode_lower_nibble_u16(b: u8) -> u16 {
+    if b >= b'0' && b <= b'9' {
+        (b - b'0') as u16
+    } else if b >= b'a' && b <= b'f' {
+        (b - b'a' + 10) as u16
+    } else {
+        INVALID_HEX_SENTINEL
     }
 }
 
-const fn decode_lower_hex_byte(hi: u8, lo: u8) -> Option<u8> {
-    let Some(h) = decode_lower_nibble(hi) else {
-        return None;
-    };
-    let Some(l) = decode_lower_nibble(lo) else {
-        return None;
-    };
-    Some(((h & 0x0f) << 4) | (l & 0x0f))
+const fn decode_lower_hex_u16(hi: u8, lo: u8) -> u16 {
+    let h = decode_lower_nibble_u16(hi);
+    let l = decode_lower_nibble_u16(lo);
+    ((h & 0x0f) << 4) | (l & 0x0f) | ((h | l) & INVALID_HEX_SENTINEL)
 }
 
 const fn decode_id_hex(bytes: &[u8; 32]) -> Option<[u8; 16]> {
-    let Some(b0) = decode_lower_hex_byte(bytes[0], bytes[1]) else {
+    let mut rest: &[u8] = bytes;
+    let mut hi_half = 0u64;
+    let mut lo_half = 0u64;
+    let mut pairs = 0usize;
+    while let &[hi, lo, ref tail @ ..] = rest {
+        let b = decode_lower_hex_u16(hi, lo);
+        if (b & INVALID_HEX_SENTINEL) != 0 {
+            return None;
+        }
+        let byte_u64 = (b & 0xff) as u64;
+        if pairs < 8 {
+            hi_half = hi_half.wrapping_shl(8) | byte_u64;
+        } else {
+            lo_half = lo_half.wrapping_shl(8) | byte_u64;
+        }
+        pairs = pairs.saturating_add(1);
+        rest = tail;
+    }
+    if pairs != 16 || !rest.is_empty() {
         return None;
-    };
-    let Some(b1) = decode_lower_hex_byte(bytes[2], bytes[3]) else {
-        return None;
-    };
-    let Some(b2) = decode_lower_hex_byte(bytes[4], bytes[5]) else {
-        return None;
-    };
-    let Some(b3) = decode_lower_hex_byte(bytes[6], bytes[7]) else {
-        return None;
-    };
-    let Some(b4) = decode_lower_hex_byte(bytes[8], bytes[9]) else {
-        return None;
-    };
-    let Some(b5) = decode_lower_hex_byte(bytes[10], bytes[11]) else {
-        return None;
-    };
-    let Some(b6) = decode_lower_hex_byte(bytes[12], bytes[13]) else {
-        return None;
-    };
-    let Some(b7) = decode_lower_hex_byte(bytes[14], bytes[15]) else {
-        return None;
-    };
-    let Some(b8) = decode_lower_hex_byte(bytes[16], bytes[17]) else {
-        return None;
-    };
-    let Some(b9) = decode_lower_hex_byte(bytes[18], bytes[19]) else {
-        return None;
-    };
-    let Some(b10) = decode_lower_hex_byte(bytes[20], bytes[21]) else {
-        return None;
-    };
-    let Some(b11) = decode_lower_hex_byte(bytes[22], bytes[23]) else {
-        return None;
-    };
-    let Some(b12) = decode_lower_hex_byte(bytes[24], bytes[25]) else {
-        return None;
-    };
-    let Some(b13) = decode_lower_hex_byte(bytes[26], bytes[27]) else {
-        return None;
-    };
-    let Some(b14) = decode_lower_hex_byte(bytes[28], bytes[29]) else {
-        return None;
-    };
-    let Some(b15) = decode_lower_hex_byte(bytes[30], bytes[31]) else {
-        return None;
-    };
+    }
+    let [r0, r1, r2, r3, r4, r5, r6, r7] = hi_half.to_be_bytes();
+    let [r8, r9, r10, r11, r12, r13, r14, r15] = lo_half.to_be_bytes();
     Some([
-        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
+        r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15,
     ])
 }
 
@@ -188,22 +149,9 @@ const fn encode_lineage_step(g: u64, c: u64) -> [u8; 16] {
 }
 
 const fn decode_lineage_step(s: &[u8; 16]) -> (u64, u64) {
-    let g = (s[0] as u64)
-        | ((s[1] as u64) << 8)
-        | ((s[2] as u64) << 16)
-        | ((s[3] as u64) << 24)
-        | ((s[4] as u64) << 32)
-        | ((s[5] as u64) << 40)
-        | ((s[6] as u64) << 48)
-        | ((s[7] as u64) << 56);
-    let c = (s[8] as u64)
-        | ((s[9] as u64) << 8)
-        | ((s[10] as u64) << 16)
-        | ((s[11] as u64) << 24)
-        | ((s[12] as u64) << 32)
-        | ((s[13] as u64) << 40)
-        | ((s[14] as u64) << 48)
-        | ((s[15] as u64) << 56);
+    let &[s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15] = s;
+    let g = decode_u64_le_bytes(&[s0, s1, s2, s3, s4, s5, s6, s7]);
+    let c = decode_u64_le_bytes(&[s8, s9, s10, s11, s12, s13, s14, s15]);
     (g, c)
 }
 
@@ -243,18 +191,12 @@ impl LogIdentity {
     }
 
     const fn decode_wire(b: &[u8; Self::WIRE_LEN]) -> LogIdentity {
+        let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23] =
+            b;
         let id = [
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
-            b[14], b[15],
+            b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
         ];
-        let generation = (b[16] as u64)
-            | ((b[17] as u64) << 8)
-            | ((b[18] as u64) << 16)
-            | ((b[19] as u64) << 24)
-            | ((b[20] as u64) << 32)
-            | ((b[21] as u64) << 40)
-            | ((b[22] as u64) << 48)
-            | ((b[23] as u64) << 56);
+        let generation = decode_u64_le_bytes(&[b16, b17, b18, b19, b20, b21, b22, b23]);
         LogIdentity { id, generation }
     }
 

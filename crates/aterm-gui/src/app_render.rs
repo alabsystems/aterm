@@ -8548,6 +8548,10 @@ impl App {
                 None => ws.input_scratch.cols,
                 Some(_) => ws.composed_focus_scratch.cols,
             })
+            .with_frame_marks(match pane_text {
+                None => &ws.input_scratch.combining,
+                Some(_) => &ws.composed_focus_scratch.combining,
+            })
             .with_print_anchor(print_anchor)
             .with_print_anchor_glyph(print_anchor_glyph)
             .with_caret_drawn(cursor_visible),
@@ -10662,6 +10666,14 @@ impl App {
             };
             if !projected {
                 return None;
+            }
+            // The yield (§15.2 1.9): the route runs no word pass, so the glass the step laid
+            // yields to the frame's cells here, as a window's word publish yields it.
+            if let Some(window) = self.windows.get_mut(&id).map(Box::as_mut) {
+                let WindowState {
+                    fx, input_scratch, ..
+                } = window;
+                fx.yield_glass_unworded(input_scratch);
             }
         }
         match cursor_fx {

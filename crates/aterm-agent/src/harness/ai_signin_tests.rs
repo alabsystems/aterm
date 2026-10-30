@@ -985,3 +985,114 @@ receives = ["routed@outlook.example.test"]
     );
     assert!(warm.route_for(Some("alias1@pm.example.test")).is_none());
 }
+
+#[test]
+fn denied_member_stale_claim_cannot_block_active_member_mail_code() {
+    use crate::harness::claims::{Book, Claim, Kind, LeaseKey, Row, View};
+
+    let m12_id = deterministic_identity(12);
+    let m60_id = deterministic_identity(60);
+    let roster = SwarmRoster {
+        members: vec![
+            make_member("m12", &[], &m12_id, Some("node-m12")),
+            make_member("m60", &[], &m60_id, Some("node-m60")),
+        ],
+        deny_labels: vec!["m60".to_owned()],
+        deny_nodes: Vec::new(),
+    };
+    let key = LeaseKey::new("claude", "shared@example.com").unwrap();
+    let now = 1_760_000_000_i64;
+    let book = Book::of([
+        Row {
+            machine: "00000000000000000000000000000060".to_owned(),
+            label: "m60".to_owned(),
+            counter: 1,
+            until: now + 3_600,
+            claims: vec![Claim {
+                key: key.clone(),
+                kind: Kind::Lease,
+                since: now - 500,
+            }],
+        },
+        Row {
+            machine: "00000000000000000000000000000012".to_owned(),
+            label: "m12".to_owned(),
+            counter: 1,
+            until: now + 3_600,
+            claims: vec![Claim {
+                key,
+                kind: Kind::Lease,
+                since: now - 100,
+            }],
+        },
+    ]);
+    let view = View {
+        me: "00000000000000000000000000000001".to_owned(),
+        presence: None,
+    };
+    let req = MailCodeRequest {
+        email: "shared@example.com".to_owned(),
+        since: None,
+        senders: Vec::new(),
+        claimed_label: Some("m12".to_owned()),
+    };
+    let claims = (view, book);
+    let auth = authorize_mail_code_requester("node-m12", &req, &roster, None, Some(&claims), now)
+        .expect("active member m12 must not be blocked by denied m60's earlier claim");
+    assert_eq!(auth.label, "m12");
+    assert_eq!(auth.recipient, m12_id.recipient());
+}
+
+#[cfg(unix)]
+#[test]
+fn read_standby_steward_labels_filters_denied_stewards() {
+    use std::time::Duration;
+
+    let srv_dir = aterm_tempfile::tempdir().expect("server dir");
+    let home_dir = aterm_tempfile::tempdir().expect("home dir");
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let running = aterm_secrets::server::start(
+        socket,
+        &aterm_secrets::server::Options {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: srv_dir.path().to_path_buf(),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(50),
+            keep_awake: false,
+        },
+    )
+    .expect("start server");
+    let url = format!("http://{}/v1/test", running.addr);
+    let paths = aterm_secrets::client::Paths::for_home(home_dir.path());
+    aterm_secrets::client::create(&paths, &url, None, Some("m1")).expect("create vault");
+    let adm = aterm_secrets::client::admin_open(&paths).expect("admin open");
+    let mut doc = adm.doc.clone();
+    let roster = SwarmRoster {
+        members: Vec::new(),
+        deny_labels: vec!["m2".to_owned()],
+        deny_nodes: Vec::new(),
+    };
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .expect("set roster");
+    aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish");
+    aterm_secrets::client::sync(&paths, None).expect("sync");
+
+    std::fs::write(
+        home_dir.path().join(".secrets/swarm-policy.toml"),
+        "[[steward]]\nlabel = \"m2\"\nrank = 1\nalways_on = true\n\n[[steward]]\nlabel = \"m22\"\nrank = 2\nalways_on = true\n",
+    )
+    .unwrap();
+
+    let labels = read_standby_steward_labels(home_dir.path());
+    assert_eq!(
+        labels,
+        vec!["m22".to_owned()],
+        "denied steward m2 must be filtered out of standby steward labels"
+    );
+    running.stop();
+}

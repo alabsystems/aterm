@@ -45,16 +45,67 @@ pub(super) fn install(observe: fn() -> Option<NetworkObservation>) {
 
 struct Commons;
 
+fn denied_swarm_labels(paths: &Paths) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(paths) else {
+        return out;
+    };
+    for d in &roster.deny_labels {
+        out.insert(d.to_ascii_lowercase());
+    }
+    for member in &roster.members {
+        let member_denied = roster.is_label_denied(&member.label)
+            || member.aliases.iter().any(|a| roster.is_label_denied(a))
+            || member
+                .node_id
+                .as_deref()
+                .is_some_and(|n| roster.is_node_denied(n))
+            || member
+                .node_key
+                .as_deref()
+                .is_some_and(|k| roster.is_node_denied(k));
+        if member_denied {
+            out.insert(member.label.to_ascii_lowercase());
+            if !member.vault_name.trim().is_empty() {
+                out.insert(member.vault_name.trim().to_ascii_lowercase());
+            }
+            if let Some(claimed) = &member.claimed_label {
+                out.insert(claimed.to_ascii_lowercase());
+            }
+            for alias in &member.aliases {
+                out.insert(alias.to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
+
+fn label_is_denied(label: &str, denied: &std::collections::BTreeSet<String>) -> bool {
+    if denied.is_empty() {
+        return false;
+    }
+    let canon = aterm_secrets::swarm_roster::leading_m_label(label)
+        .map(|(_, c)| c)
+        .unwrap_or_else(|| label.trim_ascii().to_ascii_lowercase());
+    !canon.is_empty() && denied.contains(&canon)
+}
+
 impl Table for Commons {
     fn read(&self, home: &Path) -> Result<Tabled, String> {
-        let read = aterm_db::accounts::claims::read(&Paths::for_home(home))
-            .map_err(|why| why.to_string())?;
-        let book =
-            Book::of(read.rows.iter().filter_map(|(machine, body)| {
-                Row::from_value(&hex::encode_lower(machine), body).ok()
-            }));
+        let paths = Paths::for_home(home);
+        let read = aterm_db::accounts::claims::read(&paths).map_err(|why| why.to_string())?;
+        let me = hex::encode_lower(&read.me);
+        let denied = denied_swarm_labels(&paths);
+        let book = Book::of(
+            read.rows
+                .iter()
+                .filter_map(|(machine, body)| {
+                    Row::from_value(&hex::encode_lower(machine), body).ok()
+                })
+                .filter(|row| row.machine == me || !label_is_denied(&row.label, &denied)),
+        );
         Ok(Tabled {
-            me: hex::encode_lower(&read.me),
+            me,
             book,
             writable: read.writable,
         })

@@ -527,7 +527,9 @@ pub fn thread_stack(pid: u32, log: &Path, thread: Option<&str>) -> String {
 /// A `ctl` client that has not exited by now is hung.
 pub const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
 
-/// `aterm ctl --sock <sock> <args…>` against `inst`.
+/// `aterm ctl --sock <sock> <args…>` against `inst`. A discovery verb's probe (`ls`, `survey`,
+/// `brief`) waits the hang detector ([`aterm_ctl::PROBE_WITHIN_SEAM`]), not its 2 s: the instance
+/// it dials serves, so one that answers late is a loaded machine.
 pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
@@ -540,6 +542,10 @@ pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     launch_isolation::apply(&mut cmd, &inst.tmp);
+    cmd.env(
+        aterm_ctl::PROBE_WITHIN_SEAM,
+        MUST_HAPPEN.as_millis().to_string(),
+    );
     cmd
 }
 

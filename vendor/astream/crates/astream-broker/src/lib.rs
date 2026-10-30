@@ -124,6 +124,7 @@ mod compact;
 #[cfg(test)]
 mod crash_sim;
 mod escalation;
+pub mod failover;
 pub mod federation;
 pub mod health;
 #[cfg(feature = "retention")]
@@ -136,9 +137,11 @@ pub mod logid;
 mod power_loss;
 pub mod proto;
 mod recover;
+pub mod refill;
 #[cfg(feature = "retention")]
 pub mod retention;
 pub mod sharded;
+pub mod sticky_fence;
 mod storage;
 pub mod store;
 
@@ -163,9 +166,11 @@ pub use client::{
     LAST_WALK_PAGES_MAX,
 };
 pub use federation::{
-    federation_cursor_advance, federation_hop_allowed, federation_seq_clamp, FederatedCut,
-    FederationBridge, FederationConfig, FederationEndpoint, FederationError, FederationLink,
-    FederationReport, FederationWire, SubjectRewrite,
+    federation_cursor_advance, federation_hop_allowed, federation_seq_clamp,
+    parse_federation_rules, parse_rewrite_spec, FederatedCut, FederationBridge, FederationConfig,
+    FederationEndpoint, FederationError, FederationLink, FederationReport, FederationRule,
+    FederationRunner, FederationRunnerCloser, FederationWire, SubjectRewrite,
+    DEFAULT_FEDERATION_BATCH, MAX_FEDERATION_RULES,
 };
 
 /// Capability minting and principal derivation (`cap` feature), re-exported so
@@ -185,6 +190,11 @@ pub use escalation::{
     parse_escalation, parse_escalation_file, Escalate, Escalation, EscalationParseError,
     EscalationParseKind,
 };
+pub use failover::{
+    elect_highest_candidate, failover_epoch_advance, failover_fences_stale, failover_quorum_clamp,
+    inspect_node_log, promote_replica_log, repair_follower_for_leader, ElectionCandidate,
+    ElectionWinner, PromotedReplica,
+};
 pub use health::{health_path, read_health, BrokerHealth, HealthRead, HealthWriter, HEALTH_SUFFIX};
 pub use logid::{
     identity_path, logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity,
@@ -196,11 +206,21 @@ pub use proto::{
     REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
+pub use refill::{
+    refill_cursor_at_least_oldest, refill_debt_clamp, refill_join_cursor_max, LaneSchedule,
+    RefillStep, SharedRefillMeter, SharedRefillPlan, DEFAULT_REFILL_SPLIT_SLACK, MAX_REFILL_LANES,
+    REFILL_ROW_COST,
+};
 #[cfg(feature = "retention")]
 pub use retention::{parse_rule_line, parse_rules, record_bytes, Class, Keep, Retention, Rule};
 pub use sharded::{sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedHandle};
 #[cfg(unix)]
 pub use sharded::{ShardedClient, ShardedEvent, ShardedSubscription};
+pub use sticky_fence::{
+    format_gap_fenced_msg, parse_gap_fenced_seq, sticky_fence_admits, sticky_fence_admits_code,
+    sticky_fence_min_seq, sticky_fence_seq_allowed, sticky_fence_table_within_cap,
+    StickyFenceTable, GAP_FENCED_PREFIX, MAX_STICKY_FENCES,
+};
 pub use storage::{storage_len_advance, storage_truncate_within_len};
 #[cfg(feature = "anti-rollback")]
 pub use store::AntiRollback;

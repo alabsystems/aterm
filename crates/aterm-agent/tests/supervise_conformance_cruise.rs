@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
+use aterm_agent::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use aterm_agent::supervise::policy::turn_end::{
     Composer, DONE_CHECK, Outage, RULE_API_CUTOFF, RULE_CONTINUE, RULE_DONE_CHECK, Reach,
     TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD, WaitKind, decide_turn_end,
@@ -103,6 +104,7 @@ fn point(
         opens_cut: false,
         turn_said: Some(crate::common::earlier(earlier)),
         opened_by: None,
+        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -181,6 +183,8 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             Verdict::Check
         }
         TurnEndAction::Type { rule_id, .. } if is_answer_rule(rule_id) => Verdict::Answer,
+        // The owner's standing go-ahead answers a park as the model's Answer does.
+        TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_GO_AHEAD => Verdict::Answer,
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_CUTOFF => Verdict::WallAct,
         TurnEndAction::WaitUntil {
             why,

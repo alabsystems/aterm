@@ -354,7 +354,17 @@ pub(in crate::native_settings) fn laid_last() -> Option<ListRoom> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::native_settings) struct ListRoom {
     panel: (f32, f32),
+    /// Whether its panel frames its list, its rows laid out narrower ([`rows_alike`]).
+    framed: bool,
     held: (bool, bool, usize),
+    /// The nodes and heights it is led by ([`led_by`]).
+    led: u64,
+    /// Whether its list scrolls at every width it builds rows at: its room shorter than its lead.
+    scrolls: bool,
+    /// Whether its list captions its sections.
+    captions: bool,
+    /// Whether its lead lists the demo's strip.
+    strip: bool,
     room: f32,
     extra: f32,
     keyboard_pinned: bool,
@@ -377,6 +387,11 @@ impl ListRoom {
         self.extra
     }
 
+    /// How wide its panel is, and whether it frames its list ([`blocks_between`]).
+    pub(in crate::native_settings) const fn panel_framed(self) -> (f32, bool) {
+        (self.panel.0, self.framed)
+    }
+
     /// Whether the keyboard's control is pinned around the list, so the list never cuts it.
     pub(in crate::native_settings) const fn pins_keyboard(self) -> bool {
         self.keyboard_pinned
@@ -387,10 +402,79 @@ impl ListRoom {
         self.pin
     }
 
-    /// Whether the list lays its stops out as `other` does: as wide, pinned and led the same.
-    pub(in crate::native_settings) fn stops_as(self, other: Self) -> bool {
+    /// Whether its stops lay out as `other`'s do: as wide, its rows, captions, pins and lead alike.
+    pub(in crate::native_settings) fn stops_as(
+        self,
+        other: Self,
+        state: &SettingsViewState,
+    ) -> bool {
+        self.stops_as_at(other, [true, true], state)
+    }
+
+    /// [`Self::stops_as`] for a list laid in `laid`, only its narrower rows told where it scrolls.
+    pub(in crate::native_settings) fn drawn_as(
+        self,
+        laid: Self,
+        state: &SettingsViewState,
+    ) -> bool {
+        self.stops_as_at(laid, [!self.scrolls, true], state)
+    }
+
+    /// Whether a list laid in `other` is as wide and pinned alike: one a reuse here is told for.
+    #[cfg(test)]
+    pub(in crate::native_settings) fn held_as(self, other: Self) -> bool {
         self.panel.0 == other.panel.0 && self.held == other.held
     }
+
+    /// [`Self::stops_as`], its rows told alike at the widths `sides` names: wide, then narrower.
+    fn stops_as_at(self, other: Self, sides: [bool; 2], state: &SettingsViewState) -> bool {
+        let footer = !self.held.1;
+        self.panel.0 == other.panel.0
+            && self.captions == other.captions
+            && self.held == other.held
+            && self.led == other.led
+            && (self.framed == other.framed
+                || (0..2).all(|side| !sides[side] || rows_alike(state, self.panel.0, side, footer)))
+    }
+}
+
+/// Whether `panel_width`'s chooser rows at `side` (0, or 1: a gutter narrower) lay out as framed.
+fn rows_alike(state: &SettingsViewState, panel_width: f32, side: usize, footer: bool) -> bool {
+    let narrow = chooser_is_narrow(panel_width);
+    let query = state.showcase.query();
+    let tall = |inner: f32| {
+        // Its rows kept at both sides, so the blocks list them with none built.
+        let _ = chooser_rows_tallest(state, inner, narrow);
+        let width = if side == 0 {
+            inner
+        } else {
+            (inner - THUMB_GUTTER).max(0.0)
+        };
+        let mut tall = with_blocks(state, (width, narrow, &query), false, |entry| {
+            entry
+                .blocks
+                .iter()
+                .map(|(_, tall, _)| *tall)
+                .collect::<Vec<_>>()
+        });
+        if footer {
+            let rows = footer_rows(state, width, narrow);
+            tall.extend(rows.into_iter().map(|(_, tall)| tall));
+        }
+        tall
+    };
+    tall((panel_width - 2.0 * PANEL_INSET).max(0.0)) == tall(panel_width)
+}
+
+/// What [`ListRoom::stops_as`] tells a list's lead by: each node's key and height.
+fn led_by(lead: &[(UiNode, f32)]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for (node, height) in lead {
+        node.key.as_str().hash(&mut hasher);
+        height.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// How [`themes_page`] lays its list out at the chrome and bars `state` holds: its sizes, measured,
@@ -2529,6 +2613,7 @@ fn chooser_panel(
     let inner = (panel_width - 2.0 * inset).max(0.0);
     let footer = footer_rows(state, inner, narrow);
     let tallest_row = fit.rows(state, height).tallest_row;
+    let captions_from = captions_from(tallest_row);
     let lead_items: Vec<ListItem> = lead
         .iter()
         .cloned()
@@ -2555,7 +2640,13 @@ fn chooser_panel(
     };
     let laid = ListRoom {
         panel: (panel_width, height),
+        framed: inset > 0.0,
         held: (pins.head, pins.footer, lead.len()),
+        led: led_by(&lead),
+        // Its lead heads its list at every width.
+        scrolls: scroll::leading_span(&lead_items, 0.0, f32::INFINITY, usize::MAX) > room + 0.01,
+        captions: room + 0.5 >= captions_from,
+        strip: lead.iter().any(|(node, _)| node.key.as_str() == STRIP_KEY),
         room,
         extra: 0.0,
         keyboard_pinned: false,
@@ -2607,8 +2698,7 @@ fn chooser_panel(
             .page_rows
             .set(((room / row_height()).floor() as usize).max(1));
     }
-    let captions_from = captions_from(tallest_row);
-    let captions = room + 0.5 >= captions_from;
+    let captions = laid.captions;
     let led = lead_at(&lead);
     let items_at = |width: f32, painted: bool| {
         let at = (width.to_bits(), narrow, query.clone(), painted);
@@ -2821,7 +2911,12 @@ fn sheet_panel(
     };
     let laid = ListRoom {
         panel: (panel_width, height),
+        framed: true,
         held: (pin_title, false, lead.len()),
+        led: led_by(&lead),
+        scrolls: false,
+        captions: false,
+        strip: false,
         room,
         extra: 0.0,
         keyboard_pinned: false,
@@ -3342,6 +3437,12 @@ pub(in crate::native_settings) struct Between {
     pub(in crate::native_settings) over: Option<(f32, f32)>,
     /// How far the second's row stands over its panel's foot where a footer pins it.
     pub(in crate::native_settings) foot: f32,
+    /// Per width, the second's row where it is its own listed control: a span takes it in.
+    reach: [f32; 2],
+    /// Whether the first is its row's own control, over the second: its whole row spanned.
+    first_over: bool,
+    /// Whether the second is in the footer.
+    in_footer: bool,
 }
 
 impl Between {
@@ -3353,6 +3454,35 @@ impl Between {
         } else {
             (between.min(thin.0), from.min(thin.1), to.min(thin.2))
         }
+    }
+
+    /// Whether no screen of `there`'s list shows the first with the second (`footer`: its reach).
+    pub(in crate::native_settings) fn apart_in(
+        self,
+        there: ListRoom,
+        footer: impl FnOnce() -> [f32; 2],
+    ) -> bool {
+        let room = there.room;
+        let (between, first, _) = self.in_room(room);
+        let first = if self.first_over { first } else { 0.0 };
+        let past = |[wide, thin]: [f32; 2]| {
+            let second = if self.rows > room + 0.01 {
+                thin
+            } else {
+                wide.min(thin)
+            };
+            between + first + second > there.stops() + 0.01
+        };
+        let (head, footer_pinned, _) = there.held;
+        // Listed where its list lists it, not pinned round it: a head the strip's span takes in.
+        let listed = !there.keyboard_pinned
+            && match self.place {
+                Place::Listed => !(self.in_footer && footer_pinned),
+                Place::Head => !head,
+                Place::Strip => !head && there.strip,
+                Place::Footer => false,
+            };
+        listed && (past(self.reach) || self.in_footer && past(footer()))
     }
 
     /// The row a captioned list `room` tall stops with the second heading a section past the first.
@@ -3377,6 +3507,7 @@ pub(in crate::native_settings) fn blocks_between(
     let inner = (panel_width - 2.0 * inset).max(0.0);
     let query = state.showcase.query();
     let narrow = chooser_is_narrow(panel_width);
+    let (first_key, second) = (from, to);
     let head = chooser_head(state, inner)
         .iter()
         .any(|(node, _)| holds(node, to));
@@ -3392,21 +3523,30 @@ pub(in crate::native_settings) fn blocks_between(
                 .sum::<f32>()
     });
     let strip = !head && !footer && holds(&strip_node(state, page_width).0, to);
-    let between = |width: f32| {
+    // Each key's row, looked for first where it lay at another width: a tree's keys are unique.
+    let between = |width: f32, was: Option<(usize, Option<usize>)>| {
         with_blocks(state, (width, narrow, &query), false, |entry| {
-            let at = |key: &UiKey| {
-                entry
-                    .blocks
-                    .iter()
-                    .position(|(node, _, _)| holds(node, key))
+            let at = |key: &UiKey, was: Option<usize>| {
+                was.filter(|at| {
+                    entry
+                        .blocks
+                        .get(*at)
+                        .is_some_and(|(node, _, _)| holds(node, key))
+                })
+                .or_else(|| {
+                    entry
+                        .blocks
+                        .iter()
+                        .position(|(node, _, _)| holds(node, key))
+                })
             };
-            let from = at(from)?;
+            let from = at(from, was.map(|(from, _)| from))?;
             let (skip, take, first, to) = if head || strip {
                 (0, from, None, None)
             } else if footer {
                 (from + 1, entry.blocks.len(), Some(from), None)
             } else {
-                let to = at(to)?;
+                let to = at(to, was.and_then(|(_, to)| to))?;
                 (from != to).then_some((
                     from.min(to) + 1,
                     from.max(to),
@@ -3432,27 +3572,41 @@ pub(in crate::native_settings) fn blocks_between(
                 .iter()
                 .map(|(_, height, _)| *height)
                 .sum::<f32>();
+            // Whose row is its own control: the second's, and the first's where over the second.
+            let own = |at: usize, key: &UiKey| entry.blocks[at].0.key == *key;
+            let own = (
+                to.filter(|to| own(*to, second)).map_or(0.0, height),
+                !head && !strip && to.is_none_or(|to| to > from) && own(from, first_key),
+            );
             Some((
                 (rows, height(from), to.map_or(0.0, height)),
                 first.and_then(|first| caption_over(&entry.blocks, first)),
                 all,
-                joined,
+                (joined, own),
+                (from, to),
             ))
         })
     };
+    // A narrower list can lay its rows out shorter, where a row's slab gives way to its name.
+    let narrower = (inner - THUMB_GUTTER).max(0.0);
+    let (wide, over, rows, (joined, (reach, first_over)), found) = between(inner, None)?;
+    let (thin, thin_over, _, (thin_joined, (thin_reach, _)), _) = between(narrower, Some(found))?;
     // The footer's rows a listed footer lays out before `to`'s, and `to`'s.
-    let footer_at = |width: f32| {
-        let rows = footer_rows(state, width, narrow);
+    let footer_at = |rows: &[(UiNode, f32)]| {
         let at = rows.iter().position(|(node, _)| holds(node, to))?;
         Some((
             rows[..at].iter().map(|(_, height)| *height).sum::<f32>(),
             rows[at].1,
         ))
     };
-    // A narrower list can lay its rows out shorter, where a row's slab gives way to its name.
-    let narrower = (inner - THUMB_GUTTER).max(0.0);
-    let ((wide, over, rows, joined), (thin, thin_over, _, thin_joined)) =
-        (between(inner)?, between(narrower)?);
+    let footers = if footer {
+        Some([
+            footer_at(&pinned)?,
+            footer_at(&footer_rows(state, narrower, narrow))?,
+        ])
+    } else {
+        None
+    };
     let over = caption_at_both(over, thin_over);
     // Only a chooser beside the demo pins its footer; a leading strip leads its head too, unpinned.
     let place = if head {
@@ -3464,8 +3618,8 @@ pub(in crate::native_settings) fn blocks_between(
     } else {
         Place::Listed
     };
-    let at = |(rows, from, to): (f32, f32, f32), width: f32| {
-        Some(if head {
+    let at = |(rows, from, to): (f32, f32, f32), side: usize| {
+        if head {
             (rows, from, field_height())
         } else if strip {
             (
@@ -3473,20 +3627,23 @@ pub(in crate::native_settings) fn blocks_between(
                 from,
                 strip_button_height(),
             )
-        } else if footer {
-            let (before, to) = footer_at(width)?;
+        } else if let Some(footers) = footers {
+            let (before, to) = footers[side];
             (rows + before, from, to)
         } else {
             (rows, from, to)
-        })
+        }
     };
     Some(Between {
-        at: [at(wide, inner)?, at(thin, narrower)?],
+        at: [at(wide, 0), at(thin, 1)],
         rows,
         joined: [joined, thin_joined],
         place,
         over,
         foot,
+        reach: [reach, thin_reach],
+        first_over,
+        in_footer: footer,
     })
 }
 
@@ -3514,6 +3671,82 @@ pub(in crate::native_settings) fn caption_over_row(
 /// Whether `node` is `key`'s or holds it.
 fn holds(node: &UiNode, key: &UiKey) -> bool {
     node.key == *key || node.children.iter().any(|child| holds(child, key))
+}
+
+/// How far down its footer row `key` reaches, in a panel framed or not and a gutter narrower.
+pub(in crate::native_settings) fn footer_reach(
+    state: &SettingsViewState,
+    (panel_width, framed): (f32, bool),
+    key: &UiKey,
+) -> [f32; 2] {
+    let inner = (panel_width - if framed { 2.0 * PANEL_INSET } else { 0.0 }).max(0.0);
+    let narrow = chooser_is_narrow(panel_width);
+    [inner, (inner - THUMB_GUTTER).max(0.0)].map(|width| {
+        footer_rows(state, width, narrow)
+            .iter()
+            .find(|(node, _)| holds(node, key))
+            .and_then(|(node, tall)| {
+                let (spans, _) = scroll::control_spans_in(node, *tall);
+                spans
+                    .iter()
+                    .find(|(at, _, _)| at == key)
+                    .map(|(_, top, tall)| top + tall)
+            })
+            .unwrap_or(0.0)
+    })
+}
+
+/// Whether `there`'s list lists `first`'s row and `second` more apart than it stops, by theme rows.
+pub(in crate::native_settings) fn rows_apart(
+    state: &SettingsViewState,
+    page_width: impl Fn() -> f32,
+    there: ListRoom,
+    (first, second): (&UiKey, &UiKey),
+) -> bool {
+    // A keyboard pinned round the list is never cut by it, however far apart.
+    if there.keyboard_pinned {
+        return false;
+    }
+    let (panel_width, framed) = there.panel_framed();
+    let inner = (panel_width - if framed { 2.0 * PANEL_INSET } else { 0.0 }).max(0.0);
+    let narrow = chooser_is_narrow(panel_width);
+    // Kept at its width and a gutter narrower: each row as tall as it lays out at either.
+    let Some((kept, 0)) = rows_kept_at(state, inner, narrow) else {
+        return false;
+    };
+    let shortest = kept.iter().flatten().copied().fold(f32::INFINITY, f32::min);
+    let query = state.showcase.query();
+    // The theme rows a span from the first to the second takes in: as in [`Between::apart_in`].
+    let rows = with_blocks(state, (inner, narrow, &query), false, |entry| {
+        let at = |key: &UiKey| {
+            entry
+                .blocks
+                .iter()
+                .position(|(node, _, _)| holds(node, key))
+        };
+        let row = |at: usize| entry.blocks[at].2.is_some();
+        let own = |at: usize, key: &UiKey| row(at) && entry.blocks[at].0.key == *key;
+        let rows = |from: usize, to: usize| (from..to).filter(|at| row(*at)).count();
+        let from = at(first)?;
+        match at(second) {
+            Some(to) if to != from => Some(
+                rows(from.min(to) + 1, from.max(to))
+                    + usize::from(to > from && own(from, first))
+                    + usize::from(own(to, second)),
+            ),
+            // In its footer, listed under its rows where unpinned: only one beside the demo pins.
+            None if !there.held.1
+                && !matches!(Shape::for_width(page_width()), Shape::Beside { .. })
+                && footer_rows(state, inner, narrow)
+                    .iter()
+                    .any(|(node, _)| holds(node, second)) =>
+            {
+                Some(rows(from + 1, entry.blocks.len()) + usize::from(own(from, first)))
+            }
+            _ => None,
+        }
+    });
+    rows.is_some_and(|rows| rows as f32 * shortest > there.stops() + 0.01)
 }
 
 /// Whether the chooser's filter leaves theme row `key` out of a panel by width and frame.

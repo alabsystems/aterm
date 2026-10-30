@@ -13,7 +13,7 @@ use aterm_effects::color_math::contrast_ratio;
 use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
-use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
+use aterm_effects::kitty_pet::{OldPath, PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
@@ -239,6 +239,28 @@ impl Host {
         )
     }
 
+    /// [`Self::replay`], the head law's fit on the grid's last row reverted unless `fitted`
+    /// ([`OldPath::RowFit`]): where the prompt sits under a lettered line there, the fit keeps
+    /// the cat off it too, so a law that keeps it off the line is judged alone with the fit
+    /// reverted.
+    fn replay_fit(
+        theme: Theme,
+        unseen: bool,
+        fitted: bool,
+        events: &[(u64, Rec, Option<PetInputKind>)],
+        tail: u64,
+    ) -> Self {
+        Self::replay_with(
+            theme,
+            &|owner| {
+                owner.set_pet_letters_unseen(unseen);
+                owner.set_pet_old_path(OldPath::RowFit, !fitted);
+            },
+            events,
+            tail,
+        )
+    }
+
     /// [`Self::replay`] with the owner set up by `setup` first.
     fn replay_with(
         theme: Theme,
@@ -328,36 +350,46 @@ fn returns(shots: &[&Shot]) -> usize {
 fn a_cat_rests_beside_the_line_an_enter_at_the_bottom_prints() {
     let (ev, enter) = enter_bottom("echo the quick brown fox", "the quick brown fox");
     for theme in [DARK, LIGHT] {
-        let h = Host::replay(theme, false, &ev, 3_000);
-        let shots: Vec<&Shot> = after(&h, enter).collect();
-        for s in &shots {
-            if let Some((c, row, col)) = s.worst {
-                assert!(
-                    c >= BAR,
-                    "{}: {} ms after Enter the cat ({:?}, alpha {}) lies on the letter at \
+        for fitted in [true, false] {
+            let label = format!(
+                "{} ({})",
+                theme.name,
+                if fitted {
+                    "as it ships"
+                } else {
+                    "the fit reverted"
+                }
+            );
+            let h = Host::replay_fit(theme, false, fitted, &ev, 3_000);
+            let shots: Vec<&Shot> = after(&h, enter).collect();
+            for s in &shots {
+                if let Some((c, row, col)) = s.worst {
+                    assert!(
+                        c >= BAR,
+                        "{}: {} ms after Enter the cat ({:?}, alpha {}) lies on the letter at \
                      ({row}, {col}), {c:.2}:1 at worst",
-                    theme.name,
-                    s.ms - enter,
-                    s.frame.action,
-                    s.frame.alpha,
-                );
+                        label,
+                        s.ms - enter,
+                        s.frame.action,
+                        s.frame.alpha,
+                    );
+                }
             }
+            let last = shots.last().expect("frames after Enter");
+            assert!(
+                last.frame.action.settled() && last.frame.alpha == 255,
+                "{}: the cat ends at rest and whole ({:?}, alpha {})",
+                label,
+                last.frame.action,
+                last.frame.alpha
+            );
+            assert!(
+                shots.iter().all(|s| s.frame.alpha == 255),
+                "{}: nothing veils a cat that rests off the words",
+                label
+            );
         }
-        let last = shots.last().expect("frames after Enter");
-        assert!(
-            last.frame.action.settled() && last.frame.alpha == 255,
-            "{}: the cat ends at rest and whole ({:?}, alpha {})",
-            theme.name,
-            last.frame.action,
-            last.frame.alpha
-        );
-        assert!(
-            shots.iter().all(|s| s.frame.alpha == 255),
-            "{}: nothing veils a cat that rests off the words",
-            theme.name
-        );
-
-        let blind = Host::replay(theme, true, &ev, 3_000);
+        let blind = Host::replay_fit(theme, true, false, &ev, 3_000);
         let worst = after(&blind, enter)
             .filter(|s| s.frame.action.settled())
             .filter_map(|s| s.worst)
@@ -435,53 +467,59 @@ fn a_cat_under_a_line_lettered_to_the_margin_is_veiled_once() {
         ev.push((at, Rec::Out(format!("\x1b[{col}G").into_bytes()), None));
     }
     for theme in [DARK, LIGHT] {
-        let h = Host::replay(theme, false, &ev, 3_000);
-        let shots: Vec<&Shot> = after(&h, enter).collect();
-        let under: Vec<_> = shots
-            .iter()
-            .filter(|s| s.worst.is_some_and(|(c, ..)| c < BAR))
-            .map(|s| (s.ms - enter, s.frame.alpha, s.worst))
-            .collect();
-        assert!(
-            under.is_empty(),
-            "{}: frames after Enter lay a letter under the bar (ms after Enter, alpha, \
-             worst): {under:?}",
-            theme.name
-        );
-        let settled = shots.iter().filter(|s| s.frame.action.settled()).count();
-        assert!(
-            settled > 300,
-            "{}: the cat rests between the moves ({settled} frames)",
-            theme.name
-        );
-        let on_letters: Vec<&Shot> = shots
-            .iter()
-            .copied()
-            .filter(|s| s.worst.is_some())
-            .collect();
-        assert_eq!(
-            returns(&on_letters),
-            0,
-            "{}: a cat on the letters fades once and stays faded",
-            theme.name
-        );
-        let flown = flights(&shots);
-        assert!(
-            flown.len() >= 3,
-            "{}: the moves fly ({flown:?})",
-            theme.name
-        );
-        for &(ms, gathered, left, least, most) in &flown {
-            assert!(
-                most <= gathered && u32::from(least) * 10 >= u32::from(left) * 9,
-                "{}: the flight gathered {} ms after Enter at {gathered} left the ground at \
-                 {left} and was drawn from {least} to {most}",
+        for fitted in [true, false] {
+            let label = format!(
+                "{} ({})",
                 theme.name,
-                ms - enter
+                if fitted {
+                    "as it ships"
+                } else {
+                    "the fit reverted"
+                }
             );
+            let h = Host::replay_fit(theme, false, fitted, &ev, 3_000);
+            let shots: Vec<&Shot> = after(&h, enter).collect();
+            let under: Vec<_> = shots
+                .iter()
+                .filter(|s| s.worst.is_some_and(|(c, ..)| c < BAR))
+                .map(|s| (s.ms - enter, s.frame.alpha, s.worst))
+                .collect();
+            assert!(
+                under.is_empty(),
+                "{}: frames after Enter lay a letter under the bar (ms after Enter, alpha, \
+             worst): {under:?}",
+                label
+            );
+            let settled = shots.iter().filter(|s| s.frame.action.settled()).count();
+            assert!(
+                settled > 300,
+                "{}: the cat rests between the moves ({settled} frames)",
+                label
+            );
+            let on_letters: Vec<&Shot> = shots
+                .iter()
+                .copied()
+                .filter(|s| s.worst.is_some())
+                .collect();
+            assert_eq!(
+                returns(&on_letters),
+                0,
+                "{}: a cat on the letters fades once and stays faded",
+                label
+            );
+            let flown = flights(&shots);
+            assert!(flown.len() >= 3, "{}: the moves fly ({flown:?})", label);
+            for &(ms, gathered, left, least, most) in &flown {
+                assert!(
+                    most <= gathered && u32::from(least) * 10 >= u32::from(left) * 9,
+                    "{}: the flight gathered {} ms after Enter at {gathered} left the ground at \
+                 {left} and was drawn from {least} to {most}",
+                    label,
+                    ms - enter
+                );
+            }
         }
-
-        let blind = Host::replay(theme, true, &ev, 3_000);
+        let blind = Host::replay_fit(theme, true, false, &ev, 3_000);
         let last = after(&blind, enter).last().expect("frames after Enter");
         assert!(
             last.worst.is_some_and(|(c, ..)| c < BAR),
@@ -492,7 +530,10 @@ fn a_cat_under_a_line_lettered_to_the_margin_is_veiled_once() {
         );
         let dwelt = Host::replay_with(
             theme,
-            &|owner| owner.set_pet_letter_arrival_dwells(true),
+            &|owner| {
+                owner.set_pet_letter_arrival_dwells(true);
+                owner.set_pet_old_path(OldPath::RowFit, true);
+            },
             &ev,
             3_000,
         );
@@ -662,23 +703,37 @@ fn output_streaming_after_an_enter_never_blinks_the_veiled_cat() {
         (settled, returns(&span), falls, under)
     };
     for theme in [DARK, LIGHT] {
-        let h = Host::replay(theme, false, &ev, 1_000);
-        let (settled, back, falls, under) = judge(&h);
-        assert!(
-            settled > 150,
-            "{}: fixture: the cat rests through the stream ({settled} frames)",
-            theme.name
-        );
-        assert_eq!(
-            (back, falls, under),
-            (0, 0, 0),
-            "{}: through the stream the cat came back {back} times, fell over 60 levels in one \
+        for fitted in [true, false] {
+            let label = format!(
+                "{} ({})",
+                theme.name,
+                if fitted {
+                    "as it ships"
+                } else {
+                    "the fit reverted"
+                }
+            );
+            let h = Host::replay_fit(theme, false, fitted, &ev, 1_000);
+            let (settled, back, falls, under) = judge(&h);
+            assert!(
+                settled > 150,
+                "{}: fixture: the cat rests through the stream ({settled} frames)",
+                label
+            );
+            assert_eq!(
+                (back, falls, under),
+                (0, 0, 0),
+                "{}: through the stream the cat came back {back} times, fell over 60 levels in one \
              frame {falls} times, and lay on a letter under the bar in {under} frames",
-            theme.name
-        );
+                label
+            );
+        }
         let armed = Host::replay_with(
             theme,
-            &|owner| owner.set_pet_letter_step_rearms(true),
+            &|owner| {
+                owner.set_pet_letter_step_rearms(true);
+                owner.set_pet_old_path(OldPath::RowFit, true);
+            },
             &ev,
             1_000,
         );

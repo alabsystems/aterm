@@ -4,6 +4,14 @@
 use super::*;
 
 fn trial(case: i64, action: &str) -> [i64; 7] {
+    let timed = trial_with_stamp(case, action, true);
+    if case >= 9 {
+        assert_eq!(trial_with_stamp(case, action, false), timed);
+    }
+    timed
+}
+
+fn trial_with_stamp(case: i64, action: &str, stamped: bool) -> [i64; 7] {
     let world = World::new("planning");
     let cli = Cli::Codex;
     world.two(cli);
@@ -19,7 +27,13 @@ fn trial(case: i64, action: &str) -> [i64; 7] {
             Ok(Vec::new())
         })
         .unwrap();
-    let s = session(cli, Supervisor::Aterm, Mode::Early, Path::new("/opt/codex"));
+    let mut s = session(cli, Supervisor::Aterm, Mode::Early, Path::new("/opt/codex"));
+    if case >= 9 {
+        s.point = Point::Wall {
+            window: "five_hour".into(),
+            at: stamped.then_some(NOW),
+        };
+    }
     let plan = super::super::session_plan(&world.seat(), &s, |note| note.record());
     let debug = format!("{plan:?}");
     assert!(!debug.contains(plan.prepared.as_ref().unwrap().line.as_str()));
@@ -79,12 +93,28 @@ fn trial(case: i64, action: &str) -> [i64; 7] {
                 let other = super::super::session_plan(&world.seat(), &s, |note| note.record());
                 assert!(other.commit(NOW).line.is_some());
             }
+            11 | 12 => {
+                store
+                    .transact(NOW + MIN, &mut None, |state| {
+                        Ok(accounts::note_wall(
+                            state,
+                            "main",
+                            if case == 11 { "seven_day" } else { "five_hour" },
+                            (case == 12).then_some(NOW + HOUR),
+                            NOW + MIN,
+                            NOW + MIN,
+                        ))
+                    })
+                    .unwrap();
+            }
             _ => {}
         }
     }
     let now = match case {
         7 if change => NOW + 4 * HOUR,
         8 if change => NOW - 1,
+        9 | 11 | 12 if change => NOW + accounts::NO_RESET_WALL_S[0],
+        10 if change => NOW + accounts::NO_RESET_WALL_S[0] - 1,
         _ => NOW,
     };
     let before = store.load(now).unwrap().0;
@@ -158,7 +188,7 @@ pub(crate) fn planning_transition(
 #[test]
 fn planning_conforms_without_allocating_a_rotation() {
     let model = aterm_models_harness::account_pool_planning_model();
-    assert_eq!(model.mutant_dials(), (1..=13).collect::<Vec<_>>());
+    assert_eq!(model.mutant_dials(), (1..=17).collect::<Vec<_>>());
     aterm_spec::interp::prove_and_catch(&model);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
@@ -176,7 +206,7 @@ fn planning_conforms_without_allocating_a_rotation() {
     let mut planned = planning_transition(&state, "Plan");
     planned.insert("count", 1);
     assert!(!model.check_invariant("Planning", &planned));
-    for case in 1..=7 {
+    for case in (1..=7).chain([9]) {
         state.insert("case", case);
         let mut denied = planning_transition(&state, "Finish");
         assert_eq!(denied["committed"], 0);

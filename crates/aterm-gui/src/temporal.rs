@@ -192,11 +192,17 @@ pub(crate) fn keyframe_of(term: &Terminal, max_history: usize) -> Option<ReplayK
 
 /// A message on its way to a recorder, with the recording generation it was sent in ([`TemporalRecorder::forget`]) and the bytes it holds ([`TemporalMsg::weight`]).
 struct Queued {
-    to: Option<Arc<Mutex<TemporalRecorder>>>,
-    state: Arc<QueueState>,
+    route: Arc<QueueRoute>,
     generation: u64,
     weight: usize,
     msg: TemporalMsg,
+}
+
+/// The immutable destination and accounting of one queue, shared once per message. A drain
+/// holds only the accounting state, so it cannot keep a retired recorder alive.
+struct QueueRoute {
+    to: Option<Arc<Mutex<TemporalRecorder>>>,
+    state: Arc<QueueState>,
 }
 
 /// How many messages a reader may have queued that the writer has not written yet.
@@ -242,10 +248,14 @@ pub(crate) fn open(
         let rec = recorder.lock().unwrap_or_else(PoisonError::into_inner);
         (rec.spine_watermark(), rec.budget)
     };
+    let state = Arc::new(QueueState::on(pool().clone()));
     Ok(TemporalTx {
         sender,
-        to: Some(recorder.clone()),
-        state: Arc::new(QueueState::on(pool().clone())),
+        route: Arc::new(QueueRoute {
+            to: Some(recorder.clone()),
+            state: state.clone(),
+        }),
+        state,
         spine,
         cap,
         byte_cap: budget.max(MIN_QUEUE_BYTES),
@@ -278,11 +288,11 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                     while let Some(first) = next {
                         let mut cur = Some(first);
                         while let Some(queued) = cur {
-                            if let Some(to) = &queued.to {
+                            if let Some(to) = &queued.route.to {
                                 write_queued(to, queued.generation, queued.msg);
                             }
-                            queued.state.written(queued.weight);
-                            queued.state.pool.relieve();
+                            queued.route.state.written(queued.weight);
+                            queued.route.state.pool.relieve();
                             cur = rx.try_recv().ok();
                         }
                         if pool().relief_due() {
@@ -333,7 +343,10 @@ fn queue_in(
     (
         TemporalTx {
             sender,
-            to: None,
+            route: Arc::new(QueueRoute {
+                to: None,
+                state: state.clone(),
+            }),
             state: state.clone(),
             spine,
             cap,
@@ -379,7 +392,7 @@ impl QueueState {
 #[derive(Clone)]
 pub(crate) struct TemporalTx {
     sender: Sender<Queued>,
-    to: Option<Arc<Mutex<TemporalRecorder>>>,
+    route: Arc<QueueRoute>,
     state: Arc<QueueState>,
     spine: Arc<SpineWatermark>,
     cap: usize,
@@ -395,8 +408,7 @@ impl TemporalTx {
         }
         self.state.queue(weight);
         let queued = Queued {
-            to: self.to.clone(),
-            state: self.state.clone(),
+            route: self.route.clone(),
             generation: self.spine.generation(),
             weight,
             msg,
@@ -1713,6 +1725,8 @@ impl TemporalRecorder {
             freed_keyframe = prev_charge;
             command |= prev.command;
         }
+        let retained_bytes =
+            charge_of(&keyframe.checkpoint).saturating_add(keyframe.carry.retained_image_bytes());
         let keyframe = RetainedKeyframe {
             #[cfg(test)]
             id,
@@ -1725,6 +1739,7 @@ impl TemporalRecorder {
             coalesceable,
             command,
             packed: false,
+            retained_bytes,
             checkpoint: keyframe.checkpoint,
             carry: keyframe.carry,
             config,
@@ -2727,6 +2742,8 @@ struct RetainedKeyframe {
     command: bool,
     /// Whether unshared small slices in this completed chain were packed into slabs.
     packed: bool,
+    /// Immutable checkpoint and carry payload bytes, charged once when the keyframe is retained.
+    retained_bytes: usize,
     checkpoint: Arc<TerminalCheckpoint>,
     /// The in-process transient state no checkpoint carries ([`ReplayCarry`]).
     carry: Arc<ReplayCarry>,
@@ -2735,8 +2752,8 @@ struct RetainedKeyframe {
 }
 
 impl RetainedKeyframe {
-    fn charge(&self) -> usize {
-        charge_of(&self.checkpoint).saturating_add(self.carry.retained_image_bytes())
+    const fn charge(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -5608,6 +5625,32 @@ mod tests {
         assert!(tx.send(msg()), "one written frees one place");
         drop(rx);
         assert!(!tx.send(msg()), "a closed queue takes nothing");
+    }
+
+    #[test]
+    fn queued_messages_keep_the_recorder_alive_but_a_completed_drain_does_not() {
+        let recorder = Arc::new(Mutex::new(TemporalRecorder::new()));
+        let weak = Arc::downgrade(&recorder);
+        let (mut tx, rx) = queue(2);
+        tx.route = Arc::new(QueueRoute {
+            to: Some(recorder.clone()),
+            state: tx.state.clone(),
+        });
+        let drain = tx.drain();
+        assert!(tx.send(TemporalMsg::RawIn(InputSlice::at(b"x", clock(0)))));
+        drop(tx);
+        drop(recorder);
+        assert!(weak.upgrade().is_some(), "queued work owns its recorder");
+        let queued = rx.rx.try_recv().expect("queued work");
+        drop(rx);
+        assert!(!drain.is_finished());
+        queued.route.state.written(queued.weight);
+        drop(queued);
+        assert!(drain.is_finished());
+        assert!(
+            weak.upgrade().is_none(),
+            "a retained drain must not keep the completed recorder alive"
+        );
     }
 
     #[test]

@@ -42,6 +42,9 @@ struct DoorHost {
     /// The wall (unix ms) of the read the run is at, when the facts reading is taken.
     facts_at: Mutex<i64>,
     calls: Mutex<Vec<String>>,
+    /// The exceptions the loop put on the host ([`IdleHost::exception`]), each by its `why`, and
+    /// `None` for one ended, in order.
+    exceptions: Mutex<Vec<Option<String>>>,
     /// What the door told the host ([`IdleHost::occupancy_said`]), in order.
     said: Mutex<Vec<OccupancySaid>>,
     /// The task record's answer to the task door ([`IdleHost::task_fact`]); `None`, a record's:
@@ -115,6 +118,12 @@ impl IdleHost for DoorHost {
     }
     fn fact_owed(&self) -> bool {
         self.fact.lock().expect("fact").is_some()
+    }
+    fn exception(&self, standing: Option<&crate::supervise::policy::exception::Exception>) {
+        self.exceptions
+            .lock()
+            .expect("exceptions")
+            .push(standing.map(|e| e.why.clone()));
     }
     fn at_background_fact(&self, point: IdlePoint) -> Option<HostStep> {
         self.called("at_background_fact".to_string());

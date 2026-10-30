@@ -32,13 +32,26 @@ use std::time::Duration;
 
 /// How long a heard request shows (§3.3.4 "Limits on phrases").
 pub const REQUEST_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
-/// How many requests a desk holds; past it the oldest settled one (ignored, let in, or allowed
-/// with a phrase that can no longer admit), else the oldest still asking, goes. A row whose
-/// phrase can still admit never goes: at most [`crate::pake::MAX_LIVE`] rows hold one.
+/// How many requests a desk holds. Past it the oldest settled one (ignored, let in, or allowed
+/// with a phrase that can no longer admit) goes, else an asking one of the sources that hold the
+/// most asking rows ([`Desk::victim`] among them): a flood's, while it holds more rows from each
+/// of its addresses than a Mac asking for itself holds from its own. A row whose phrase can still
+/// admit never goes: at most [`crate::pake::MAX_LIVE`] rows hold one.
 pub const MAX_HEARD: usize = 64;
 /// The asking rows one source holds (an IPv4 address, an IPv6 /64): its next new request takes
-/// the place of its own oldest, so one LAN host's flood never pushes another Mac's row out.
+/// the place of one of its own ([`Desk::victim`] among them), so one LAN host's flood never
+/// pushes another Mac's row out.
 pub const PER_SOURCE: usize = 4;
+/// How long after its first ask a request that asks again counts as a waiting Mac's. A Mac
+/// waiting to be let in asks each member again (its subscriber once a minute, `aterm members
+/// join` every few seconds), and its row goes only once no row that is not a waiting Mac's is
+/// left among those that may go ([`Desk::victim`]).
+pub const ASKED_AGAIN_AFTER: Duration = Duration::from_secs(30);
+/// How long a row that asked again stays a waiting Mac's without asking once more: past twice
+/// the subscriber's minute, so one ask lost on the LAN keeps it, while a Mac that stopped asking
+/// (or a host that asked its own requests again once) holds no row ahead of a fresh one for the
+/// rest of [`REQUEST_LIFETIME`].
+pub const STILL_ASKING: Duration = Duration::from_secs(3 * 60);
 /// From this many asking rows on, the band shows them as one row.
 pub const COLLAPSE_AT: usize = 10;
 /// The CPace runs one source address may start a minute.
@@ -108,6 +121,7 @@ pub struct Local {
     trust: Trust,
     can_allow: bool,
     name: String,
+    removed: client::RemovedNotes,
     admitted: std::collections::BTreeSet<crate::membership_log::MemberId>,
 }
 
@@ -135,12 +149,16 @@ impl Local {
         let name = client::config(paths)?
             .map(|config| config.host)
             .unwrap_or_default();
+        // A removed Mac that asks again shows as removed, not new (F16): from the log this Mac
+        // holds, read without the state lock (the records file is written whole).
+        let removed = client::removed_notes(paths).unwrap_or_default();
         Ok(Some(Self {
             device,
             request,
             trust,
             can_allow,
             name,
+            removed,
             admitted,
         }))
     }
@@ -159,8 +177,17 @@ impl Local {
             trust,
             can_allow,
             name: name.to_owned(),
+            removed: client::RemovedNotes::default(),
             admitted: std::collections::BTreeSet::new(),
         })
+    }
+
+    /// This member with `removed` as the Macs its log removed: the seam a test gives a desk
+    /// built by [`Local::with`] its log's removals with.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_removed(self, removed: client::RemovedNotes) -> Self {
+        Self { removed, ..self }
     }
 
     /// The writer key this member's greeting names and its `CI` binds.
@@ -217,6 +244,11 @@ pub struct Row {
     pub code: String,
     /// What it is doing.
     pub state: RowState,
+    /// The membership log removed this Mac (by its recipient or its writer key): who did and
+    /// when, so the band asks "Allow again?" instead of showing a new Mac (F16).
+    pub removed: Option<client::RemovedNote>,
+    /// A person pressed "Allow again": the run restores the Mac a plain removal took out.
+    pub restore: bool,
 }
 
 struct Heard {
@@ -227,7 +259,12 @@ struct Heard {
     model: String,
     from: IpAddr,
     first: Instant,
+    /// Whether it asked again [`ASKED_AGAIN_AFTER`] or more after `first`.
+    again: bool,
+    /// When it last asked.
+    last: Instant,
     state: RowState,
+    restore: bool,
 }
 
 /// One `ask` line's fields, as [`Desk::hear`] checks them.
@@ -300,6 +337,7 @@ struct Running {
     node: [u8; 32],
     name: String,
     reads_log: bool,
+    restore: bool,
 }
 
 impl Desk {
@@ -415,30 +453,65 @@ impl Desk {
         }
     }
 
-    /// Make room for a new request from `from`: its source's own oldest asking row once it holds
-    /// [`PER_SOURCE`], else, at [`MAX_HEARD`], the oldest settled row or the oldest asking one.
+    /// Whether `heard` is a waiting Mac's at `now`: it asked again [`ASKED_AGAIN_AFTER`] or more
+    /// after its first ask, and last asked within [`STILL_ASKING`].
+    fn waiting(heard: &Heard, now: Instant) -> bool {
+        heard.again && now.saturating_duration_since(heard.last) < STILL_ASKING
+    }
+
+    /// Which of the asking rows `rows` (oldest first) goes: the oldest that is not a waiting
+    /// Mac's ([`Desk::waiting`]), else the oldest. A Mac that just asked is then the last of the
+    /// rows that have not asked again to go, and a Mac waiting to be let in keeps its row while
+    /// another is left.
+    fn victim(&self, rows: &[usize], now: Instant) -> Option<usize> {
+        rows.iter()
+            .find(|&&at| !Self::waiting(&self.heard[at], now))
+            .or_else(|| rows.first())
+            .copied()
+    }
+
+    /// The asking rows `asking` (oldest first) of the sources that hold the most of them. A host
+    /// whose flood fills the desk from fewer addresses than it holds rows holds more than one
+    /// from each, so a Mac asking for itself from its own address (one row) is never among them
+    /// while it does.
+    fn crowded(&self, asking: &[usize]) -> Vec<usize> {
+        let mut held = std::collections::BTreeMap::<IpAddr, usize>::new();
+        for &at in asking {
+            *held.entry(source_of(self.heard[at].from)).or_default() += 1;
+        }
+        let most = held.values().copied().max();
+        asking
+            .iter()
+            .copied()
+            .filter(|&at| held.get(&source_of(self.heard[at].from)).copied() == most)
+            .collect()
+    }
+
+    /// Make room for a new request from `from`: one of its source's own asking rows once it
+    /// holds [`PER_SOURCE`], else, at [`MAX_HEARD`], the oldest settled row or an asking one of
+    /// the most crowded sources ([`Desk::crowded`], [`Desk::victim`]).
     fn make_room(&mut self, from: IpAddr, now: Instant) -> Result<()> {
         let source = source_of(from);
-        let theirs: Vec<usize> = (0..self.heard.len())
-            .filter(|&at| {
-                self.heard[at].state == RowState::Asking && source_of(self.heard[at].from) == source
-            })
+        let asking: Vec<usize> = (0..self.heard.len())
+            .filter(|&at| self.heard[at].state == RowState::Asking)
+            .collect();
+        let theirs: Vec<usize> = asking
+            .iter()
+            .copied()
+            .filter(|&at| source_of(self.heard[at].from) == source)
             .collect();
         if theirs.len() >= PER_SOURCE {
-            self.drop_row(theirs[0]);
+            if let Some(at) = self.victim(&theirs, now) {
+                self.drop_row(at);
+            }
             return Ok(());
         }
         if self.heard.len() < MAX_HEARD {
             return Ok(());
         }
         let settled = (0..self.heard.len()).find(|&at| self.settled(&self.heard[at], now));
-        let asking = || {
-            self.heard
-                .iter()
-                .position(|heard| heard.state == RowState::Asking)
-        };
         let at = settled
-            .or_else(asking)
+            .or_else(|| self.victim(&self.crowded(&asking), now))
             .ok_or_else(|| Error::new("this Mac holds as many join requests as it can now"))?;
         self.drop_row(at);
         Ok(())
@@ -472,6 +545,11 @@ impl Desk {
             .map_err(|_| Error::new("that ask is not signed by the Mac whose request it names"))?;
         self.expire(now);
         if let Some(at) = self.find(&request) {
+            let heard = &mut self.heard[at];
+            if now.saturating_duration_since(heard.first) >= ASKED_AGAIN_AFTER {
+                heard.again = true;
+            }
+            heard.last = heard.last.max(now);
             // A Mac let in holds its bundle and asks no member again (`aterm members join` and
             // its subscriber stop at the Allowed it keeps), so a closed request that asks lost
             // its bundle between this member's send and its write: it asks anew, and an Allow
@@ -493,7 +571,10 @@ impl Desk {
             model: model.to_owned(),
             from,
             first: now,
+            again: false,
+            last: now,
             state: RowState::Asking,
+            restore: false,
         });
         Ok(Answer::Asking)
     }
@@ -511,8 +592,18 @@ impl Desk {
                 from: heard.from,
                 code: client::join_code(&heard.request.binding().recipient()),
                 state: heard.state,
+                removed: self.removed_note(&heard.request).cloned(),
+                restore: heard.restore,
             })
             .collect()
+    }
+
+    /// Why this Mac's log keeps out the Mac `request` binds, where it does.
+    fn removed_note(&self, request: &Request) -> Option<&client::RemovedNote> {
+        let binding = request.binding();
+        self.local
+            .removed
+            .of(&binding.recipient(), binding.writer())
     }
 
     fn row_mut(&mut self, id: u64) -> Result<&mut Heard> {
@@ -535,9 +626,52 @@ impl Desk {
     /// Allow row `id`: a phrase bound to its request, for this Mac's own sheet.
     ///
     /// # Errors
-    /// This Mac cannot allow, the row is gone or closed, or four phrases are live already.
+    /// This Mac cannot allow, the row is gone or closed, the log removed its Mac (that row asks
+    /// "Allow again?", [`Desk::allow_again`]), or four phrases are live already.
     pub fn allow(&mut self, id: u64, now: Instant) -> Result<PhraseId> {
+        self.allow_as(id, now, false)
+    }
+
+    /// "Allow again" row `id`, whose Mac a member's plain removal took out (F16): a phrase as
+    /// [`Desk::allow`] gives, and the run then restores the Mac with an `Admit` under its old
+    /// label. A Mac a quorum `Remove` took out is not restored by one person.
+    ///
+    /// # Errors
+    /// As [`Desk::allow`], or the log did not remove the row's Mac, or a quorum did.
+    pub fn allow_again(&mut self, id: u64, now: Instant) -> Result<PhraseId> {
+        self.allow_as(id, now, true)
+    }
+
+    fn allow_as(&mut self, id: u64, now: Instant, restore: bool) -> Result<PhraseId> {
         self.may_allow()?;
+        {
+            let heard = self
+                .heard
+                .iter()
+                .find(|heard| heard.id == id)
+                .ok_or_else(|| Error::new("no such request on this Mac"))?;
+            match (self.removed_note(&heard.request), restore) {
+                (Some(note), false) => {
+                    return Err(Error::new(format!(
+                        "{}; \"Allow again\" restores it",
+                        note.title().trim_end_matches(". Allow again?")
+                    )));
+                }
+                (Some(note), true) if note.quorum => {
+                    return Err(Error::new(format!(
+                        "a quorum of members removed {}, and one person's Allow does not bring \
+                         it back",
+                        note.label
+                    )));
+                }
+                (None, true) => {
+                    return Err(Error::new(
+                        "the vault did not remove that Mac: Allow it as a new one",
+                    ));
+                }
+                _ => {}
+            }
+        }
         let key = *self.local.key();
         let genesis = self.local.trust.genesis;
         let (ci, prev) = {
@@ -562,7 +696,9 @@ impl Desk {
             self.phrases.cancel(prev);
         }
         let phrase = self.phrases.allow(ci, now)?;
-        self.row_mut(id)?.state = RowState::Allowed(phrase);
+        let heard = self.row_mut(id)?;
+        heard.state = RowState::Allowed(phrase);
+        heard.restore = restore;
         Ok(phrase)
     }
 
@@ -682,7 +818,7 @@ impl Desk {
                     && ChannelId::new(&key, heard.request.binding(), &heard.node, &genesis)
                         == ci =>
             {
-                Some((phrase, allowed_name(&heard.name)))
+                Some((phrase, allowed_name(&heard.name), heard.restore))
             }
             _ => None,
         });
@@ -692,9 +828,9 @@ impl Desk {
                 .rev()
                 .copied()
                 .find(|phrase| self.phrases.words(*phrase, now).is_some())
-                .map(|phrase| (phrase, name.to_owned()))
+                .map(|phrase| (phrase, name.to_owned(), false))
         };
-        let (phrase, name) = allowed
+        let (phrase, name, restore) = allowed
             .or_else(invited)
             .ok_or_else(|| Error::new("no join phrase is shown on this Mac for that Mac"))?;
         let (run, nonce) = self.phrases.begin(phrase, &ci, nonce, now)?;
@@ -705,6 +841,7 @@ impl Desk {
                 node,
                 name,
                 reads_log: false,
+                restore,
             },
             run,
             nonce,
@@ -772,6 +909,9 @@ pub struct Handing<'a> {
     /// It reads `alab-join-bundle/2`, the membership log ([`super::bundle::Handed::Log`]): it
     /// said so when it started the run. A Mac that did not gets the `[everyone]` files.
     pub reads_log: bool,
+    /// A person pressed "Allow again" for it: the log removed it, and a plain removal does not
+    /// keep it out of this run (F16).
+    pub restore: bool,
 }
 
 /// What the caller hands back for a run: the encoded bundle, and whether it carries the log.
@@ -957,6 +1097,7 @@ fn steps<S: Read + Write + ?Sized>(
         name: &running.name,
         allowed: &allowed,
         reads_log: running.reads_log,
+        restore: running.restore,
     })?;
     let sealed = session.seal_bundle(handout.bundle.as_slice())?;
     wire::write_line(stream, &format!("OK bundle={}", sealed.len()))?;

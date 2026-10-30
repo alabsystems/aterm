@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::{Clock, Host};
-use crate::memory::Meter;
+use crate::memory::{Meter, StageKey as _};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;

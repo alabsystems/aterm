@@ -562,6 +562,13 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     {
         return crate::build_cache::registered::run_hidden(&argv[1..]);
     }
+    if argv.first().and_then(|v| v.to_str()) == Some(crate::build_admit::VERB) {
+        return crate::build_admit::run_hidden(&argv[1..]);
+    }
+    if argv.first().and_then(|v| v.to_str()) == Some(crate::build_cache::registered::package::VERB)
+    {
+        return crate::build_cache::registered::package::run_hidden(&argv[1..]);
+    }
     if argv.first().and_then(|v| v.to_str()) == Some(crate::warm::HIDDEN_VERB) {
         return crate::warm::run_hidden(&argv[1..]);
     }
@@ -6437,6 +6444,20 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         Unused::Unfinished => {
             "candidate: an earlier pass moved it aside and did not finish removing it".to_owned()
         }
+        Unused::PackageSuperseded => "candidate for the whole disposable package target: a different compiler generation is waiting".to_owned(),
+        Unused::PackageBudget {
+            allocated,
+            budget,
+            low_disk,
+        } => format!(
+            "candidate for the whole disposable package target: {allocated} allocated bytes, \
+             {budget} byte idle budget{}",
+            if low_disk {
+                "; volume below the package disk floor"
+            } else {
+                ""
+            }
+        ),
         Unused::Tooling { idle, after } => format!(
             "candidate for the whole tool folder: no use observed for {} (age threshold \
              {}; `targo --unverified verify provision` lays it again, with `--linux` for the \

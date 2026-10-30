@@ -60,7 +60,10 @@ impl Manager {
             ),
         };
         let global = registry.find(name)?;
-        let version = global.version.min(max).max(1);
+        let version = global.version.min(max);
+        if version == 0 {
+            return None;
+        }
         let proxy = registry.bind(&global, iface, version)?;
         Some(Manager {
             kind,
@@ -526,10 +529,17 @@ unsafe fn device_listener(
     // SAFETY: the caller's contract.
     unsafe {
         proxy.listen(move |_, opcode, args| {
-            if let Some(device_book) = weak.upgrade()
-                && let Some(event) = on_device(&device_book, kind, opcode, args)
+            if let Some(device_book) = weak.upgrade() {
+                if let Some(event) = on_device(&device_book, kind, opcode, args) {
+                    sink(event);
+                }
+            } else if let (wl_data_device::evt::DATA_OFFER, [EventArg::NewId(Some(offer))]) =
+                (opcode, args)
             {
-                sink(event);
+                match kind {
+                    Kind::Clipboard => wl_data_offer::destroy(*offer),
+                    Kind::Primary => primary_offer::destroy(*offer),
+                }
             }
         })
     }
@@ -830,13 +840,18 @@ fn source_request(kind: Kind, opcode: u32, args: &[EventArg<'_>]) -> Option<Sour
         Kind::Primary => (primary_source::evt::SEND, primary_source::evt::CANCELLED),
     };
     Some(match (opcode, args) {
-        (op, [EventArg::Str(mime), EventArg::Fd(fd)]) if op == send => SourceEvent::Send {
-            mime_type: mime
-                .map(|m| m.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            // SAFETY: the event's descriptor, which the receiver owns.
-            fd: unsafe { OwnedFd::from_raw_fd(*fd) },
-        },
+        (op, [EventArg::Str(mime), EventArg::Fd(fd)]) if op == send => {
+            if *fd < 0 {
+                return None;
+            }
+            SourceEvent::Send {
+                mime_type: mime
+                    .map(|m| m.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                // SAFETY: a non-negative descriptor from the event, which the receiver owns.
+                fd: unsafe { OwnedFd::from_raw_fd(*fd) },
+            }
+        }
         (op, []) if op == cancelled => SourceEvent::Cancelled,
         _ if kind == Kind::Primary => return None,
         (wl_data_source::evt::TARGET, [EventArg::Str(mime)]) => {
@@ -970,5 +985,15 @@ mod tests {
     fn a_mime_type_with_a_nul_is_refused() {
         assert!(mime("text/plain;charset=utf-8").is_some());
         assert!(mime("a\0b").is_none());
+    }
+
+    #[test]
+    fn source_send_with_negative_fd_is_rejected_without_owned_fd_ub() {
+        let got = source_request(
+            Kind::Clipboard,
+            wl_data_source::evt::SEND,
+            &[EventArg::Str(Some(c"text/plain")), EventArg::Fd(-1)],
+        );
+        assert!(got.is_none());
     }
 }

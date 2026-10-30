@@ -155,13 +155,10 @@ pub fn waiting(dir: &Path) -> Vec<Waiting> {
 
 /// The wait `path` marks, while its waiter holds it.
 fn live(path: &Path) -> Option<Waiting> {
+    let mut file = File::open(path).ok()?;
     let mut head = Vec::new();
-    File::open(path)
-        .ok()?
-        .take(RECORD)
-        .read_to_end(&mut head)
-        .ok()?;
-    match RecordLock::try_lock(File::open(path).ok()?, RECORD) {
+    (&mut file).take(RECORD).read_to_end(&mut head).ok()?;
+    match RecordLock::try_lock(file, RECORD) {
         Err(std::fs::TryLockError::WouldBlock) => parse(&String::from_utf8_lossy(&head)),
         Ok(_) | Err(std::fs::TryLockError::Error(_)) => None,
     }
@@ -186,7 +183,7 @@ fn record(pid: u32, since: u64, text: &str) -> String {
 fn parse(text: &str) -> Option<Waiting> {
     let mut fields = text.lines().next()?.splitn(3, '\t');
     Some(Waiting {
-        pid: fields.next()?.parse().ok()?,
+        pid: fields.next()?.parse().ok().filter(|&p| p != 0)?,
         since: fields.next()?.parse().ok()?,
         text: fields.next().unwrap_or_default().to_string(),
     })
@@ -248,6 +245,7 @@ mod tests {
         let line = record(9, 1, &"é".repeat(4096));
         assert!(line.len() <= RECORD as usize, "{}", line.len());
         assert!(parse(&line).is_some_and(|w| w.pid == 9 && w.text.starts_with('é')));
+        assert!(parse("0\t1\tz").is_none(), "pid 0 is no waiter");
     }
 
     #[test]

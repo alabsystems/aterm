@@ -376,6 +376,14 @@ enum WakePlan {
 struct WriteOp {
     kind: WriteKind,
     ack: Sender<AckResult>,
+    conn_id: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct StickyOpMeta {
+    conn_id: u64,
+    producer_id: u64,
+    producer_seq: u64,
 }
 
 /// What the writer's queue carries: a durable mutation; a RUN of them, which one
@@ -476,6 +484,14 @@ enum WriteKind {
     /// resetting each un-fenced link's cursor to the leader's retention base, redialing,
     /// and catching up `[base..head)` in this batch. Answers with the number of un-fenced links.
     RejoinFollowers,
+    /// Pre-writer refusal (e.g. capability expiry, subject error, or rate-limit throttle)
+    /// routed in FIFO pipeline order to the writer thread when `sticky_batch_refusal` is
+    /// enabled so `(conn_id, producer_id)` latches `fence_seq` in exact send order.
+    PreRefused {
+        producer_id: u64,
+        producer_seq: u64,
+        err: Refusal,
+    },
 }
 
 /// Upper bound on records folded into one group-commit fsync. The batch self-tunes to
@@ -1929,6 +1945,10 @@ struct Shared {
     rate_limiter: Mutex<RateLimiterState>,
     /// [`BrokerStats::rate_limited`].
     rate_limited: AtomicU64,
+    /// Fast lock-free gate for [`Self::sticky_fences`] (`false` by default).
+    has_sticky_batch_refusal: AtomicBool,
+    /// Per-`(conn_id, producer_id)` sticky sequence gap fences (pure leaf lock).
+    sticky_fences: Mutex<crate::sticky_fence::StickyFenceTable>,
     /// [`BrokerStats::peer_probes`].
     peer_probes: AtomicU64,
     /// [`BrokerStats::parked_tails`].
@@ -2874,7 +2894,10 @@ impl FollowerLink {
             Response::Error { msg, .. } => {
                 if msg.starts_with("replica gap") {
                     self.upto = 0;
-                } else if msg.starts_with("replica diverged") || msg.starts_with("unauthorized") {
+                } else if msg.starts_with("replica diverged")
+                    || msg.starts_with("replica fenced")
+                    || msg.starts_with("unauthorized")
+                {
                     self.fenced = Some(msg);
                 }
                 *stopped = true;
@@ -3222,6 +3245,13 @@ impl Drop for ConnGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+        if self.shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+            let mut fences = match self.shared.sticky_fences.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            fences.drop_conn(self.id);
+        }
     }
 }
 
@@ -3531,10 +3561,14 @@ impl Broker {
         };
         let health_every = opts.health_every;
         let selective_tail_wake = opts.selective_tail_wake;
+        let sticky_batch_refusal = opts.sticky_batch_refusal;
         let log = BrokerLog::open_opts(log_path, opts, prepare)?;
         let broker = Self::start(log, None, guard);
         if selective_tail_wake {
             broker.set_selective_tail_wake(true);
+        }
+        if sticky_batch_refusal {
+            broker.set_sticky_batch_refusal(true);
         }
         if let Some(lim) = rate_limit {
             broker.set_rate_limit(Some(lim))?;
@@ -4171,6 +4205,33 @@ impl Broker {
         Ok(())
     }
 
+    /// Enable or disable opt-in sticky producer gap fencing on refused batches
+    /// (`DESIGN-aterm-fabric` §14 Open Question 7 & §15).
+    ///
+    /// When `true`, refusing a `Publish` or `ProcessAndProduce` on `(conn_id, producer_id)`
+    /// latches `fence_seq` to `min(fence_seq, producer_seq)` and refuses subsequent
+    /// pipelined writes with `req_seq > fence_seq` (`gap-fenced=<fence_seq>: ...`) until
+    /// an idempotent retry at `<= fence_seq` commits. Disabling (`false`) clears all
+    /// active fences.
+    pub fn set_sticky_batch_refusal(&self, on: bool) {
+        if !on {
+            let mut fences = match self.shared.sticky_fences.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            fences.clear();
+        }
+        self.shared
+            .has_sticky_batch_refusal
+            .store(on, Ordering::Release);
+    }
+
+    /// Whether opt-in sticky producer gap fencing on refused batches is active.
+    #[must_use]
+    pub fn sticky_batch_refusal(&self) -> bool {
+        self.shared.has_sticky_batch_refusal.load(Ordering::Acquire)
+    }
+
     /// Currently active per-principal / per-producer rate limit, if any.
     #[must_use]
     pub fn rate_limit(&self) -> Option<RateLimit> {
@@ -4428,6 +4489,8 @@ impl Broker {
             has_rate_limit: AtomicBool::new(false),
             rate_limiter: Mutex::new(RateLimiterState::new()),
             rate_limited: AtomicU64::new(0),
+            has_sticky_batch_refusal: AtomicBool::new(false),
+            sticky_fences: Mutex::new(crate::sticky_fence::StickyFenceTable::new()),
             peer_probes: AtomicU64::new(0),
             parked_tails: AtomicUsize::new(0),
             batch: Mutex::new(()),
@@ -6560,7 +6623,11 @@ fn submit_blocking(shared: &Arc<Shared>, kind: WriteKind) -> AckResult {
     let (tx, rx) = mpsc::channel();
     if shared
         .writes
-        .send(Queued::Op(WriteOp { kind, ack: tx }))
+        .send(Queued::Op(WriteOp {
+            kind,
+            ack: tx,
+            conn_id: None,
+        }))
         .is_err()
     {
         return Err(refusal(ERR_REFUSED, "broker is stopping"));
@@ -6632,6 +6699,7 @@ fn fire_will_for_conn(shared: &Arc<Shared>, conn_id: Option<u64>, will: WillReco
     let _ = shared.writes.send(Queued::Op(WriteOp {
         kind: WriteKind::WillFire { conn_id, will },
         ack: tx,
+        conn_id: None,
     }));
 }
 
@@ -6640,6 +6708,7 @@ fn drop_will_for_conn(shared: &Arc<Shared>, conn_id: u64) {
     let _ = shared.writes.send(Queued::Op(WriteOp {
         kind: WriteKind::WillDrop { conn_id },
         ack: tx,
+        conn_id: None,
     }));
 }
 
@@ -7121,7 +7190,38 @@ fn serve_conn(
                         Some(until) => until,
                         None => {
                             let why = ungranted(secret, &keyring, &req, now);
-                            if !emit(&mut stream, &mut pipe, Err(refusal(ERR_UNAUTHORIZED, why)))? {
+                            let err = refusal(ERR_UNAUTHORIZED, why);
+                            let keep_open = match &req {
+                                Request::Publish {
+                                    producer_id,
+                                    producer_seq,
+                                    subject,
+                                    ..
+                                } if subject != RETIRE_SUBJECT => emit_producer_refusal(
+                                    shared,
+                                    &mut stream,
+                                    &mut pipe,
+                                    conn_id,
+                                    *producer_id,
+                                    *producer_seq,
+                                    err,
+                                )?,
+                                Request::ProcessAndProduce {
+                                    producer_id,
+                                    producer_seq,
+                                    ..
+                                } => emit_producer_refusal(
+                                    shared,
+                                    &mut stream,
+                                    &mut pipe,
+                                    conn_id,
+                                    *producer_id,
+                                    *producer_seq,
+                                    err,
+                                )?,
+                                _ => emit(&mut stream, &mut pipe, Err(err))?,
+                            };
+                            if !keep_open {
                                 break;
                             }
                             continue;
@@ -7222,6 +7322,7 @@ fn dispatch_request(
         } => serve_publish(
             shared,
             stream,
+            conn_id,
             pipe,
             producer_id,
             producer_seq,
@@ -7240,19 +7341,36 @@ fn dispatch_request(
             upto,
         } => {
             if let Some((code, err)) = publish_subject_error(&out_subject) {
-                return emit(stream, pipe, Err((code, format!("output {err}"))));
+                return emit_producer_refusal(
+                    shared,
+                    stream,
+                    pipe,
+                    conn_id,
+                    producer_id,
+                    producer_seq,
+                    (code, format!("output {err}")),
+                );
             }
             if let Err(err) = check_publish_rate_limit(
                 shared,
                 producer_id,
                 out_subject.len().saturating_add(out_body.len()),
             ) {
-                return emit(stream, pipe, Err(err));
+                return emit_producer_refusal(
+                    shared,
+                    stream,
+                    pipe,
+                    conn_id,
+                    producer_id,
+                    producer_seq,
+                    err,
+                );
             }
-            emit_op(
+            emit_conn_op(
                 shared,
                 stream,
                 pipe,
+                Some(conn_id),
                 WriteKind::ProcessAndProduce {
                     producer_id,
                     producer_seq,
@@ -7540,9 +7658,11 @@ fn serve_retire(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_publish(
     shared: &Arc<Shared>,
     stream: &mut Conn,
+    conn_id: u64,
     pipe: &mut Option<Pipeline>,
     producer_id: u64,
     producer_seq: u64,
@@ -7603,19 +7723,36 @@ fn serve_publish(
         );
     }
     if let Some(err) = publish_subject_error(&subject) {
-        return emit(stream, pipe, Err(err));
+        return emit_producer_refusal(
+            shared,
+            stream,
+            pipe,
+            conn_id,
+            producer_id,
+            producer_seq,
+            err,
+        );
     }
     if let Err(err) = check_publish_rate_limit(
         shared,
         producer_id,
         subject.len().saturating_add(body.len()),
     ) {
-        return emit(stream, pipe, Err(err));
+        return emit_producer_refusal(
+            shared,
+            stream,
+            pipe,
+            conn_id,
+            producer_id,
+            producer_seq,
+            err,
+        );
     }
-    emit_op(
+    emit_conn_op(
         shared,
         stream,
         pipe,
+        Some(conn_id),
         WriteKind::Publish {
             producer_id,
             producer_seq,
@@ -8808,12 +8945,21 @@ impl Pipeline {
     /// in order — closing the "committed durably but ack lost (client sees EOF)" window.
     /// If the writer has since exited, dropping the `WriteOp` closes `ack_tx`, so the
     /// ack-writer's blocked recv on the reserved slot returns cleanly instead of hanging.
+    #[cfg(test)]
     fn submit(&mut self, kind: WriteKind) -> bool {
+        self.submit_conn_opt(None, kind)
+    }
+
+    fn submit_conn_opt(&mut self, conn_id: Option<u64>, kind: WriteKind) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel();
         if !self.reserve(ack_rx) {
             return false; // ack-writer gone (its socket died); nothing committed
         }
-        self.held.ops.push(WriteOp { kind, ack: ack_tx });
+        self.held.ops.push(WriteOp {
+            kind,
+            ack: ack_tx,
+            conn_id,
+        });
         true
     }
 
@@ -8876,6 +9022,16 @@ fn emit_op(
     pipe: &mut Option<Pipeline>,
     kind: WriteKind,
 ) -> io::Result<bool> {
+    emit_conn_op(shared, stream, pipe, None, kind)
+}
+
+fn emit_conn_op(
+    shared: &Arc<Shared>,
+    stream: &mut Conn,
+    pipe: &mut Option<Pipeline>,
+    conn_id: Option<u64>,
+    kind: WriteKind,
+) -> io::Result<bool> {
     let p = match pipe {
         Some(p) => p,
         None => pipe.insert(Pipeline::start(
@@ -8884,7 +9040,33 @@ fn emit_op(
             shared.writes.clone(),
         )?),
     };
-    Ok(p.submit(kind))
+    Ok(p.submit_conn_opt(conn_id, kind))
+}
+
+fn emit_producer_refusal(
+    shared: &Arc<Shared>,
+    stream: &mut Conn,
+    pipe: &mut Option<Pipeline>,
+    conn_id: u64,
+    producer_id: u64,
+    producer_seq: u64,
+    err: Refusal,
+) -> io::Result<bool> {
+    if shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+        emit_conn_op(
+            shared,
+            stream,
+            pipe,
+            Some(conn_id),
+            WriteKind::PreRefused {
+                producer_id,
+                producer_seq,
+                err,
+            },
+        )
+    } else {
+        emit(stream, pipe, Err(err))
+    }
 }
 
 /// Finish the pipeline if one is active (flush acks, join the ack-writer).
@@ -9513,6 +9695,7 @@ fn hold_paused_batch(shared: &Shared, point: BatchPoint) {
 /// covers — which starts the writer's horizon.
 #[allow(clippy::type_complexity)]
 fn stage_batch_ops(
+    shared: &Shared,
     guard: &mut BrokerLog,
     batch: Vec<WriteOp>,
     visible_head: u64,
@@ -9523,6 +9706,7 @@ fn stage_batch_ops(
     Vec<bool>,
     bool,
     Vec<bool>,
+    Vec<Option<StickyOpMeta>>,
     bool,
     Option<(crate::LogIdentity, Offset)>,
 ) {
@@ -9540,6 +9724,15 @@ fn stage_batch_ops(
     // already absent below `visible_head` with no unconfirmed retire in flight) is also
     // answered at once.
     let mut local_only: Vec<bool> = Vec::new();
+    let mut sticky_meta: Vec<Option<StickyOpMeta>> = Vec::new();
+    let mut fences_guard = if shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+        Some(match shared.sticky_fences.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        })
+    } else {
+        None
+    };
     let mut poisoned = false;
     // A LOG ALREADY POISONED refuses EVERY op of the batch in the one wording
     // (`store::poisoned_refusal`, which starts `proto::LOG_POISONED_PREFIX`), so a
@@ -9560,21 +9753,83 @@ fn stage_batch_ops(
         acks.push(op.ack);
         let mut is_local = matches!(op.kind, WriteKind::WillRegister { .. });
         flushes.push(matches!(op.kind, WriteKind::Flush));
+        let op_sticky = match (op.conn_id, &op.kind) {
+            (
+                Some(cid),
+                WriteKind::Publish {
+                    producer_id,
+                    producer_seq,
+                    ..
+                }
+                | WriteKind::ProcessAndProduce {
+                    producer_id,
+                    producer_seq,
+                    ..
+                }
+                | WriteKind::PreRefused {
+                    producer_id,
+                    producer_seq,
+                    ..
+                },
+            ) => Some(StickyOpMeta {
+                conn_id: cid,
+                producer_id: *producer_id,
+                producer_seq: *producer_seq,
+            }),
+            _ => None,
+        };
         if let Some(msg) = &refused_poisoned {
+            if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
+                fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
+            }
             local_only.push(is_local);
+            sticky_meta.push(None);
             results.push(Err(refusal(ERR_REFUSED, msg.clone())));
             poisoned = true;
             continue;
         }
         if poisoned {
+            if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
+                if let Err(fence_seq) = fences.check(m.conn_id, m.producer_id, m.producer_seq) {
+                    local_only.push(is_local);
+                    sticky_meta.push(None);
+                    results.push(Err(refusal(
+                        ERR_REFUSED,
+                        crate::sticky_fence::format_gap_fenced_msg(fence_seq, m.producer_seq),
+                    )));
+                    continue;
+                }
+                fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
+            }
             local_only.push(is_local);
+            sticky_meta.push(None);
             results.push(Err(refusal(
                 ERR_REFUSED,
                 "batch aborted (prior append I/O error)",
             )));
             continue;
         }
+        if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
+            if let Err(fence_seq) = fences.check(m.conn_id, m.producer_id, m.producer_seq) {
+                local_only.push(is_local);
+                sticky_meta.push(None);
+                results.push(Err(refusal(
+                    ERR_REFUSED,
+                    crate::sticky_fence::format_gap_fenced_msg(fence_seq, m.producer_seq),
+                )));
+                continue;
+            }
+        }
         let staged = match op.kind {
+            WriteKind::PreRefused { err, .. } => {
+                if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
+                    fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
+                }
+                local_only.push(is_local);
+                sticky_meta.push(None);
+                results.push(Err(err));
+                continue;
+            }
             WriteKind::Publish {
                 producer_id,
                 producer_seq,
@@ -9610,6 +9865,25 @@ fn stage_batch_ops(
                     Err(StageErr::Diverged(format!(
                         "replica diverged on this connection prior to offset {}: reconnect after truncating to common prefix",
                         rec.seq.0
+                    )))
+                } else if guard.is_replica()
+                    && matches!(
+                        leader,
+                        Some(ldr)
+                            if ldr.id == guard.identity().id
+                                && crate::failover::failover_fences_stale(
+                                    ldr.generation,
+                                    guard.identity().generation,
+                                )
+                    )
+                {
+                    let ldr_gen = match leader {
+                        Some(ldr) => ldr.generation,
+                        None => 0,
+                    };
+                    Err(StageErr::Diverged(format!(
+                        "replica fenced stale leader generation {ldr_gen} < adopted generation {}",
+                        guard.identity().generation
                     )))
                 } else {
                     let staged = guard.stage_replica_with_bt(rec, bt_ms);
@@ -9683,6 +9957,12 @@ fn stage_batch_ops(
         // producer can decide by what it knows about who writes the subject.
         let (code, msg) = match staged {
             Ok((off, deduped)) => {
+                if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
+                    fences.record_commit(m.conn_id, m.producer_id, m.producer_seq);
+                    sticky_meta.push(Some(m));
+                } else {
+                    sticky_meta.push(None);
+                }
                 results.push(Ok((off.0, deduped)));
                 continue;
             }
@@ -9716,6 +9996,10 @@ fn stage_batch_ops(
                 (ERR_REFUSED, format!("append failed: {e}"))
             }
         };
+        if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
+            fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
+        }
+        sticky_meta.push(None);
         results.push(Err(refusal(code, msg)));
     }
     (
@@ -9724,6 +10008,7 @@ fn stage_batch_ops(
         flushes,
         wants_flush,
         local_only,
+        sticky_meta,
         poisoned,
         adopt,
     )
@@ -9775,8 +10060,8 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
             )
         })
         .count();
-    let (acks, results, flushes, wants_flush, local_only, poisoned, adopt) =
-        stage_batch_ops(&mut guard, batch, visible_head, rejoined);
+    let (acks, results, flushes, wants_flush, local_only, sticky_meta, poisoned, adopt) =
+        stage_batch_ops(shared, &mut guard, batch, visible_head, rejoined);
     // The `pause_next_batch` test seam: staged, log lock held, nothing written yet.
     if shared.batch_pause_armed.load(Ordering::Acquire) {
         hold_paused_batch(shared, BatchPoint::Staged);
@@ -9936,6 +10221,7 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
         acks,
         results,
         local_only,
+        sticky_meta,
         flushes,
         wake,
         durable_now,
@@ -10232,6 +10518,20 @@ fn stop_ticker(shared: &Shared) {
     let _ = shared;
 }
 
+fn record_sticky_ack_refusal(shared: &Shared, meta: Option<StickyOpMeta>, send: &AckResult) {
+    let Some(m) = meta else {
+        return;
+    };
+    if send.is_ok() || !shared.has_sticky_batch_refusal.load(Ordering::Acquire) {
+        return;
+    }
+    let mut fences = match shared.sticky_fences.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn finish_batch_acks_and_flush(
     shared: &Arc<Shared>,
@@ -10241,6 +10541,7 @@ fn finish_batch_acks_and_flush(
     acks: Vec<Sender<AckResult>>,
     results: Vec<AckResult>,
     local_only: Vec<bool>,
+    sticky_meta: Vec<Option<StickyOpMeta>>,
     flushes: Vec<bool>,
     mut wake: WakePlan,
     durable_now: u64,
@@ -10315,9 +10616,19 @@ fn finish_batch_acks_and_flush(
     // goodbye for a producer told it registered nothing. No reader is shown the record
     // early by acking it (a hidden subject is delivered to nobody), so nothing is lost by
     // answering it with the commit.
-    let mut waiting: Vec<(Sender<AckResult>, AckResult, bool, bool)> = Vec::new();
-    for (((ack, res), local), is_flush) in
-        acks.into_iter().zip(results).zip(local_only).zip(flushes)
+    let mut waiting: Vec<(
+        Sender<AckResult>,
+        AckResult,
+        bool,
+        bool,
+        Option<StickyOpMeta>,
+    )> = Vec::new();
+    for ((((ack, res), local), meta), is_flush) in acks
+        .into_iter()
+        .zip(results)
+        .zip(local_only)
+        .zip(sticky_meta)
+        .zip(flushes)
     {
         let send = match (&commit_res, res) {
             // An op that failed on its own terms (too large / reserved / diverged / the
@@ -10337,7 +10648,7 @@ fn finish_batch_acks_and_flush(
                     flush.is_some() && !local && !committed.acks_now(off, deduped)
                 };
                 if held {
-                    waiting.push((ack, Ok((off, deduped)), is_flush, local));
+                    waiting.push((ack, Ok((off, deduped)), is_flush, local, meta));
                     continue;
                 }
                 if is_flush {
@@ -10352,6 +10663,7 @@ fn finish_batch_acks_and_flush(
                 }
             }
         };
+        record_sticky_ack_refusal(shared, meta, &send);
         let _ = ack.send(send);
     }
     // WAKE THE TAILS ONLY FOR SOMETHING THEY COULD DELIVER. Every parked tail waits on
@@ -10443,7 +10755,7 @@ fn finish_batch_acks_and_flush(
         let res = handle.full();
         let (outcome, still_dirty, wake) = settle_full_flush(shared, target, res, served_before);
         dirty = still_dirty;
-        for (ack, res, is_flush, local) in waiting {
+        for (ack, res, is_flush, local, meta) in waiting {
             let send = match (&outcome, res) {
                 (Ok(durable), Ok(_)) if is_flush => Ok((*durable, false)),
                 (Ok(_), res) => match (watermark, res) {
@@ -10456,6 +10768,7 @@ fn finish_batch_acks_and_flush(
                 },
                 (Err(msg), _) => Err(refusal(ERR_REFUSED, msg.clone())),
             };
+            record_sticky_ack_refusal(shared, meta, &send);
             let _ = ack.send(send);
         }
         fire_tail_wakes(shared, wake);
@@ -10677,6 +10990,232 @@ fn write_gap<S: Write>(stream: &mut S, gap: crate::proto::Gap) -> io::Result<()>
 /// revoked, or — on a guarded broker — the authority that admitted the subscription
 /// lapses at `until` (unix ms; `u64::MAX`: never), which ends the stream with an
 /// `unauthorized` error.
+fn tail_sync_selective_before_read(
+    parker: &TailParker,
+    base_off: u64,
+    visible: u64,
+    cursor: &mut u64,
+    told: &mut Option<Told>,
+) -> bool {
+    let mut st = parker
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if st.safe_skip_to > *cursor {
+        *cursor = st.safe_skip_to;
+        if let Some(ref mut t) = told {
+            t.advance_to(*cursor);
+        }
+    }
+    if !st.has_unread_match
+        && tail_wake_is_caught_up(st.matched_head, *cursor)
+        && *cursor >= base_off
+    {
+        *cursor = (*cursor).max(visible);
+        if let Some(ref mut t) = told {
+            t.advance_to(*cursor);
+        }
+        st.safe_skip_to = *cursor;
+        st.matched_head = *cursor;
+        st.has_unread_match = false;
+        parker.needs_wake.store(false, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tail_fetch_chunk_locked(
+    shared: &Shared,
+    log: &BrokerLog,
+    parker: &TailParker,
+    cursor: &mut u64,
+    visible: u64,
+    filter: &Filter,
+    told: &mut Option<Told>,
+    chunk: usize,
+    broker_times: bool,
+    batch_bts: &mut Vec<Option<u64>>,
+) -> (Option<crate::proto::Gap>, Vec<Arc<BrokerRecord>>) {
+    let (g, b) = if visible > *cursor {
+        next_chunk(log, cursor, visible, filter, told.as_mut(), chunk)
+    } else {
+        (None, Vec::new())
+    };
+    if shared.selective_tail_wake.load(Ordering::Relaxed)
+        && *cursor >= visible
+        && *cursor >= log.base().0
+    {
+        let mut st = parker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.safe_skip_to = *cursor;
+        st.matched_head = *cursor;
+        st.has_unread_match = false;
+        parker.needs_wake.store(false, Ordering::Release);
+    }
+    if broker_times && !b.is_empty() {
+        for rec in &b {
+            batch_bts.push(log.subject_bt_ms(&rec.subject, rec.seq));
+        }
+    }
+    (g, b)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tail_park_and_fetch_chunk(
+    shared: &Shared,
+    parker: &TailParker,
+    cursor: &mut u64,
+    filter: &Filter,
+    told: &mut Option<Told>,
+    chunk: usize,
+    asks: TailAsks,
+    peer_id: Option<[u8; 32]>,
+    seen_epoch: Option<u64>,
+    until: u64,
+    marked_durable: u64,
+    park: Duration,
+    batch_bts: &mut Vec<Option<u64>>,
+) -> (Option<crate::proto::Gap>, Vec<Arc<BrokerRecord>>) {
+    let mut guard = shared
+        .log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut parked = false;
+    let mut resumes = 0u64;
+    let seen_mode_epoch = shared.selective_mode_epoch.load(Ordering::Relaxed);
+    let use_selective = shared.selective_tail_wake.load(Ordering::Relaxed);
+    let wait_start = Instant::now();
+    let mut last_timed_out = false;
+    loop {
+        if parked {
+            resumes = resumes.saturating_add(1);
+        }
+        let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
+            && astream_sys::sighup_generation() != shared.sighup_seen.load(Ordering::Relaxed);
+        let epoch_changed = Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
+        let mode_changed = shared.selective_mode_epoch.load(Ordering::Relaxed) != seen_mode_epoch;
+        let caught_up = if use_selective {
+            let visible = shared.head.load(Ordering::Relaxed);
+            tail_sync_selective_before_read(parker, guard.base().0, visible, cursor, told)
+        } else {
+            shared.head.load(Ordering::Relaxed) <= *cursor
+        };
+        let wait = shared.running.load(Ordering::Relaxed)
+            && !sighup_pending
+            && !epoch_changed
+            && !mode_changed
+            && !is_peer_revoked_raw(shared, peer_id)
+            && caught_up
+            && !(asks.idle_marks
+                && shared.durable_marks
+                && marked_durable < *cursor
+                && shared.durable.load(Ordering::Relaxed) > marked_durable);
+        if wait != parked {
+            if wait {
+                shared.parked_tails.fetch_add(1, Ordering::Relaxed);
+            } else {
+                shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
+            }
+            parked = wait;
+        }
+        if !wait || last_timed_out {
+            break;
+        }
+        let Some(rem) = park.checked_sub(wait_start.elapsed()) else {
+            break;
+        };
+        if rem.is_zero() {
+            break;
+        }
+        let wait_res = if use_selective {
+            parker.cv.wait_timeout(guard, rem)
+        } else {
+            shared.tail.wait_timeout(guard, rem)
+        };
+        let (next_guard, timeout_res) = wait_res.unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard = next_guard;
+        last_timed_out = timeout_res.timed_out();
+    }
+    if parked {
+        shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
+    }
+    shared.tail_wakeups.fetch_add(resumes, Ordering::Relaxed);
+
+    let visible = shared.head.load(Ordering::Relaxed);
+    let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
+        && astream_sys::sighup_generation() != shared.sighup_seen.load(Ordering::Relaxed);
+    let epoch_changed = Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
+    if visible > *cursor
+        && !sighup_pending
+        && !epoch_changed
+        && !is_peer_revoked_raw(shared, peer_id)
+        && lapsed(until).is_none()
+    {
+        if shared.selective_tail_wake.load(Ordering::Relaxed) {
+            let _ = tail_sync_selective_before_read(parker, guard.base().0, visible, cursor, told);
+        }
+        if visible > *cursor {
+            return tail_fetch_chunk_locked(
+                shared,
+                &guard,
+                parker,
+                cursor,
+                visible,
+                filter,
+                told,
+                chunk,
+                asks.broker_times,
+                batch_bts,
+            );
+        }
+    }
+    (None, Vec::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tail_deliver_batch(
+    shared: &Shared,
+    stream: &mut Conn,
+    out: &mut Vec<u8>,
+    batch: Vec<Arc<BrokerRecord>>,
+    batch_bts: &[Option<u64>],
+    cursor: &mut u64,
+    filter: &Filter,
+    broker_times: bool,
+    peer_id: Option<[u8; 32]>,
+    cap_check: &mut StreamCapCheck,
+    until: &mut u64,
+) -> io::Result<Option<bool>> {
+    let mut wrote = false;
+    for (i, rec) in batch.into_iter().enumerate() {
+        if let Some(failure) = stream_failure(shared, peer_id, cap_check, until) {
+            end_stream_failure(stream, out, failure)?;
+            return Ok(None);
+        }
+        *cursor = match rec.seq.checked_next() {
+            Some(o) => o.0,
+            None => {
+                flush_egress(stream, out)?;
+                return Ok(None);
+            }
+        };
+        if crate::store::is_hidden_record(&rec) {
+            continue;
+        }
+        if filter.matches_str(&rec.subject) {
+            let bt_ms = batch_bts.get(i).copied().flatten();
+            queue_delivery_maybe_stamped(shared, stream, out, &rec, broker_times, bt_ms)?;
+            wrote = true;
+        }
+    }
+    flush_egress(stream, out)?;
+    Ok(Some(wrote))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tail_loop(
     shared: &Arc<Shared>,
@@ -10714,8 +11253,6 @@ fn tail_loop(
         shared,
         id: parker_id,
     };
-    // GAP NOTICES (R4's addendum, A9): for a tail that asked, what it has been told of
-    // the records retention gave up below it. One that did not ask is told nothing.
     let mut told = if asks.gaps {
         Some(Told::at(cursor))
     } else {
@@ -10731,36 +11268,16 @@ fn tail_loop(
     let chunk = pause.as_ref().map_or(TAIL_CHUNK, |p| p.chunk);
     #[cfg(not(test))]
     let chunk = TAIL_CHUNK;
-    // A short read timeout bounds the liveness probe should the socket refuse to go
-    // non-blocking for it (see `peer_gone`); a generous write timeout means a wedged
-    // delivery to a stuck consumer errors out (and resumes from its cursor) rather than
-    // hanging the thread forever.
     let _ = stream.set_read_timeout(Some(PEER_PROBE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(stream_write_timeout(shared)));
     let mut out = Vec::new();
-    // When the peer was last probed for having gone, by either branch below, and the
-    // liveness poll ([`Broker::set_liveness_poll`]): how often a parked tail wakes to
-    // probe, and the least time between two probes of a tail that writes nothing.
     let mut probed = Instant::now();
     let liveness_poll = Duration::from_millis(shared.liveness_poll_ms.load(Ordering::Relaxed));
-    // LIVENESS THE OTHER WAY: when this stream was last written to, and whether the
-    // tail has yet said it caught up. A caught-up tail marks at once, the first time,
-    // and again after every `idle_mark` with nothing written (see IDLE_MARK).
     let idle_mark = Duration::from_millis(shared.idle_mark_ms.load(Ordering::Relaxed));
     let mut wrote_at = Instant::now();
     let mut said_caught_up = false;
-    // DURABLE MARKS (on a log that served Ordered at its open, latched to Strict since or
-    // not — `Shared::durable_marks` — to a subscriber that asked for idle marks):
-    // the durable head the last `Mark` told this subscriber. When the durable head passes
-    // an offset it was delivered and not yet told is durable — `durable > marked` while
-    // `marked < cursor` — it gets one more `Mark`, at most one per full flush that
-    // covered new deliveries. That is how a reader off this host learns, in band, which
-    // of the records it was shown survive a power loss (a notifier pages only those).
     let mut marked_durable: u64 = 0;
     loop {
-        // Fast path when caught up: if `visible <= cursor` (or in selective mode, no
-        // unread matching work and `cursor >= base`), skip locking `shared.log` for an
-        // empty `next_chunk` call and go straight to the Condvar park below.
         let mut gap = None;
         let mut batch_bts = Vec::new();
         let fast_caught_up = if shared.selective_tail_wake.load(Ordering::Acquire) {
@@ -10778,59 +11295,29 @@ fn tail_loop(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let visible = shared.head.load(Ordering::Relaxed);
             if shared.selective_tail_wake.load(Ordering::Relaxed) {
-                let mut st = parker
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if st.safe_skip_to > cursor {
-                    cursor = st.safe_skip_to;
-                    if let Some(ref mut t) = told {
-                        t.advance_to(cursor);
-                    }
-                }
-                if !st.has_unread_match
-                    && tail_wake_is_caught_up(st.matched_head, cursor)
-                    && cursor >= log.base().0
-                {
-                    cursor = cursor.max(visible);
-                    if let Some(ref mut t) = told {
-                        t.advance_to(cursor);
-                    }
-                    st.safe_skip_to = cursor;
-                    st.matched_head = cursor;
-                    st.has_unread_match = false;
-                    parker.needs_wake.store(false, Ordering::Release);
-                }
+                let _ = tail_sync_selective_before_read(
+                    &parker,
+                    log.base().0,
+                    visible,
+                    &mut cursor,
+                    &mut told,
+                );
             }
-            let (g, b) = if visible > cursor {
-                next_chunk(&log, &mut cursor, visible, &filter, told.as_mut(), chunk)
-            } else {
-                (None, Vec::new())
-            };
-            if shared.selective_tail_wake.load(Ordering::Relaxed)
-                && cursor >= visible
-                && cursor >= log.base().0
-            {
-                let mut st = parker
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                st.safe_skip_to = cursor;
-                st.matched_head = cursor;
-                st.has_unread_match = false;
-                parker.needs_wake.store(false, Ordering::Release);
-            }
-            if asks.broker_times {
-                batch_bts.reserve(b.len());
-                for rec in &b {
-                    batch_bts.push(log.subject_bt_ms(&rec.subject, rec.seq));
-                }
-            }
+            let (g, b) = tail_fetch_chunk_locked(
+                shared,
+                &log,
+                &parker,
+                &mut cursor,
+                visible,
+                &filter,
+                &mut told,
+                chunk,
+                asks.broker_times,
+                &mut batch_bts,
+            );
             gap = g;
             b
         };
-        // Told before anything after it: written at once, with nothing gathered ahead of
-        // it (`out` is flushed at the end of every pass).
         if let Some(g) = gap.take() {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
@@ -10857,178 +11344,27 @@ fn tail_loop(
             }
             #[cfg(test)]
             tail_pause_at(&mut pause, PauseAt::Park, cursor);
-            // Park until a new commit (head > cursor) or shutdown — releasing the
-            // lock — but wake every liveness poll to check whether the peer vanished,
-            // and at the latest when this stream's authority lapses.
             let park = match until {
                 u64::MAX => liveness_poll,
                 t => liveness_poll.min(Duration::from_millis(t.saturating_sub(now_unix_ms()))),
             };
-            {
-                let mut guard = shared
-                    .log
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Zero-closure Condvar wait loop preserving exact `parked_tails` and
-                // `tail_wakeups` semantics across both broadcast (`shared.tail`) and
-                // filter-indexed selective (`parker.cv`) modes.
-                let mut parked = false;
-                let mut resumes = 0u64;
-                let seen_epoch = cap_check.seen_epoch;
-                let seen_mode_epoch = shared.selective_mode_epoch.load(Ordering::Relaxed);
-                let use_selective = shared.selective_tail_wake.load(Ordering::Relaxed);
-                let wait_start = Instant::now();
-                let mut last_timed_out = false;
-                loop {
-                    if parked {
-                        resumes = resumes.saturating_add(1);
-                    }
-                    let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
-                        && astream_sys::sighup_generation()
-                            != shared.sighup_seen.load(Ordering::Relaxed);
-                    let epoch_changed =
-                        Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
-                    let mode_changed =
-                        shared.selective_mode_epoch.load(Ordering::Relaxed) != seen_mode_epoch;
-                    let caught_up = if use_selective {
-                        let visible = shared.head.load(Ordering::Relaxed);
-                        let mut st = parker
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if st.safe_skip_to > cursor {
-                            cursor = st.safe_skip_to;
-                            if let Some(ref mut t) = told {
-                                t.advance_to(cursor);
-                            }
-                        }
-                        if !st.has_unread_match
-                            && tail_wake_is_caught_up(st.matched_head, cursor)
-                            && cursor >= guard.base().0
-                        {
-                            cursor = cursor.max(visible);
-                            if let Some(ref mut t) = told {
-                                t.advance_to(cursor);
-                            }
-                            st.safe_skip_to = cursor;
-                            st.matched_head = cursor;
-                            st.has_unread_match = false;
-                            parker.needs_wake.store(false, Ordering::Release);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        shared.head.load(Ordering::Relaxed) <= cursor
-                    };
-                    let wait = shared.running.load(Ordering::Relaxed)
-                        && !sighup_pending
-                        && !epoch_changed
-                        && !mode_changed
-                        && !is_peer_revoked_raw(shared, peer_id)
-                        && caught_up
-                        && !(idle_marks
-                            && shared.durable_marks
-                            && marked_durable < cursor
-                            && shared.durable.load(Ordering::Relaxed) > marked_durable);
-                    if wait != parked {
-                        if wait {
-                            shared.parked_tails.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        parked = wait;
-                    }
-                    if !wait || last_timed_out {
-                        break;
-                    }
-                    let Some(rem) = park.checked_sub(wait_start.elapsed()) else {
-                        break;
-                    };
-                    if rem.is_zero() {
-                        break;
-                    }
-                    let wait_res = if use_selective {
-                        parker.cv.wait_timeout(guard, rem)
-                    } else {
-                        shared.tail.wait_timeout(guard, rem)
-                    };
-                    let (next_guard, timeout_res) =
-                        wait_res.unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard = next_guard;
-                    last_timed_out = timeout_res.timed_out();
-                }
-                if parked {
-                    // Timed out still waiting: no longer parked all the same.
-                    shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
-                }
-                shared.tail_wakeups.fetch_add(resumes, Ordering::Relaxed);
-                // Single-lock wakeup: grab `next_chunk` right here while holding `guard`
-                // instead of dropping `guard` and re-locking `shared.log` on the next pass.
-                let visible = shared.head.load(Ordering::Relaxed);
-                let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
-                    && astream_sys::sighup_generation()
-                        != shared.sighup_seen.load(Ordering::Relaxed);
-                let epoch_changed =
-                    Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
-                if visible > cursor
-                    && !sighup_pending
-                    && !epoch_changed
-                    && !is_peer_revoked_raw(shared, peer_id)
-                    && lapsed(until).is_none()
-                {
-                    if shared.selective_tail_wake.load(Ordering::Relaxed) {
-                        let mut st = parker
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if st.safe_skip_to > cursor {
-                            cursor = st.safe_skip_to;
-                            if let Some(ref mut t) = told {
-                                t.advance_to(cursor);
-                            }
-                        }
-                        if !st.has_unread_match
-                            && tail_wake_is_caught_up(st.matched_head, cursor)
-                            && cursor >= guard.base().0
-                        {
-                            cursor = cursor.max(visible);
-                            if let Some(ref mut t) = told {
-                                t.advance_to(cursor);
-                            }
-                            st.safe_skip_to = cursor;
-                            st.matched_head = cursor;
-                            st.has_unread_match = false;
-                            parker.needs_wake.store(false, Ordering::Release);
-                        }
-                    }
-                    if visible > cursor {
-                        let (g, b) =
-                            next_chunk(&guard, &mut cursor, visible, &filter, told.as_mut(), chunk);
-                        if shared.selective_tail_wake.load(Ordering::Relaxed)
-                            && cursor >= visible
-                            && cursor >= guard.base().0
-                        {
-                            let mut st = parker
-                                .state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            st.safe_skip_to = cursor;
-                            st.matched_head = cursor;
-                            st.has_unread_match = false;
-                            parker.needs_wake.store(false, Ordering::Release);
-                        }
-                        if asks.broker_times {
-                            batch_bts.reserve(b.len());
-                            for rec in &b {
-                                batch_bts.push(guard.subject_bt_ms(&rec.subject, rec.seq));
-                            }
-                        }
-                        gap = g;
-                        batch = b;
-                    }
-                }
-            }
+            let (g, b) = tail_park_and_fetch_chunk(
+                shared,
+                &parker,
+                &mut cursor,
+                &filter,
+                &mut told,
+                chunk,
+                asks,
+                peer_id,
+                cap_check.seen_epoch,
+                until,
+                marked_durable,
+                park,
+                &mut batch_bts,
+            );
+            gap = g;
+            batch = b;
             if let Some(g) = gap.take() {
                 if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                     return end_stream_failure(stream, &mut out, failure);
@@ -11039,74 +11375,38 @@ fn tail_loop(
             if batch.is_empty() {
                 let head = shared.head.load(Ordering::Relaxed);
                 if !shared.running.load(Ordering::Relaxed) && head <= cursor {
-                    return Ok(()); // shutdown, nothing more to deliver
+                    return Ok(());
                 }
                 if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                     return end_stream_failure(stream, &mut out, failure);
                 }
-                // Here with nothing visible, the park ran out its poll (or reached the
-                // lapse, or a full flush made a durable mark due, which the next pass
-                // writes): a probe is due.
                 if head <= cursor {
                     probed = Instant::now();
                     if probe_peer(shared, stream) {
-                        return Ok(()); // consumer vanished — reap this thread + fd
+                        return Ok(());
                     }
                 }
                 continue;
             }
         }
-        // Deliver outside the lock; a slow consumer blocks only this thread.
-        let mut wrote = false;
-        for (i, rec) in batch.into_iter().enumerate() {
-            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
-                return end_stream_failure(stream, &mut out, failure);
-            }
-            // Checked, like the engine's offset spine: a u64::MAX seq ends the stream.
-            cursor = match rec.seq.checked_next() {
-                Some(o) => o.0,
-                None => return flush_egress(stream, &mut out),
-            };
-            // Pure consumer-group commit records are internal bookkeeping — never
-            // delivered to data subscribers. A wildcard filter (`/a/>`, `/a/*`)
-            // matches the reserved `/a/commit` subject, so the skip must be explicit
-            // and filter-independent; the record still consumes an offset (advanced
-            // above), it is simply not sent.
-            if crate::store::is_hidden_record(&rec) {
-                continue;
-            }
-            if filter.matches_str(&rec.subject) {
-                let bt_ms = batch_bts.get(i).copied().flatten();
-                queue_delivery_maybe_stamped(
-                    shared,
-                    stream,
-                    &mut out,
-                    &rec,
-                    asks.broker_times,
-                    bt_ms,
-                )?;
-                wrote = true;
-            }
-        }
-        flush_egress(stream, &mut out)?;
+        let Some(wrote) = tail_deliver_batch(
+            shared,
+            stream,
+            &mut out,
+            batch,
+            &batch_bts,
+            &mut cursor,
+            &filter,
+            asks.broker_times,
+            peer_id,
+            &mut cap_check,
+            &mut until,
+        )?
+        else {
+            return Ok(());
+        };
         #[cfg(test)]
         tail_pause_at(&mut pause, PauseAt::FirstChunk, cursor);
-        // A subscriber whose filter matches nothing still drains the log without ever
-        // writing, so the park branch (which probes for a vanished peer, and marks an
-        // idle stream) is never reached under continuous traffic. Mark and probe here
-        // too when a batch produced zero writes, so such a subscriber still hears from
-        // the broker and a dead one's thread + fd are still reaped.
-        //
-        // ONCE PER LIVENESS POLL, NOT ONCE PER BATCH. This probed after every batch a
-        // tail matched nothing in and had nothing more behind, which on a busy broker
-        // is almost every batch for almost every tail: with 32 tails that never match,
-        // 64.8 probes per delivered message (cost study B3). Each probe is a syscall
-        // the tail makes for nothing, and while it blocked (it no longer does, see
-        // `peer_gone`) the tail missed the next commit's wakeup. A vanished peer only
-        // has to be noticed within a poll, which is what the parked tail already
-        // promised: `probed` is shared with the park branch, so a tail probes at most
-        // once per poll whichever way it spends it, and a dead subscriber's thread and
-        // descriptor are reaped within about a poll either way.
         if wrote {
             wrote_at = Instant::now();
         } else if idle_marks && wrote_at.elapsed() >= idle_mark {
@@ -11894,7 +12194,14 @@ mod tests {
                 subject: subject.to_string(),
                 body: vec![],
             };
-            (WriteOp { kind, ack }, rx)
+            (
+                WriteOp {
+                    kind,
+                    ack,
+                    conn_id: None,
+                },
+                rx,
+            )
         };
 
         // `/t/last` takes the last slot; `/t/behind` is refused at the bound for it;
@@ -12731,7 +13038,11 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             b.shared
                 .writes
-                .send(Queued::Op(WriteOp { kind, ack: tx }))
+                .send(Queued::Op(WriteOp {
+                    kind,
+                    ack: tx,
+                    conn_id: None,
+                }))
                 .unwrap();
             rx
         }
@@ -12957,7 +13268,11 @@ mod tests {
             };
             b.shared
                 .writes
-                .send(Queued::Op(WriteOp { kind, ack: tx }))
+                .send(Queued::Op(WriteOp {
+                    kind,
+                    ack: tx,
+                    conn_id: None,
+                }))
                 .unwrap();
             rx
         }
@@ -13247,12 +13562,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pipelined_multi_follower_replication_confirms_across_three_replicas() {
-        let root = crate::test_scratch::Scratch::new("pipelined-multi-replica");
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let k = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        // Under /tmp: a Darwin TMPDIR can push a socket path past SUN_LEN.
+        let l_sock = format!("/tmp/asb_pmr_{pid}_{k}.sock");
+        let _tmp = Cleanup(vec![l_sock.clone(), format!("{l_sock}.wake")]);
+        let root = crate::test_scratch::Scratch::new("pmr");
         let f1_log = root.path().join("f1.log");
         let f2_log = root.path().join("f2.log");
         let f3_log = root.path().join("f3.log");
         let l_log = root.path().join("leader.log");
-        let l_sock = root.path().join("leader.sock");
 
         let f1 = Broker::open_replica_with(&f1_log, Durability::Relaxed).unwrap();
         let f2 = Broker::open_replica_with(&f2_log, Durability::Relaxed).unwrap();

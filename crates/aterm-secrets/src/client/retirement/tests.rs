@@ -1038,3 +1038,165 @@ fn a_member_silent_for_30_days_leaves_the_roster_and_returns_when_heard() {
     assert!(members(&journal).contains(&silent));
     assert!(matches!(peer.access_in(&journal), Ok(Some(_))));
 }
+
+#[test]
+fn repair_half_done_revokes_expires_steward_lease_held_by_denied_member() {
+    let r1 = Identity::generate().unwrap().recipient().to_bech32();
+    let r2 = Identity::generate().unwrap().recipient().to_bech32();
+    let mut doc = Document::new_vault("m1", &r1);
+    // m2 was removed from [machines] on one branch, leaving m2 in the roster and holding the lease.
+    let roster = crate::swarm_roster::SwarmRoster {
+        members: vec![
+            crate::swarm_roster::SwarmMember {
+                label: "m1".to_owned(),
+                vault_name: "m1".to_owned(),
+                recipient: r1,
+                node_id: None,
+                node_key: None,
+                hint: None,
+                admitted_ms: 1000,
+                aliases: Vec::new(),
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+            crate::swarm_roster::SwarmMember {
+                label: "m2".to_owned(),
+                vault_name: "m2".to_owned(),
+                recipient: r2,
+                node_id: None,
+                node_key: None,
+                hint: None,
+                admitted_ms: 1000,
+                aliases: Vec::new(),
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    let lease = crate::swarm_roster::SwarmLease {
+        holder: "m2".to_owned(),
+        epoch: 4,
+        until: 1_900_000_000,
+    };
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".to_owned()]),
+        crate::swarm_roster::LEASE_ENTRY,
+        lease.to_toml().as_bytes(),
+    )
+    .unwrap();
+
+    let summary = repair_half_done_revokes(&mut doc)
+        .unwrap()
+        .expect("should repair stale m2 member and expire lease");
+    assert!(summary.contains("retired m2"), "summary: {summary}");
+    assert!(
+        summary.contains("expired steward lease"),
+        "summary: {summary}"
+    );
+    let updated_lease = crate::swarm_roster::SwarmLease::from_document(&doc)
+        .unwrap()
+        .expect("lease entry preserved");
+    assert_eq!(updated_lease.epoch, 4, "epoch must be preserved");
+    assert_eq!(updated_lease.until, 0, "until must be expired to 0");
+    assert!(
+        repair_half_done_revokes(&mut doc).unwrap().is_none(),
+        "idempotent after repair"
+    );
+}
+
+#[test]
+fn repair_half_done_revokes_retires_node_denied_member_and_strips_pool_and_lease() {
+    let r1 = Identity::generate().unwrap().recipient().to_bech32();
+    let r2 = Identity::generate().unwrap().recipient().to_bech32();
+    let mut doc = Document::new_vault("m1", &r1);
+    doc.add_machine("m2", &r2).unwrap();
+    let nk2 = "dd".repeat(32);
+    let roster = crate::swarm_roster::SwarmRoster {
+        members: vec![
+            crate::swarm_roster::SwarmMember {
+                label: "m1".to_owned(),
+                vault_name: "m1".to_owned(),
+                recipient: r1,
+                node_id: None,
+                node_key: None,
+                hint: None,
+                admitted_ms: 1000,
+                aliases: Vec::new(),
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+            crate::swarm_roster::SwarmMember {
+                label: "m2".to_owned(),
+                vault_name: "m2".to_owned(),
+                recipient: r2,
+                node_id: None,
+                node_key: Some(nk2.clone()),
+                hint: None,
+                admitted_ms: 1000,
+                aliases: vec!["m20".to_owned()],
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: vec![nk2],
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    let pool_toml = r#"version = 1
+
+[[account]]
+provider = "claude"
+email = "a@example.test"
+warm = ["m2", "m1"]
+"#;
+    doc.set_entry(&Audience::Everyone, AI_POOL_ENTRY, pool_toml.as_bytes())
+        .unwrap();
+    let lease = crate::swarm_roster::SwarmLease {
+        holder: "m2".to_owned(),
+        epoch: 7,
+        until: 1_900_000_000,
+    };
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".to_owned()]),
+        crate::swarm_roster::LEASE_ENTRY,
+        lease.to_toml().as_bytes(),
+    )
+    .unwrap();
+
+    let summary = repair_half_done_revokes(&mut doc)
+        .unwrap()
+        .expect("node-denied member must be retired and cascaded");
+    assert!(summary.contains("retired m2"), "summary: {summary}");
+    assert!(
+        summary.contains("released denied warm slots"),
+        "summary: {summary}"
+    );
+    assert!(
+        summary.contains("expired steward lease"),
+        "summary: {summary}"
+    );
+    let updated_roster = crate::swarm_roster::SwarmRoster::from_document(&doc)
+        .unwrap()
+        .unwrap();
+    assert!(updated_roster.member_by_label_or_alias("m2").is_none());
+    assert!(updated_roster.is_label_denied("m2"));
+    assert!(updated_roster.is_label_denied("m20"));
+    let updated_lease = crate::swarm_roster::SwarmLease::from_document(&doc)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated_lease.until, 0);
+    assert!(repair_half_done_revokes(&mut doc).unwrap().is_none());
+}

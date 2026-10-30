@@ -370,6 +370,7 @@ pub fn processes_clear(
                     match u.how {
                         "cwd" => "working directory",
                         "exe" => "executable",
+                        "map" => "mapped file",
                         _ => "open file",
                     }
                 ));

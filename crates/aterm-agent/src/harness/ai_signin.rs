@@ -923,7 +923,11 @@ fn authorize_mail_code_inner(
     let member = roster
         .members
         .iter()
-        .find(|m| m.node_id.as_deref() == Some(proof_node))
+        .find(|m| {
+            m.node_id
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(proof_node))
+        })
         .or_else(|| {
             let key_hex = proof_key_hex?;
             roster.members.iter().find(|m| {
@@ -936,6 +940,7 @@ fn authorize_mail_code_inner(
             let claimed = req.claimed_label.as_deref()?;
             roster.members.iter().find(|m| {
                 m.node_id.is_none()
+                    && (m.node_key.is_none() || proof_key_hex.is_some())
                     && (m.label.eq_ignore_ascii_case(claimed)
                         || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(claimed)))
             })
@@ -962,12 +967,29 @@ fn authorize_mail_code_inner(
             })
         });
         let in_lease = claims.is_some_and(|(view, book)| {
-            book.rows()
+            let active_book = super::claims::Book::of(
+                book.rows()
+                    .filter(|row| {
+                        let canon = ai_pool::leading_m_label(&row.label)
+                            .map(|(_, c)| c)
+                            .unwrap_or_else(|| row.label.trim().to_ascii_lowercase());
+                        if !canon.is_empty() && roster.is_label_denied(&canon) {
+                            return false;
+                        }
+                        if let Some(m) = roster.member_by_label_or_alias(&canon) {
+                            return !member_is_denied(m, roster);
+                        }
+                        true
+                    })
+                    .cloned(),
+            );
+            active_book
+                .rows()
                 .filter(|row| requester_id.matches(&row.label))
                 .any(|row| {
                     row.claims.iter().any(|claim| {
                         claim.key.email.eq_ignore_ascii_case(&req.email)
-                            && book
+                            && active_book
                                 .senior(&claim.key, view, now)
                                 .is_some_and(|holder| holder.machine == row.machine)
                     })
@@ -1022,7 +1044,13 @@ fn append_audit_record(state_dir: &Path, audit: &MailCodeAudit) {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let _ = aterm_uds::private_file::ensure_private_dir(state_dir);
     let path = state_dir.join(MAIL_CODE_AUDIT_FILE);
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= MAIL_CODE_AUDIT_MAX_BYTES {
+    if std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len())
+        .unwrap_or(0)
+        >= MAIL_CODE_AUDIT_MAX_BYTES
+    {
         let prev = state_dir.join(MAIL_CODE_AUDIT_PREV_FILE);
         let _ = std::fs::rename(&path, &prev);
         let _ = std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o600));
@@ -1031,6 +1059,7 @@ fn append_audit_record(state_dir: &Path, audit: &MailCodeAudit) {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
     {
         let _ = writeln!(f, "{}", audit.log_line());
@@ -1087,6 +1116,9 @@ fn steward_handle_mail_code_with_key(
     }
 
     let paths = aterm_secrets::client::Paths::for_home(home);
+    if aterm_secrets::client::local_recipient_denied_in_roster(&paths) {
+        return Err(MailCodeRefusal::NotSteward);
+    }
     if let Some(proved_key) = proof_key {
         let own_key_mismatch = match aterm_net::fleet_member::read_node_identity(state_dir)
             .ok()
@@ -1115,14 +1147,10 @@ fn steward_handle_mail_code_with_key(
         }
     }
 
-    let mut roster = aterm_secrets::client::swarm_roster(&paths)
+    let roster = aterm_secrets::client::swarm_roster(&paths)
         .ok()
         .flatten()
         .ok_or(MailCodeRefusal::NotSteward)?;
-    if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes(&paths) {
-        roster.deny_nodes.extend(denied);
-        roster.canonicalize();
-    }
 
     let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
     let pool = std::fs::read_to_string(&pool_path)
@@ -1201,6 +1229,23 @@ pub fn serve_fleet_mail_code<S: std::io::Read + std::io::Write>(
 
 #[cfg(unix)]
 fn read_standby_steward_labels(home: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let paths = aterm_secrets::client::Paths::for_home(home);
+    let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
+    let push_label = |out: &mut Vec<String>, label: &str| {
+        let trimmed = label.trim();
+        if !trimmed.is_empty()
+            && !roster.as_ref().is_some_and(|r| r.is_label_denied(trimmed))
+            && !out
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+        {
+            out.push(trimmed.to_owned());
+        }
+    };
+    if let Ok(Some(holder)) = aterm_secrets::client::swarm_lease_holder(&paths) {
+        push_label(&mut out, &holder);
+    }
     for candidate in [
         home.join(".secrets/swarm-policy.toml"),
         home.join(".config/aterm/swarm-policy.toml"),
@@ -1208,26 +1253,32 @@ fn read_standby_steward_labels(home: &Path) -> Vec<String> {
         let Ok(raw) = std::fs::read_to_string(&candidate) else {
             continue;
         };
+        if let Ok(policy) = aterm_secrets::swarm_roster::SwarmPolicy::from_toml(&raw)
+            && !policy.stewards.is_empty()
+        {
+            let mut stewards = policy.stewards;
+            stewards.sort_by_key(|s| s.rank);
+            for s in stewards {
+                push_label(&mut out, &s.label);
+            }
+            return out;
+        }
         let Ok(table) = aterm_toml::from_str::<aterm_toml::Value>(&raw) else {
             continue;
         };
         if let Some(arr) = table.get("stewards").and_then(aterm_toml::Value::as_array) {
-            let mut out = Vec::new();
+            let before = out.len();
             for item in arr {
-                if let Some(label) = item.as_str().map(str::trim).filter(|s| !s.is_empty())
-                    && !out
-                        .iter()
-                        .any(|existing: &String| existing.eq_ignore_ascii_case(label))
-                {
-                    out.push(label.to_owned());
+                if let Some(label) = item.as_str() {
+                    push_label(&mut out, label);
                 }
             }
-            if !out.is_empty() {
+            if out.len() > before {
                 return out;
             }
         }
     }
-    Vec::new()
+    out
 }
 
 /// True if `host` matches `label` by exact stem (`<stem>.local`) or by leading `m<N>` label
@@ -1320,10 +1371,14 @@ pub fn select_steward_relay_peers<'a>(
         Some(home) => {
             let paths = aterm_secrets::client::Paths::for_home(home);
             let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
-            let denied = aterm_secrets::client::swarm_denied_nodes(&paths)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let denied = if roster.is_none() {
+                aterm_secrets::client::swarm_denied_nodes(&paths)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let log = crate::fleet_log::LocalLog::of(&paths).keys();
             (roster, denied, log)
         }
@@ -1337,6 +1392,22 @@ pub fn select_steward_relay_peers<'a>(
             aterm_net::fleet::is_denied_key(&k, &denied_nodes)
                 || roster.as_ref().is_some_and(|r| r.is_node_denied(&k.hex()))
                 || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+        }) || roster.as_ref().is_some_and(|r| {
+            let host_stem = p.host.strip_suffix(".local").unwrap_or(&p.host);
+            r.is_label_denied(host_stem)
+                || r.members.iter().any(|m| {
+                    member_is_denied(m, r)
+                        && ((p.node.is_some()
+                            && m.node_id.as_deref().is_some_and(|mn| {
+                                p.node.as_deref().unwrap().eq_ignore_ascii_case(mn)
+                            }))
+                            || (p.key.is_some()
+                                && m.node_key.as_deref().is_some_and(|mk| {
+                                    mk.eq_ignore_ascii_case(&p.key.unwrap().hex())
+                                }))
+                            || host_matches_label(&p.host, &m.label)
+                            || m.aliases.iter().any(|a| host_matches_label(&p.host, a)))
+                })
         })
     };
     let mut ordered: Vec<&Peer> = Vec::new();
@@ -1421,7 +1492,10 @@ pub fn fetch_relay_mail_credential(
     let standby_labels = read_standby_steward_labels(home);
     let ordered = select_steward_relay_peers(&peers, me.node(), &standby_labels, Some(home));
 
-    let deadline = std::time::Instant::now() + within;
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(within)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(3600));
     for peer in ordered {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {

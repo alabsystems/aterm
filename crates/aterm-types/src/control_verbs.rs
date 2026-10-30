@@ -1487,11 +1487,14 @@ pub const VERBS: &[VerbSpec] = &[
         OwnerOnly,
         "members <requests|allow|invite|ignore> …: Macs asking to join",
         "— Owner-only. `members requests` lists the Macs asking that this Mac hears (`OK <n>` \
-         then `request name=<n> model=<m> from=<ip> code=<code> state=<asking|allowed>`, free \
-         text pct-encoded). `members allow <name|code>` and `members invite` show a phrase in a \
-         sheet on this Mac's own screen and answer only `OK the phrase is on this Mac's screen, \
-         for 5 minutes`; a headless instance answers `ERR members: press Allow on a Mac with a \
-         screen`. `members ignore <name|code>` hides that row here (`OK ignored`).",
+         then `request name=<n> model=<m> from=<ip> code=<code> state=<asking|allowed|removed \
+         by=<labels>[ quorum=1]>`, free text pct-encoded; `removed` is a Mac the membership log \
+         removed). `members allow <name|code>` and `members invite` show a phrase in a sheet on \
+         this Mac's own screen and answer only `OK the phrase is on this Mac's screen, for 5 \
+         minutes`; `members allow --again <name|code>` does so for a removed Mac, whose run \
+         restores it (a quorum's removal refuses); a headless instance answers `ERR members: \
+         press Allow on a Mac with a screen`. `members ignore <name|code>` hides that row here \
+         (`OK ignored`).",
     )
     .input(Input::NONE)
     .forms(&[form(Word("requests")).framing(Lines)]),
@@ -2796,7 +2799,9 @@ pub const VERBS: &[VerbSpec] = &[
         "— POSIX only (`ERR restart unsupported on this platform` on Windows). Stamps the \
          supervised foreground agent (Claude Code, agy, codex-alab), sends `SIGTERM` (escalating \
          to `SIGKILL` after 5 s if still stalled and deaf, or 30 s otherwise), and has the window \
-         harness relaunch it on the same conversation. Options: `pid=<n>` (must lead foreground \
+         harness relaunch it on the same conversation. Work the agent runs inside its own \
+         process (subagents, workflows) ends with it and its background shells may not come back, \
+         so an agent restarts itself at a stopping point. Options: `pid=<n>` (must lead foreground \
          pgrp), `if-stalled` (requires `status input=stalled`), `quiet=<s>` (`ERR busy person \
          human_ms=<ms>` if human input within `<s>` s). Replies `OK restarting pid <n> \
          cause=<stall|asked>[ discarded=<bytes>]`, `OK restart gone pid <n>`, or `ERR restart \
@@ -3437,7 +3442,13 @@ pub const VERBS: &[VerbSpec] = &[
          none is not told there) or its deadline sweep for one of the session's asks (past the \
          ask and the watermark). The two are kept apart, and the log marks each range once \
          (`mail-gap`). `<n>` selects the newest `n` `msg` rows above `since=`; \
-         `--peek` leaves rows unlisted and `--meta` omits `text=`.",
+         `--peek` leaves rows unlisted and `--meta` omits `text=`. Unlisted direct fleet mail \
+         follows as `msg f<id> from=fleet:<node> kind=<k> trust=agent ... text=<pct>`. These \
+         identifiers are mailbox ids, never broker offsets. On a remote drive, `inbox` reads \
+         only that authenticated node's direct conversations. `inbox fleet [since=f<id>]` \
+         lists retained direct conversations, including `reply_text=` when answered. A direct \
+         `await inbox` wake returns `OK inbox <bus-id> fleet=f<id>`; rearm with \
+         `since=<bus-id> fleet_since=f<id>`, or `since=f<id>` for direct mail alone.",
     ),
     v(
         "inbox get",
@@ -3467,7 +3478,11 @@ pub const VERBS: &[VerbSpec] = &[
          `handled|refused|deferred` attaches `verdict=<v> kind=<k> from=<p>` for row `<id>` and \
          queues a receipt (`kind=ack re=<off> verdict=<v>`) on `outbox` for an `ask` or `task` \
          row (unless `[fabric] receipts = false`), waking the sender's `post --wait-ack` and \
-         `await inbox re=<off>`. Answerable during `hold`.",
+         `await inbox re=<off>`. Answerable during `hold`. For direct fleet mail, the remote \
+         sender acknowledges a read reply with `inbox seen f<id>`. Completed acknowledged \
+         conversations are reclaimed when space is needed. The local recipient may retire \
+         a listed conversation with `inbox seen f<id> forget`, even when its sender is offline. \
+         Unread messages stay; retiring also drops the idempotency key.",
     )
     .input(Input::NONE),
     v(
@@ -3477,7 +3492,13 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "post to=<@<sid>[@<node>]|<principal>|say[:<topic>]> kind=<k> [opts] [--] <text>: send a \
          message",
-        "— Owner-only (refused to edge tokens; exempt from `hold`). `to=say[:<topic>]` broadcasts \
+        "— Owner-only (refused to edge tokens; exempt from `hold`). Over an authenticated \
+         fleet drive, `@<sid> post key=<token> kind=<k> -- <text>` delivers directly to that \
+         session and returns `OK f<id>`; it takes no `to=`, uses no terminal input, and \
+         attributes the sender to the proved node. Locally, `post re=f<id> key=<token> \
+         kind=answer -- <text>` retains a reply for that sender's next `inbox` read. Reusing a \
+         retained key with identical bytes returns `dup=1`; different bytes refuse. \
+         `to=say[:<topic>]` broadcasts \
          on `say/<topic>` (`<topic>` in `[a-z0-9][a-z0-9._-]{0,31}`, default `say`) to sessions \
          with `topic add <topic>` (`topic=<t>`). \
          `kind=<ask|answer|task|report|note|ack|control>`. Options before `--`: `[re=<off>] \

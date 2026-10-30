@@ -8815,6 +8815,250 @@ fn the_hosts_background_step_at_the_wake_waits_for_the_settle() {
     assert!(withheld.is_empty(), "{withheld:?}");
 }
 
+/// A host that types the quiet upgrade's line at a break where none of the guards a host's fact
+/// is judged by holds ([`IdleHost::at_background_on`]), keeping the guard each break was told, and
+/// the guards the loop said withheld one.
+#[derive(Debug, Default)]
+struct TellingHost {
+    held: std::sync::Mutex<Vec<Option<crate::supervise::Guard>>>,
+    withheld: std::sync::Mutex<Vec<crate::supervise::Guard>>,
+}
+
+impl IdleHost for TellingHost {
+    fn wants(&self) -> bool {
+        true
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn at_background_on(
+        &self,
+        point: IdlePoint,
+    ) -> Option<(String, crate::supervise::policy::turn_end::HostTurn)> {
+        self.held.lock().unwrap().push(point.held);
+        point.held.is_none().then(|| {
+            (
+                "upgrade step=told:background".to_string(),
+                crate::supervise::policy::turn_end::HostTurn::Fact,
+            )
+        })
+    }
+    fn withheld(&self, guard: crate::supervise::Guard) {
+        self.withheld.lock().unwrap().push(guard);
+    }
+}
+
+/// The quiet upgrade's line at a break (`told:`) is a fact: it stands untaken in a record of its
+/// own, so the land episode the loop has in hand keeps its landing, and the next break waits for
+/// the agent to take it. The host is told the guards a fact is judged by, and a manager's wait
+/// holds the line. CONTROL: booked as the host's own turn (`host_typed`), the landing goes.
+#[test]
+fn the_quiet_upgrades_line_at_a_break_is_a_fact_its_guards_hold() {
+    use crate::supervise::Guard;
+    let bg = || {
+        let mut r = rows(&[
+            "⏺ Waiting for the build.",
+            "",
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+        r
+    };
+    let run = |managed: bool| {
+        let host = Arc::new(TellingHost::default());
+        let mut m = Mock::new(vec![bg()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.setup.background_settle = Duration::ZERO;
+        s.turn_end.seed_land(1, true, false, false);
+        let now = s.fx.mono();
+        s.turn_end.seed_land_act(1, 1, Duration::from_secs(60), now);
+        s.turn_end.set_managed(managed);
+        let screen = s.screen().expect("the break");
+        let mut since = Some(Instant::now());
+        s.host_steps_in_background(&screen, &mut since, None, &mut Alone)
+            .expect("the break's step");
+        let told = (s.turn_end.fact_untaken(), s.turn_end.land_act_seeded());
+        s.host_steps_in_background(&screen, &mut since, None, &mut Alone)
+            .expect("the next break");
+        let held = host.held.lock().unwrap().clone();
+        let withheld = host.withheld.lock().unwrap().clone();
+        let mut control = s.turn_end.clone();
+        control.host_typed(now, crate::supervise::policy::turn_end::HostTurn::Fact);
+        (told, held, withheld, control.land_act_seeded())
+    };
+    let (told, held, withheld, control) = run(false);
+    assert_eq!(told, (true, true), "untaken, and the landing kept");
+    assert_eq!(held, [None], "told once, with nothing holding it");
+    assert_eq!(
+        withheld,
+        [Guard::ActUntaken],
+        "the next break waits for the agent"
+    );
+    assert!(!control, "CONTROL: a host's turn wipes the landing");
+    let (told, held, _, _) = run(true);
+    assert_eq!(
+        held,
+        [Some(Guard::Managed); 2],
+        "a manager's wait is told at each break"
+    );
+    assert_eq!(told, (false, true), "and nothing is typed over it");
+}
+
+/// A break tells its host a task landed under Land, as an idle point does, so a host's fact (the
+/// quiet upgrade's line) is not typed past a land's defense; the same landing under Cruise, or
+/// with no policy to read the mode by, says nothing of it.
+#[test]
+fn a_break_tells_its_host_a_task_landed_under_land() {
+    use crate::supervise::config::Autopilot;
+    let mut m = Mock::new(vec![ended("All landed.")]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_clock(TEST_NOW, PDT);
+    let under = |autopilot| SupervisorConfig {
+        autopilot,
+        ..owners_policy()
+    };
+    let (land, cruise) = (under(Autopilot::Land), under(Autopilot::Cruise));
+    let rows = ended("All landed.");
+    let now = s.fx.mono();
+    assert!(
+        !s.break_point(now, Some(&land), &rows).done_under_land,
+        "nothing landed yet"
+    );
+    assert!(s.turn_end.seed_task_done());
+    assert!(s.break_point(now, Some(&land), &rows).done_under_land);
+    assert!(!s.break_point(now, Some(&cruise), &rows).done_under_land);
+    assert!(!s.break_point(now, None, &rows).done_under_land);
+}
+
+/// A tape a build without the guarded break door recorded (no `host.at_background_on` among its
+/// header's host doors) replays the door that build had: at the break the loop asks
+/// [`IdleHost::at_background`] and reads no clock for a break's point, so that build's tape
+/// reproduces, as this build's own tape does through the guarded door. CONTROL: the older tape
+/// under this build's header reads the point's clock where the tape holds the old door, and this
+/// build's tape under the older header asks the old door where the tape holds that clock read.
+#[test]
+fn a_tape_from_a_build_with_no_guarded_break_door_replays_the_old_door() {
+    use crate::supervise::tape::codec::Item;
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::{assert_replays, written};
+    use astream_effects::EffectRecord;
+
+    const GUARDED: &str = "host.at_background_on";
+    const OLD: &str = "host.at_background";
+    let mut bg = rows(&[
+        "⏺ Waiting for the build.",
+        "",
+        "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+        "",
+    ]);
+    bg.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+    let host = Arc::new(BackgroundHost::default());
+    let mut m = Mock::new(vec![bg]);
+    m.vanish_after = Some(3);
+    m.cursor_on_caret = true;
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..auto(30)
+    };
+    let run = record_watch(&mut m, &opts, |s| s.set_background_settle(Duration::ZERO));
+    assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let at = |item: &Item, name: &str| {
+        matches!(item.record(), Some(EffectRecord::Exchange { door, .. })
+            if door == name)
+    };
+    let asks = host.backgrounds.load(Ordering::SeqCst);
+    assert!(
+        asks >= 1,
+        "the break asked its host: {:?}",
+        host.withheld.lock().unwrap()
+    );
+    assert_eq!(
+        items.iter().filter(|i| at(i, GUARDED)).count(),
+        asks,
+        "each ask went through the guarded door"
+    );
+    assert!(
+        !items.iter().any(|i| at(i, OLD)),
+        "and none through the old one"
+    );
+
+    // The older build's tape: each guarded ask is the old door's, with the same answer, and the
+    // clock read for the break's point just before it is gone.
+    let old_ask = crate::supervise::tape::host::request(&[]);
+    let mut older: Vec<Item> = Vec::with_capacity(items.len());
+    for item in &items {
+        match item {
+            Item::Effect {
+                record: EffectRecord::Exchange { door, reply, .. },
+                stamp,
+            } if door == GUARDED => {
+                let point = older.pop();
+                assert!(
+                    matches!(
+                        point.as_ref().and_then(Item::record),
+                        Some(EffectRecord::Mono(_))
+                    ),
+                    "the break's point read the clock just before the guarded door: {point:?}"
+                );
+                older.push(Item::Effect {
+                    record: EffectRecord::Exchange {
+                        door: OLD.to_string(),
+                        request: old_ask.clone(),
+                        reply: reply.clone(),
+                    },
+                    stamp: *stamp,
+                });
+            }
+            other => older.push(other.clone()),
+        }
+    }
+    let mut was = run.header.clone();
+    was.host_doors
+        .as_mut()
+        .expect("a capture names its doors")
+        .retain(|door| door != GUARDED);
+    let older_header = was.encode();
+    assert_ne!(
+        older_header, header,
+        "the older header lacks the guarded door"
+    );
+
+    let replayed = |text: &str, items: &[Item]| {
+        replay(&written(text, items), &Options::default()).expect("the tape reads")
+    };
+    let report = replayed(&older_header, &older);
+    assert_eq!(
+        report.verdict,
+        Verdict::Reproduced,
+        "the older build's tape replays the door it had:\n{}",
+        report.render()
+    );
+    let report = replayed(&header, &older);
+    assert!(
+        matches!(&report.verdict, Verdict::Diverged(d) if d.door.is_none()),
+        "CONTROL: under this build's header the break's point reads the clock where the tape \
+         holds the old door:\n{}",
+        report.render()
+    );
+    let report = replayed(&older_header, &items);
+    assert!(
+        matches!(&report.verdict, Verdict::Diverged(d) if d.door.as_deref() == Some(OLD)),
+        "CONTROL: under the older header the loop asks the old door where this build's tape \
+         holds the point's clock read:\n{}",
+        report.render()
+    );
+}
+
 #[test]
 fn a_point_after_a_sleep_a_request_saw_is_held_only_until_the_wakes_settle() {
     use crate::supervise::policy::turn_end::RULE_CONTINUE;

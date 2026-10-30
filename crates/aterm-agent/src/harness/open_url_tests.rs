@@ -37,7 +37,7 @@ fn curl_keeps_credential_options_and_urls_off_its_command_line() {
         ("data-raw", "code=fake-code"),
         ("url", "https://example.test/callback?code=fake-url-code"),
     ];
-    let (cmd, _) = curl_command(aterm_uds::os_path!("curl"), &args, &options).unwrap();
+    let (cmd, _) = curl_command(aterm_uds::os_path!("curl"), &args, &options, &|_| None).unwrap();
     let expected: Vec<&std::ffi::OsStr> = args
         .iter()
         .copied()
@@ -52,7 +52,8 @@ fn curl_keeps_credential_options_and_urls_off_its_command_line() {
         curl_command(
             aterm_uds::os_path!("curl"),
             &args,
-            &[("user", "bad\0value")]
+            &[("user", "bad\0value")],
+            &|_| None
         )
         .unwrap_err()
         .kind(),
@@ -107,6 +108,7 @@ fn curl_reads_escaped_stdin_config_as_one_private_file_transfer() {
             ("data-raw", &form),
             ("url", &url),
         ],
+        &|name| (name == "PATH").then(|| OsString::from("/usr/bin:/bin")),
     )
     .expect("installed curl consumed private config");
     assert!(out.status.success(), "{:?}", out);
@@ -114,6 +116,103 @@ fn curl_reads_escaped_stdin_config_as_one_private_file_transfer() {
     assert_eq!(
         std::fs::read(&decoy).unwrap(),
         b"a second transfer must not appear\n"
+    );
+}
+
+/// The opener's environment as a test gives it: a scratch home, a path, a proxy, and every
+/// mailbox credential and setting the opener reads.
+#[cfg(unix)]
+fn opener_env(home: &Path) -> impl Fn(&str) -> Option<OsString> + use<> {
+    let home = home.as_os_str().to_os_string();
+    move |name: &str| match name {
+        "HOME" => Some(home.clone()),
+        "PATH" => Some(OsString::from("/usr/bin:/bin")),
+        "HTTPS_PROXY" => Some(OsString::from("http://127.0.0.1:9")),
+        super::super::headless_oauth::IMAP_PASS_ENV
+        | super::super::headless_oauth::WEBMAIL_PASS_ENV
+        | super::super::headless_oauth::MAILBOX_TOKEN_ENV
+        | super::super::headless_oauth::TOTP_SECRET_ENV => {
+            Some(OsString::from("fake-secret-in-env"))
+        }
+        MAILBOX_ENV => Some(OsString::from(
+            "imaps://fake-user:fake-secret-in-url@mail.example.test",
+        )),
+        "ATERM_SOMETHING_ELSE" => Some(OsString::from("not for curl")),
+        _ => None,
+    }
+}
+
+/// curl's environment is the opener's [`CHILD_ENV_KEPT`] variables and nothing else: no mailbox
+/// credential the opener holds reaches it, by environment or by argument, and its home is the
+/// one the opener was given. CONTROL: the kept variables do arrive, and the credentials it was
+/// handed arrive on its stdin.
+#[cfg(unix)]
+#[test]
+fn curl_gets_its_secrets_on_stdin_and_only_the_kept_environment() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-curl-env-")
+        .tempdir()
+        .expect("scratch");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let curl = dir.path().join("bin").join("curl");
+    std::fs::create_dir_all(curl.parent().unwrap()).unwrap();
+    aterm_tempfile::stand_in(
+        &curl,
+        "#!/bin/sh\nd=\"${0%/*}\"\nprintf '%s\\n' \"$@\" > \"$d/argv\"\n\
+         /usr/bin/env > \"$d/env\"\n/bin/cat > \"$d/stdin\"\n",
+    )
+    .expect("stand-in curl");
+    let out = curl_output_with(
+        &curl,
+        &["--disable", "--silent"],
+        &[
+            ("user", "fake-user:fake-secret-on-stdin"),
+            ("url", "https://mail.example.test/"),
+        ],
+        &opener_env(&home),
+    )
+    .expect("the stand-in ran");
+    assert!(out.status.success(), "{out:?}");
+    let read = |name: &str| std::fs::read_to_string(curl.with_file_name(name)).unwrap();
+    let env = read("env");
+    let names: BTreeSet<&str> = env
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, _)| k)
+        .collect();
+    let allowed: BTreeSet<&str> = CHILD_ENV_KEPT
+        .iter()
+        .copied()
+        .chain(["PWD", "SHLVL", "_"])
+        .collect();
+    assert!(
+        names.is_subset(&allowed),
+        "only the kept variables: {names:?}"
+    );
+    assert!(
+        !env.contains("fake-secret"),
+        "no credential in curl's environment: {env}"
+    );
+    assert!(
+        !env.contains("ATERM_"),
+        "none of the opener's own settings: {env}"
+    );
+    assert!(
+        env.lines().any(|l| l == format!("HOME={}", home.display())),
+        "CONTROL: the opener's home, not this process's: {env}"
+    );
+    assert!(
+        env.lines().any(|l| l == "HTTPS_PROXY=http://127.0.0.1:9"),
+        "CONTROL: proxy kept"
+    );
+    assert!(
+        !read("argv").contains("fake-secret"),
+        "nothing secret on argv"
+    );
+    assert!(
+        read("stdin").contains("fake-secret-on-stdin"),
+        "CONTROL: the credential arrives on stdin"
     );
 }
 
@@ -5315,4 +5414,18 @@ fn the_outcome_file_holds_one_closed_word_and_a_host() {
         "a relative path is not written"
     );
     assert_eq!(read_outcome(&tmp.path().join("absent")), None);
+    #[cfg(unix)]
+    {
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let link = tmp.path().join("outcome-link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        write_outcome(&link, &met);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep\n",
+            "write_outcome refuses symlinks"
+        );
+        assert_eq!(read_outcome(&link), None, "read_outcome refuses symlinks");
+    }
 }

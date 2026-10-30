@@ -4,7 +4,7 @@
 //! Tests for fleet membership join codes, peer book persistence, and loopback join/reach flows.
 
 use super::*;
-use crate::fleet::{FleetEvent, Listening, read_key_file, serve};
+use crate::fleet::{FleetEvent, Listening, read_key_file, serve_with_handshake};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -1599,10 +1599,11 @@ impl Issuing {
         let serving = std::thread::spawn({
             let running = Arc::clone(&running);
             move || {
-                serve(
+                serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     move |served, op| {
                         let proof = served.peer_node().cloned();
                         served.answer(|stream| {
@@ -1740,10 +1741,11 @@ fn a_registration_tells_an_issuers_refusal_from_no_answer() {
         let serving = std::thread::spawn({
             let running = Arc::clone(&running);
             move || {
-                serve(
+                serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     move |served, _| {
                         served.answer(|stream| {
                             stream.set_read_timeout(Some(HANG))?;
@@ -2669,6 +2671,27 @@ fn a_fleets_members_share_toolsets_at_their_lan_addresses_most_recently_heard_fi
         [IpAddr::from([192, 168, 1, 2]), IpAddr::from([10, 0, 0, 1])],
         "the bound members on the LAN, the most recently heard first: not this node, a \
          loopback or public address, a node no key binds, nor a person's entry"
+    );
+    assert_eq!(
+        member_addrs_with_denied(state.dir(), &[node_of(0xb2)], None),
+        [IpAddr::from([10, 0, 0, 1])],
+        "denied node_id is excluded from LAN toolset sharing"
+    );
+    assert_eq!(
+        member_addrs_with_denied(state.dir(), &[key(0xa1).hex().to_uppercase()], None),
+        [IpAddr::from([192, 168, 1, 2])],
+        "denied 64-hex node_key is excluded from LAN toolset sharing"
+    );
+    let log: MemberKeys = [
+        (key(0xa1), Standing::Member),
+        (key(0xb2), Standing::Out("removed".to_owned())),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        member_addrs_with_denied(state.dir(), &[], Some(&log)),
+        [IpAddr::from([10, 0, 0, 1])],
+        "log-held-out key is excluded from LAN toolset sharing"
     );
 }
 
@@ -5229,10 +5252,11 @@ impl Naming {
         std::thread::spawn({
             let (running, asked) = (Arc::clone(&running), Arc::clone(&asked));
             move || {
-                serve(
+                serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     move |served, _| {
                         served.answer(|stream| {
                             stream.set_read_timeout(Some(HANG))?;
@@ -5659,10 +5683,11 @@ fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
     let serving = std::thread::spawn({
         let (running, dir) = (Arc::clone(&running), state.dir().to_path_buf());
         move || {
-            serve(
+            serve_with_handshake(
                 &listener,
                 &listening,
                 &running,
+                HANG,
                 move |served, _| {
                     let _ = told.send(proven_peer(&served, &dir));
                     served.answer(|_| Ok(()))
@@ -5719,10 +5744,11 @@ fn node_listener(
     let serving = std::thread::spawn({
         let running = Arc::clone(&running);
         move || {
-            serve(
+            serve_with_handshake(
                 &listener,
                 &listening,
                 &running,
+                HANG,
                 move |served, op| {
                     served.answer(|stream| {
                         stream.set_read_timeout(Some(HANG))?;
@@ -6560,12 +6586,16 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
         let running = Arc::clone(&running);
         let deny = Arc::clone(&deny);
         move || {
-            crate::fleet::serve_offering_with_denied(
+            crate::fleet::serve_offering_with_ask_within(
                 &tcp_listener,
-                &listening,
-                &|| (FleetScope::Content, EVERY_OP),
-                &move || Arc::clone(&deny),
+                (
+                    &listening,
+                    &|| (FleetScope::Content, EVERY_OP),
+                    &move || Arc::clone(&deny),
+                ),
+                None,
                 &running,
+                HANG,
                 |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
                 |_| {},
             );

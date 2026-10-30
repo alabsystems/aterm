@@ -138,17 +138,24 @@ pub(crate) fn refresh_child_path(env_pairs: &mut Vec<(OsString, OsString)>) {
     let Some(reg) = registry_path() else {
         return;
     };
+    let is_path = |k: &OsString| k.to_string_lossy().eq_ignore_ascii_case("path");
     let inherited = env_pairs
         .iter()
-        .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("path"))
+        .rfind(|(k, _)| is_path(k))
         .map(|(_, v)| v.clone());
     let merged = union_paths(&reg, inherited.as_ref());
-    match env_pairs
-        .iter_mut()
-        .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("path"))
-    {
-        Some(slot) => slot.1 = merged,
-        None => env_pairs.push((OsString::from("PATH"), merged)),
+    if let Some(first) = env_pairs.iter().position(|(k, _)| is_path(k)) {
+        env_pairs[first].1 = merged;
+        let mut idx = first + 1;
+        while idx < env_pairs.len() {
+            if is_path(&env_pairs[idx].0) {
+                env_pairs.remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+    } else {
+        env_pairs.push((OsString::from("PATH"), merged));
     }
 }
 

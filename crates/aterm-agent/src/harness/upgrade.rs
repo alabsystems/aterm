@@ -3519,6 +3519,16 @@ pub struct Facts {
     pub rung: Rung,
     pub typing: bool,
     pub still_s: u64,
+    /// How long the agent's own work has held this round's move ([`tell_due`]).
+    pub own_hold_s: u64,
+    /// How many times this round's target was told to the agent ([`Step::Tell`]).
+    pub tells: u32,
+    /// How long ago the last tell, about this target or an earlier one, was typed (`u64::MAX`
+    /// when none was): a retarget starts the count again, not the rest.
+    pub told_s: u64,
+    /// Whether the session's autopilot carries it on its own (Cruise or Land), so a line the
+    /// quiet upgrade types is read by an agent that keeps working, not a person.
+    pub may_tell: bool,
     pub press: Press,
 }
 
@@ -3900,6 +3910,15 @@ pub const RETRY_S: u64 = MAX_ASKS as u64 * REASK_S;
 
 const _: () = assert!(RETRY_S >= REASK_S);
 
+/// How long the agent's own work holds a quiet round at [`Rung::Land`] before the agent is told.
+pub const OWN_TELL_S: u64 = 2 * DRAIN_S;
+
+/// The most times one target build is told to one session.
+pub const MAX_TELLS: u32 = 3;
+
+/// The least time between two of them.
+pub const RETELL_S: u64 = RETRY_S;
+
 pub const RETRY_BACKOFF_MAX_SHIFT: u32 = 2;
 
 /// Additional retry backoff in seconds for the `streak`-th consecutive identical failure.
@@ -3952,6 +3971,9 @@ pub enum Step {
     GiveUp,
     Fresh,
     Rearm,
+    /// The quiet upgrade's one line to an agent whose own work holds the move (the wait word):
+    /// what waits and when it moves ([`tell_prompt`]). It asks nothing and ends nothing.
+    Tell(&'static str),
 }
 
 /// Returns whether a failed phase has rested long enough to rearm.
@@ -4135,12 +4157,16 @@ pub fn quiet_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Option<S
     let wait = if f.background_point {
         "background"
     } else {
-        match restart_gate(f, f.owner_now && status_lags(f)) {
+        match quiet_move(f) {
             Gate::Go if f.unnoticed => return Some(Step::Wait(NOTICE_SHOWN)),
             Gate::Go => return Some(Step::Terminate),
             Gate::Wait(w) => w,
         }
     };
+    if own_work_holds(wait) && tell_due(phase, f) && !person_seen(f) && gate_announce(f) == Gate::Go
+    {
+        return Some(Step::Tell(wait));
+    }
     if let Some(since) = announced {
         if ready && let Some(who) = person_void(f, since >= DRAIN_S) {
             return Some(Step::Void(who));
@@ -4150,6 +4176,54 @@ pub fn quiet_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Option<S
         }
     }
     Some(Step::Wait(wait))
+}
+
+/// Whether the quiet move may go now: the session at a genuine idle point with nothing of its
+/// own running under it ([`quiet_step`]).
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeQuiet",
+        action = "MoveAtIdle",
+        project = "aterm_agent::harness::upgrade_drive::quiet_projection"
+    )
+)]
+pub fn quiet_move(f: &Facts) -> Gate {
+    restart_gate(f, f.owner_now && status_lags(f))
+}
+
+/// Whether a quiet round is owed its line to the agent ([`Step::Tell`]): still pending at
+/// [`Rung::Land`], its move held by the agent's own work for [`OWN_TELL_S`], in a session its
+/// autopilot carries, told fewer than [`MAX_TELLS`] times and no tell within [`RETELL_S`].
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellAtPoint",
+        project = "aterm_agent::harness::upgrade_drive::quiet_projection"
+    )
+)]
+pub fn tell_due(phase: &Phase, f: &Facts) -> bool {
+    f.quiet
+        && f.may_tell
+        && !f.taskless
+        && *phase == Phase::Pending
+        && rung_in_force(f) == Rung::Land
+        && f.own_hold_s >= OWN_TELL_S
+        && f.tells < MAX_TELLS
+        && f.told_s >= RETELL_S
+}
+
+/// Whether a look finds a person at the session: their box, draft or hold, their keys, or a key of
+/// theirs within their grace ([`Facts::attended`], whatever the rung; a key a control client
+/// writes is never theirs). A quiet round never tells the agent at such a look ([`quiet_step`]),
+/// and the look restarts the own-work hold ([`Facts::own_hold_s`]): the line is for an agent
+/// nobody is with.
+#[must_use]
+pub fn person_seen(f: &Facts) -> bool {
+    f.attended || f.typing || f.held || person_hold(f).is_some()
 }
 
 fn person_void(f: &Facts, drained: bool) -> Option<&'static str> {
@@ -4226,7 +4300,7 @@ pub fn build_hold(step: Step, phase: &Phase, ready: bool) -> Step {
         return Step::Void(BUILD_FAILS);
     }
     match step {
-        Step::Announce | Step::Terminate | Step::Fresh => Step::Wait(BUILD_FAILS),
+        Step::Announce | Step::Terminate | Step::Fresh | Step::Tell(_) => Step::Wait(BUILD_FAILS),
         Step::Wait(_) | Step::Void(_) | Step::GiveUp | Step::Rearm => step,
     }
 }
@@ -4242,6 +4316,8 @@ pub fn gate_release(f: &Facts, ready: bool) -> Gate {
 
 pub const RELEASE_HEAD: &str = "[aterm harness] Upgrade off: ";
 
+pub const TELL_HEAD: &str = "[aterm harness] Upgrade waiting: ";
+
 /// Returns whether `draft` is a prefix of aterm's own upgrade notice or release line.
 #[must_use]
 pub fn own_draft(draft: &str) -> bool {
@@ -4249,10 +4325,29 @@ pub fn own_draft(draft: &str) -> bool {
     let draft = compact(draft);
     let draft = draft.trim_start_matches(['\u{276F}', '\u{203A}', '\u{00BB}']);
     draft.chars().nth(1).is_some()
-        && [ANNOUNCE_HEAD, RELEASE_HEAD]
+        && [ANNOUNCE_HEAD, RELEASE_HEAD, TELL_HEAD]
             .iter()
             .map(|head| compact(head))
             .any(|head| draft.starts_with(&head) || head.starts_with(draft))
+}
+
+/// The quiet upgrade's line to an agent whose own work has held its move `held_s` ([`Step::Tell`]):
+/// a fact, not a request. With `verb`, it also names the restart the agent may run itself, and
+/// what that ends.
+#[must_use]
+pub fn tell_prompt(agent: Agent, from: &str, to: &str, held_s: u64, verb: bool) -> String {
+    let product = agent.product();
+    let line = format!(
+        "{TELL_HEAD}{product} {to} is installed and this session runs {from}; its own running \
+         work has held the move for {}. aterm moves this conversation onto {to} at a turn end with \
+         no shell, workflow or subagent of its own running",
+        span(held_s)
+    );
+    if verb {
+        format!("{line}; `aterm ctl @self restart` moves it sooner and ends any still running.")
+    } else {
+        format!("{line}.")
+    }
 }
 
 /// Builds the release prompt telling an agent it may resume normal work.
@@ -4285,7 +4380,12 @@ pub fn release_prompt(agent: Agent, quiet: bool) -> String {
 /// Downgrades a restart step to `Wait("circuit-breaker")` when the circuit breaker is open.
 pub fn break_step(step: Step) -> Step {
     match step {
-        Step::Announce | Step::GiveUp | Step::Void(_) | Step::Wait(_) | Step::Rearm => step,
+        Step::Announce
+        | Step::GiveUp
+        | Step::Void(_)
+        | Step::Wait(_)
+        | Step::Rearm
+        | Step::Tell(_) => step,
         Step::Terminate | Step::Fresh => Step::Wait("background"),
     }
 }
@@ -4506,10 +4606,20 @@ pub fn held_point(
             };
             match requested_step(&request, &Phase::Pending, f, false, now_s, target) {
                 Step::Wait(w) | Step::Void(w) => Some(w),
-                Step::Announce | Step::Terminate | Step::Fresh | Step::GiveUp | Step::Rearm => None,
+                Step::Announce
+                | Step::Terminate
+                | Step::Fresh
+                | Step::GiveUp
+                | Step::Rearm
+                | Step::Tell(_) => None,
             }
         }
-        Step::Announce | Step::Wait(_) | Step::Terminate | Step::Void(_) | Step::Fresh => None,
+        Step::Announce
+        | Step::Wait(_)
+        | Step::Terminate
+        | Step::Void(_)
+        | Step::Fresh
+        | Step::Tell(_) => None,
     }
 }
 

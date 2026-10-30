@@ -858,6 +858,8 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
         block: true,
         glyph_span: None,
         light_vivid: false,
+        chosen_hue: false,
+        chosen_base: false,
     };
     let mut app = App::headless_for_test();
     let t0 = Instant::now();

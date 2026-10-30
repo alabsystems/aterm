@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every light scheme (foreach-scheme light: the built-ins and the pack themes) at the build's
+# live level (no `live` line), so the commit that moves prism_glass::LIVE compares its light
+# with main's paper arm: focus loss: the window loses focus mid-trail, gets it back, typing resumes,
+# and loses it again.
+
+foreach-scheme light {
+  grid 16 80
+  style rainbow kitty
+  hz 60
+
+  at 0 pty "\e[9;1H$ "
+  at 700 key e
+  at 702 pty "e"
+  at 800 key c
+  at 802 pty "c"
+  at 900 key h
+  at 902 pty "h"
+  at 1000 key o
+  at 1002 pty "o"
+  at 1100 key space
+  at 1102 pty " "
+  at 1200 key t
+  at 1202 pty "t"
+  at 1300 key h
+  at 1302 pty "h"
+  at 1400 key e
+  at 1402 pty "e"
+  at 1500 key space
+  at 1502 pty " "
+  at 1600 key w
+  at 1602 pty "w"
+  at 1700 key i
+  at 1702 pty "i"
+  at 1800 key n
+  at 1802 pty "n"
+  at 1900 key d
+  at 1902 pty "d"
+  at 2000 key o
+  at 2002 pty "o"
+  at 2100 key w
+  at 2102 pty "w"
+  at 2200 env focus 0
+  at 3400 env focus 1
+  at 3600 key space
+  at 3602 pty " "
+  at 3700 key l
+  at 3702 pty "l"
+  at 3800 key o
+  at 3802 pty "o"
+  at 3900 key s
+  at 3902 pty "s"
+  at 4000 key e
+  at 4002 pty "e"
+  at 4100 key s
+  at 4102 pty "s"
+  at 4200 key space
+  at 4202 pty " "
+  at 4300 key f
+  at 4302 pty "f"
+  at 4400 key o
+  at 4402 pty "o"
+  at 4500 key c
+  at 4502 pty "c"
+  at 4600 key u
+  at 4602 pty "u"
+  at 4700 key s
+  at 4702 pty "s"
+  at 4800 key space
+  at 4802 pty " "
+  at 4900 key a
+  at 4902 pty "a"
+  at 5000 key n
+  at 5002 pty "n"
+  at 5100 key d
+  at 5102 pty "d"
+  at 5200 key space
+  at 5202 pty " "
+  at 5300 key g
+  at 5302 pty "g"
+  at 5400 key e
+  at 5402 pty "e"
+  at 5500 key t
+  at 5502 pty "t"
+  at 5600 key s
+  at 5602 pty "s"
+  at 5700 key space
+  at 5702 pty " "
+  at 5800 key i
+  at 5802 pty "i"
+  at 5900 key t
+  at 5902 pty "t"
+  at 6000 key space
+  at 6002 pty " "
+  at 6100 key b
+  at 6102 pty "b"
+  at 6200 key a
+  at 6202 pty "a"
+  at 6300 key c
+  at 6302 pty "c"
+  at 6400 key k
+  at 6402 pty "k"
+  at 6600 env focus 0
+  run 8000
+}

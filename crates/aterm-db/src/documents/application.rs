@@ -8,6 +8,17 @@ use crate::{
 };
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 
+/// When an open stops waiting to be admitted (custody and the journal writer): 2 s. A unit
+/// test's other holders are its own runtimes, which release them, so its opens wait the
+/// one-minute hang detector ([`crate::replica`]'s admission does the same).
+fn admission_deadline() -> std::time::Instant {
+    #[cfg(not(test))]
+    const ADMISSION: std::time::Duration = std::time::Duration::from_secs(2);
+    #[cfg(test)]
+    const ADMISSION: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+    std::time::Instant::now() + ADMISSION
+}
+
 /// Open one application under a fresh membership observation. Callers keep
 /// their own schema and descriptor; this helper grants no application authority.
 pub(crate) fn with_store<T>(
@@ -16,7 +27,7 @@ pub(crate) fn with_store<T>(
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
 ) -> Result<T> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = admission_deadline();
     let (bootstrap, journal) =
         Bootstrap::required_with_journal_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::from_admitted_journal(&bootstrap, journal)?;
@@ -55,7 +66,7 @@ pub(crate) fn observe_store<T>(
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<T> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = admission_deadline();
     let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::observe(&bootstrap)?;
     let descriptor = descriptor(&bootstrap)?;

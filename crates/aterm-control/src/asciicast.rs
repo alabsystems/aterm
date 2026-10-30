@@ -280,9 +280,14 @@ fn parse_event(line: &str) -> Result<Option<CastEvent<Vec<u8>>>, String> {
             data: data.clone().into_bytes(),
         })),
         "r" => {
+            let dim = |s: &str| {
+                (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse::<u16>().ok())
+                    .flatten()
+            };
             let (cols, rows) = data
                 .split_once('x')
-                .and_then(|(c, r)| Some((c.parse::<u16>().ok()?, r.parse::<u16>().ok()?)))
+                .and_then(|(c, r)| Some((dim(c)?, dim(r)?)))
                 .ok_or_else(|| format!("a resize is not <cols>x<rows>: {data:?}"))?;
             Ok(Some(CastEvent::Resize { t, cols, rows }))
         }
@@ -517,13 +522,16 @@ impl JsonReader<'_> {
             while self
                 .s
                 .get(self.i)
-                .is_some_and(|b| *b != b'"' && *b != b'\\')
+                .is_some_and(|b| *b >= 0x20 && *b != b'"' && *b != b'\\')
             {
                 self.i += 1;
             }
             out.extend_from_slice(&self.s[start..self.i]);
             match self.s.get(self.i) {
                 None => return Err("unterminated JSON string".to_string()),
+                Some(0..=0x1f) => {
+                    return Err("unescaped control character in JSON string".to_string());
+                }
                 Some(b'"') => {
                     self.i += 1;
                     return Ok(String::from_utf8_lossy(&out).into_owned());
@@ -929,6 +937,14 @@ mod tests {
                 "line 3",
             ),
             (
+                "{\"version\": 2, \"width\": 80, \"height\": 24}\n[0.2, \"r\", \"+80x24\"]\n",
+                "line 2",
+            ),
+            (
+                "{\"version\": 2, \"width\": 80, \"height\": 24}\n[0.2, \"r\", \"80x+24\"]\n",
+                "line 2",
+            ),
+            (
                 "{\"version\": 2, \"width\": 80, \"height\": 24}\n[0.1, \"o\", \"\\q\"]\n",
                 "line 2",
             ),
@@ -942,7 +958,18 @@ mod tests {
         }
         let deep = format!("{}{}", "[".repeat(100), "]".repeat(100));
         assert!(parse_json(&deep).is_err(), "nesting is bounded");
-        for malformed in ["\"\\u+041\"", "\"\\u-041\"", "01", "-01", "1.", "1e", "1e+"] {
+        for malformed in [
+            "\"\\u+041\"",
+            "\"\\u-041\"",
+            "\"\x00\"",
+            "\"\t\"",
+            "\"\x1f\"",
+            "01",
+            "-01",
+            "1.",
+            "1e",
+            "1e+",
+        ] {
             assert!(
                 parse_json(malformed).is_err(),
                 "{malformed} is not RFC 8259 JSON"

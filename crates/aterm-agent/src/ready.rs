@@ -59,13 +59,29 @@ impl Ready {
         }
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(&path)
             .and_then(|read| {
-                std::fs::OpenOptions::new()
+                use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                let rmeta = read.metadata()?;
+                if !rmeta.file_type().is_fifo() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ready path is not a FIFO",
+                    ));
+                }
+                let write = std::fs::OpenOptions::new()
                     .write(true)
-                    .open(&path)
-                    .map(|write| (read, write))
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)?;
+                let wmeta = write.metadata()?;
+                if wmeta.dev() != rmeta.dev() || wmeta.ino() != rmeta.ino() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ready FIFO changed between opens",
+                    ));
+                }
+                Ok((read, write))
             });
         let unlinked = std::fs::remove_file(&path);
         let (read, write) = opened?;

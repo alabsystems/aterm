@@ -8,6 +8,7 @@ use crate::supervise::policy::approval::{
     QuestionPriority, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
     RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
+use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 use crate::supervise::policy::turn_end::{
     RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE,
@@ -137,6 +138,7 @@ fn is_dialog_key(rule: &str) -> bool {
 
 fn is_prose_answer(rule: &str) -> bool {
     rule == RULE_LAND_ANSWER
+        || rule == RULE_GO_AHEAD
         || QuestionPriority::ALL
             .into_iter()
             .any(|p| p.prose_rule_id() == rule)
@@ -216,6 +218,7 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         | RULE_ANSWER_LONG_TERM
         | RULE_ANSWER_SHORT_TERM
         | RULE_LAND_ANSWER
+        | RULE_GO_AHEAD
         | RULE_ANSWER
         | RULE_PROSE_LONG_TERM
         | RULE_PROSE_SHORT_TERM => "answer",
@@ -815,6 +818,7 @@ mod tests {
             RULE_PROSE_LONG_TERM,
             RULE_PROSE_SHORT_TERM,
             RULE_LAND_ANSWER,
+            RULE_GO_AHEAD,
         ] {
             assert_eq!(
                 sort(rule, typed, "the long-term one"),
@@ -1149,6 +1153,7 @@ mod tests {
             RULE_LAND,
             RULE_LAND_NUDGE,
             RULE_LAND_ANSWER,
+            RULE_GO_AHEAD,
             RULE_ANSWER,
             RULE_PROSE_LONG_TERM,
             RULE_PROSE_SHORT_TERM,

@@ -553,6 +553,26 @@ fn enrolled_is_the_rows_in_whose_login_directory_a_login_was_made() {
     }
 }
 
+#[test]
+fn a_renewal_receipt_is_not_a_login() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let dir = root.path();
+    std::fs::write(dir.join(RENEWAL_CHECKPOINT_FILE), "private checkpoint").unwrap();
+    std::fs::create_dir(dir.join(".renewal-check-interrupted")).unwrap();
+    let roster = Roster {
+        rows: vec![Row {
+            label: "account".into(),
+            dir: Some(dir.to_str().unwrap().into()),
+            ..Row::default()
+        }],
+    };
+    assert!(!login_made(dir));
+    assert!(enrolled(&roster).is_empty());
+    std::fs::write(dir.join(".claude.json"), "vendor profile").unwrap();
+    assert!(login_made(dir));
+    assert!(enrolled(&roster).contains("account"));
+}
+
 fn full_state() -> State {
     let mut s = on_main();
     s.machine = "00112233aabbccdd".to_string();
@@ -2424,6 +2444,66 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
         Some(&second),
         "a refused pin keeps the request for a later eligible completion"
     );
+}
+
+#[test]
+fn an_expired_recorded_wall_resumes_only_when_no_other_limit_stands() {
+    let r = three();
+    let enrolled = all(&r);
+    let written = NOW - HOUR;
+    for until in [None, Some(written + 10 * MIN)] {
+        let mut s = on_main();
+        note_wall(&mut s, "main", "five_hour", until, written, written);
+        let end = s.accounts["main"].walls["five_hour"]
+            .stands_until()
+            .unwrap();
+        let ask = |s: &State, point: &Point, now| {
+            advise_past_probe(&r, s, &enrolled, &me("main"), point, Mode::Wall, now)
+        };
+        let point = wall_at(written);
+        assert!(matches!(ask(&s, &point, end - 1), Advice::Move { .. }));
+        for now in [end, NOW] {
+            assert_eq!(ask(&s, &point, now), Advice::Resume { cleared_at: end });
+        }
+        assert!(matches!(ask(&s, &point, written - 1), Advice::Move { .. }));
+        assert!(matches!(ask(&s, &wall(), NOW), Advice::Move { .. }));
+        assert!(matches!(ask(&s, &wall_at(end), NOW), Advice::Move { .. }));
+        assert!(matches!(
+            ask(
+                &s,
+                &Point::Wall {
+                    window: "unknown".into(),
+                    at: Some(written)
+                },
+                NOW
+            ),
+            Advice::Move { .. }
+        ));
+        let mut other = s.clone();
+        note_wall(&mut other, "main", "seven_day", Some(NOW + HOUR), NOW, NOW);
+        assert!(matches!(ask(&other, &point, NOW), Advice::Move { .. }));
+        let mut replaced = s.clone();
+        note_wall(
+            &mut replaced,
+            "main",
+            "five_hour",
+            Some(NOW + HOUR),
+            NOW,
+            NOW,
+        );
+        assert!(matches!(ask(&replaced, &point, NOW), Advice::Move { .. }));
+        let mut signed_out = s.clone();
+        note_auth(&mut signed_out, "main", Auth::SignedOut, NOW);
+        assert!(matches!(ask(&signed_out, &point, NOW), Advice::Move { .. }));
+        // Following an already active account still wins over resuming this old one.
+        s.active = Some("work-2".into());
+        s.proven = true;
+        fresh(&mut s, "work-2");
+        assert!(matches!(
+            ask(&s, &point, NOW),
+            Advice::Move { to, rotates: false, .. } if to == "work-2"
+        ));
+    }
 }
 
 #[test]

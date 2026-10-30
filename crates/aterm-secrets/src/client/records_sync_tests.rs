@@ -307,6 +307,8 @@ fn lacking(root: &Path, post_status: u16) -> Lacking {
 /// `Repost::Whole`) posts nine records the second time, not one.
 #[test]
 fn a_server_that_cannot_take_a_members_frontier_gets_no_whole_store_each_pass() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let mut lacking = lacking(root.path(), 400);
     for pass in 0..2 {
@@ -363,6 +365,8 @@ fn a_server_that_cannot_take_a_members_frontier_gets_no_whole_store_each_pass() 
 /// a `503`) posts once over both passes.
 #[test]
 fn a_server_too_busy_to_judge_a_post_is_posted_the_frontier_again() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     for status in [503, 500, 408, 429] {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let lacking = lacking(root.path(), status);
@@ -437,6 +441,8 @@ fn a_keyless_host_leaves_nothing_in_a_store_with_no_genesis() {
 /// `sync_records_inner`) keeps the host's six records, and the vault's genesis is refused.
 #[test]
 fn a_keyless_host_cannot_root_a_store_with_a_genesis_it_signed() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let vault_seed = [0x77; 32];
     let ours = Record::found(&vault_seed, vec![entrant(1, "m1").3], 1_000).expect("genesis");

@@ -32,7 +32,19 @@ use std::{
 /// Bounded repair work per connection; subsequent rounds resume from durable inventory.
 pub const RECORDS_PER_ROUND: usize = 256;
 /// One exchange's absolute deadline.
+#[cfg(not(test))]
 pub(crate) const WITHIN: Duration = Duration::from_secs(30);
+/// A unit test's peer is its own listener, which serves: a round a loaded machine slows waits the
+/// one-minute hang detector rather than being cut (as [`crate::control`]'s exchange does).
+#[cfg(test)]
+pub(crate) const WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// How long [`serve_until`]'s listener gives a connection's TLS and both proofs: aterm-net's
+/// [`fleet::HANDSHAKE_WITHIN`].
+#[cfg(not(test))]
+const HANDSHAKE: Duration = fleet::HANDSHAKE_WITHIN;
+/// A unit test's dialer is its own runtime, which finishes the handshake: the hang detector.
+#[cfg(test)]
+const HANDSHAKE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Durably exchanged operation counts for this peer and round. Zero counts do
 /// not prove global convergence or the absence of another peer's unseen history.
@@ -454,7 +466,7 @@ pub fn serve_until(
     let error = stopped.clone();
     let dir = dir.to_path_buf();
     let repairs = Arc::new(Mutex::new(BTreeMap::new()));
-    fleet::serve_lan(
+    fleet::serve_lan_within(
         listener,
         &fleet::Listening {
             secret,
@@ -466,6 +478,7 @@ pub fn serve_until(
             lifetime: WITHIN,
         },
         &running,
+        HANDSHAKE,
         move |served, _| {
             let peer = served.peer_node().cloned();
             let credentials = Credentials::load(&dir).map_err(std::io::Error::other)?;

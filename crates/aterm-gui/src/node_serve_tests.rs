@@ -28,7 +28,8 @@ use super::{
 };
 
 const SECRET_BYTES: [u8; 24] = [0x5a; 24];
-const DIAL_WITHIN: Duration = Duration::from_secs(5);
+/// The node job each test dials is its own, which serves: a dial waits the hang detector.
+const DIAL_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 struct MockWindowLauncher {
     logged_in: AtomicBool,
@@ -241,7 +242,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         vault_paths: None,
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(40),
-        wake_timeout: Duration::from_secs(3),
+        wake_timeout: aterm_spec::wait::MUST_HAPPEN,
         stop: Arc::clone(&stop),
         launcher: Arc::clone(&launcher) as Arc<dyn WindowLauncher>,
         members: None,
@@ -886,10 +887,11 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     };
     let server = std::thread::spawn(move || run_node_serve_with(cfg));
 
-    let lock_acquired =
-        aterm_spec::wait::within(Duration::from_secs(5), Duration::from_millis(15), || {
-            node_job_holds_lock(&state_dir).then_some(())
-        });
+    let lock_acquired = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(15),
+        || node_job_holds_lock(&state_dir).then_some(()),
+    );
     assert!(
         lock_acquired.is_some(),
         "running node job must hold node-job.lock so GUI yields port 7100"
@@ -947,11 +949,12 @@ fn query_window_survey_facts_reads_live_window_session_counts_unlike_zero_fallba
         .launch_window(&state_dir, relay_scratch.path())
         .expect("spawn mock window relay");
 
-    let live_facts =
-        aterm_spec::wait::within(Duration::from_secs(5), Duration::from_millis(15), || {
-            query_window_survey_facts(relay_scratch.path())
-        })
-        .expect("live window relay must answer survey facts");
+    let live_facts = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(15),
+        || query_window_survey_facts(relay_scratch.path()),
+    )
+    .expect("live window relay must answer survey facts");
     assert_eq!(
         live_facts.sessions, 1,
         "node heartbeat must preserve live window session count from wf-<pid>.sock"
@@ -1019,7 +1022,7 @@ fn member_node_with_identity_only_aterm_toml_preserves_default_drive_grant() {
         vault_paths: None,
         prebound_listener: Some(prebound),
         tick_every: Duration::from_millis(30),
-        wake_timeout: Duration::from_secs(3),
+        wake_timeout: aterm_spec::wait::MUST_HAPPEN,
         stop: Arc::clone(&stop),
         launcher: Arc::clone(&launcher) as Arc<dyn WindowLauncher>,
         members: None,

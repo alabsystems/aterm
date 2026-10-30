@@ -127,6 +127,211 @@ fn reserved_entries_are_authenticated_without_becoming_secret_files() {
 }
 
 #[test]
+fn log_backed_roster_and_admin_reads_terminate_and_keep_their_privileges() {
+    let f = Fixture::new();
+    f.publish(|doc| {
+        doc.set_entry(
+            &Audience::Everyone,
+            fleet::FLEET_CODE_ENTRY,
+            b"inert-reserved-code",
+        )
+        .unwrap()
+    });
+    admin_seed_swarm_roster(&f.paths, &[]).unwrap();
+    seed_vault_genesis(&f.paths, &f._root.path().join("test.genesis")).unwrap();
+    admin_mirror_log(&f.paths, &[]).unwrap();
+
+    let expected = config(&f.paths).unwrap().unwrap();
+    assert!(
+        log_entries::trusted_local_log(&f.paths, &expected)
+            .unwrap()
+            .is_some(),
+        "the admin verdict must consult a seeded membership log"
+    );
+    let roster = read_reserved_entry(&f.paths, &expected, crate::SWARM_ROSTER_ENTRY)
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::swarm_roster::SwarmRoster::from_toml(
+            std::str::from_utf8(roster.value().as_slice()).unwrap()
+        )
+        .unwrap()
+        .member_by_recipient(
+            &read_identity(&f.paths)
+                .unwrap()
+                .unwrap()
+                .recipient()
+                .to_bech32()
+        )
+        .is_some()
+    );
+    let fleet = fleet::reserved_fleet(&f.paths, &expected).unwrap().unwrap();
+    assert!(
+        fleet.admin,
+        "an explicit admin read keeps the real privilege"
+    );
+    assert_eq!(fleet.code.as_slice(), b"inert-reserved-code");
+    assert!(f.read_token().is_some());
+}
+
+#[test]
+fn a_log_backed_denied_admin_can_read_the_roster_but_has_no_admin_privilege() {
+    for deny_node in [false, true] {
+        let macs = crate::client::log_entries_tests::two_macs_with(
+            &[
+                (Audience::Everyone, fleet::FLEET_CODE_ENTRY, b"inert-code"),
+                (Audience::Everyone, "token", b"inert-token"),
+            ],
+            true,
+        );
+        admin_seed_swarm_roster(&macs.m22, &[]).unwrap();
+        sync(&macs.m7, None).unwrap();
+        let expected = config(&macs.m7).unwrap().unwrap();
+        assert!(
+            fleet::reserved_fleet(&macs.m7, &expected)
+                .unwrap()
+                .unwrap()
+                .admin
+        );
+        let admin = admin_open(&macs.m22).unwrap();
+        let mut doc = admin.doc.clone();
+        let mut roster = crate::swarm_roster::SwarmRoster::from_document(&doc)
+            .unwrap()
+            .unwrap();
+        let recipient = read_identity(&macs.m7)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32();
+        let member = roster
+            .members
+            .iter_mut()
+            .find(|m| m.recipient == recipient)
+            .unwrap();
+        let node_key = "22".repeat(32);
+        member.node_key = Some(node_key.clone());
+        if deny_node {
+            roster.deny_nodes.push(node_key.clone());
+        } else {
+            roster.deny_labels.push(member.label.clone());
+        }
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            roster.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&macs.m22, &admin, &doc).unwrap();
+        sync(&macs.m7, None).unwrap();
+
+        let identity = read_identity(&macs.m7).unwrap().unwrap();
+        let cached = envelope::parse(&std::fs::read(macs.m7.cache_file()).unwrap()).unwrap();
+        assert!(
+            age::decrypt(
+                std::slice::from_ref(&identity),
+                cached.admin_locker().unwrap().armored.as_bytes()
+            )
+            .is_ok(),
+            "the denied member still decrypts the admin locker, so key absence cannot explain refusal"
+        );
+        assert!(
+            log_entries::trusted_local_log(&macs.m7, &expected)
+                .unwrap()
+                .is_some()
+        );
+        let (_, is_admin) =
+            read_reserved_entry_and_admin(&macs.m7, &expected, crate::SWARM_ROSTER_ENTRY)
+                .unwrap()
+                .unwrap();
+        assert!(
+            !is_admin,
+            "a readable roster must not grant the denied admin's privilege"
+        );
+        assert!(
+            fleet::swarm_denied_nodes(&macs.m7)
+                .unwrap()
+                .unwrap()
+                .contains(&node_key)
+        );
+        assert!(
+            read_reserved_entry(&macs.m7, &expected, fleet::FLEET_CODE_ENTRY)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fleet::reserved_fleet(&macs.m7, &expected)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_verified_entry(&macs.m7, &expected, "token")
+                .unwrap()
+                .is_none()
+        );
+        macs.server.stop();
+    }
+}
+
+#[test]
+fn a_log_removed_admin_cannot_reuse_its_cached_admin_locker() {
+    let macs = crate::client::log_entries_tests::two_macs_with(
+        &[(Audience::Everyone, fleet::FLEET_CODE_ENTRY, b"inert-code")],
+        true,
+    );
+    admin_seed_swarm_roster(&macs.m22, &[]).unwrap();
+    sync(&macs.m7, None).unwrap();
+    let expected = config(&macs.m7).unwrap().unwrap();
+    assert!(
+        fleet::reserved_fleet(&macs.m7, &expected)
+            .unwrap()
+            .unwrap()
+            .admin
+    );
+    let cached = std::fs::read(macs.m7.cache_file()).unwrap();
+    let (writer, actor, incarnation) = crate::client::log_entries_tests::member_key(&macs.m22);
+    let (_, removed, _) = crate::client::log_entries_tests::member_key(&macs.m7);
+    let mut log = load_records(&macs.m7).unwrap().log().unwrap().clone();
+    let record = writer
+        .device()
+        .with_seed(|seed| {
+            log.draft(
+                &actor,
+                100,
+                crate::membership_log::Body::Remove {
+                    member: removed,
+                    cutoff: *log.genesis().id(),
+                },
+            )
+            .sign(seed, incarnation)
+        })
+        .unwrap();
+    log.insert(record.clone()).unwrap();
+    save_records(&macs.m7, &crate::membership_log::encode_records(&[record])).unwrap();
+    assert_eq!(cached, std::fs::read(macs.m7.cache_file()).unwrap());
+    let identity = read_identity(&macs.m7).unwrap().unwrap();
+    let envelope = envelope::parse(&cached).unwrap();
+    assert!(
+        age::decrypt(
+            std::slice::from_ref(&identity),
+            envelope.admin_locker().unwrap().armored.as_bytes()
+        )
+        .is_ok()
+    );
+    assert!(log.recipient_is_removed(&identity.recipient()));
+    assert!(
+        fleet::reserved_fleet(&macs.m7, &expected)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read_reserved_entry_and_admin(&macs.m7, &expected, crate::SWARM_ROSTER_ENTRY)
+            .unwrap()
+            .is_none()
+    );
+    macs.server.stop();
+}
+
+#[test]
 fn an_update_removes_the_fleet_code_file_an_older_build_wrote_at_the_same_version() {
     let f = Fixture::new();
     f.publish(|doc| {
@@ -385,6 +590,52 @@ fn reserved_fleet_distinguishes_admin_locker_holders_from_members() {
         !fleet::reserved_fleet(&m2, &m2_cfg).unwrap().unwrap().admin,
         "removed admin no longer opens the admin locker"
     );
+
+    // Denying m2 in aterm-swarm-roster refuses reserved_fleet and read_verified_entry on m2 while
+    // still permitting SWARM_ROSTER_ENTRY itself to be read.
+    let admin = admin_open(&m1).unwrap();
+    let mut doc = admin.doc.clone();
+    let mut roster = crate::swarm_roster::SwarmRoster::from_document(&doc)
+        .unwrap()
+        .unwrap_or_default();
+    roster.deny_labels.push("m2".to_string());
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::SWARM_ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    admin_publish(&m1, &admin, &doc).unwrap();
+    sync(&m2, None).unwrap();
+    let m2_cfg = config(&m2).unwrap().unwrap();
+    assert!(
+        fleet::reserved_fleet(&m2, &m2_cfg).unwrap().is_none(),
+        "denied member must not read reserved_fleet"
+    );
+    assert!(
+        read_reserved_entry(&m2, &m2_cfg, fleet::FLEET_CODE_ENTRY)
+            .unwrap()
+            .is_none(),
+        "denied member must not read non-roster reserved entries"
+    );
+    assert!(
+        read_reserved_entry(&m2, &m2_cfg, crate::SWARM_ROSTER_ENTRY)
+            .unwrap()
+            .is_some(),
+        "SWARM_ROSTER_ENTRY itself must remain readable so swarm_roster can observe the denial"
+    );
+    assert!(
+        !materialization_ready(&m2).unwrap(),
+        "denied member must not report materialization_ready"
+    );
+    assert!(matches!(
+        observe_materialization(&m2, &m2_cfg, || Ok(())).unwrap(),
+        MaterializationObservation::Blocked(MaterializationBlocker::Revoked)
+    ));
+    assert!(matches!(
+        observe_commons(&m2).unwrap(),
+        crate::commons::Observation::Unavailable(crate::commons::Unavailable::Revoked)
+    ));
 }
 
 #[test]

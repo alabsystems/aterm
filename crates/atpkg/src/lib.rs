@@ -41,6 +41,7 @@ pub mod admit_disk;
 pub mod adoption;
 pub mod alab;
 pub mod apply;
+pub mod build_admit;
 pub mod build_cache;
 /// Programs built into aterm (`amacs`).
 pub mod builtin;

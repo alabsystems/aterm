@@ -3509,6 +3509,13 @@ fn try_proxy_forward(
         let _ = (&*client).write_all(line.as_bytes());
         let _ = (&*client).flush();
     };
+    // Drive admission may have promoted the request to Owner before its hosted session
+    // moved. A sibling TOKEN hop carries no Driver, so retry instead of widening authority.
+    #[cfg(any(unix, test))]
+    if crate::fabric::serving_driver().is_some() {
+        reply(aterm_types::control_verbs::CONTROL_BUSY_LINE);
+        return true;
+    }
     let forward_error = |error: &std::io::Error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
             reply(&format!("ERR forward: {error}\n"));
@@ -6296,7 +6303,7 @@ fn drive_gate(
             }
             _ => Err(format!(
                 "a drive serves survey, version, hold, spawn agent=<word> and await task, \
-                 and @<sid> status|text|screen|result|turn|key|send|close; not `{}`",
+                 and @<sid> status|text|screen|result|inbox|post|turn|key|send|close; not `{}`",
                 verb.chars().take(32).collect::<String>()
             )),
         },
@@ -6306,14 +6313,15 @@ fn drive_gate(
                 return Err(SID.to_owned());
             };
             match verb {
-                "status" | "text" | "screen" | "result" => Ok(read()),
+                "status" | "text" | "screen" | "result" | "inbox" => Ok(read()),
+                "post" => Ok(act("post", Some(sid))),
                 "turn" => drive_turn(rest).map(|()| act("turn", Some(sid))),
                 "key" => Ok(act("key", Some(sid))),
                 "send" => Ok(act("send", Some(sid))),
                 "close" if rest.trim().is_empty() && spawned(&sid) => Ok(act("close", Some(sid))),
                 "close" => Err(DRIVE_CLOSE_REFUSED.to_owned()),
                 _ => Err(format!(
-                    "a drive serves @<sid> status|text|screen|result|turn|key|send|close; not \
+                    "a drive serves @<sid> status|text|screen|result|inbox|post|turn|key|send|close; not \
                      `{}`",
                     verb.chars().take(32).collect::<String>()
                 )),

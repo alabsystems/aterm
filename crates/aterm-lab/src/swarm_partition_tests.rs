@@ -181,6 +181,7 @@ fn whole() -> Evidence {
         },
         commons: None,
         accounts: None,
+        removals: None,
         load: Vec::new(),
         cut_ms: 80_000,
     }

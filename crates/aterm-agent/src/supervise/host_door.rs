@@ -169,6 +169,18 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     act fn at_background(&self) -> Option<(String, crate::supervise::policy::turn_end::HostTurn)> {
         None
     }
+    /// [`Self::at_background`] at a break the loop describes ([`IdlePoint`]: the guards a host's
+    /// fact is judged by, [`IdlePoint::held`] and [`IdlePoint::theirs`]), as
+    /// [`Self::at_idle_on`] is to [`Self::at_idle`]: a fact the host may type there goes only
+    /// where none of the guards it is judged by holds (the quiet upgrade's line: under Cruise only
+    /// a person's grace, which holds Cruise's own carry at a break too).
+    act fn at_background_on(
+        &self,
+        point: IdlePoint,
+    ) -> Option<(String, crate::supervise::policy::turn_end::HostTurn)> {
+        let _ = point;
+        self.at_background()
+    }
     /// Whether the host owes a fact of its own (`HostTurn::Fact`: the `disk-free@v1` ask's line)
     /// that it would type at a settled break of the agent's own background work, where the turn
     /// is over and only a shell or a monitor it left runs on ([`Self::at_background_fact`]). Asked

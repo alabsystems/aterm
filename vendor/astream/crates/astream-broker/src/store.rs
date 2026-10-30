@@ -3270,6 +3270,13 @@ pub struct OpenOptions {
     /// a bucket's record or byte budget is exhausted. `None` by default. Ignored by
     /// [`BrokerLog::open_opts`].
     pub rate_limit: Option<RateLimit>,
+    /// When `true` (`false` by default), latch a per-`(conn_id, producer_id)` sticky
+    /// sequence gap fence whenever a `Publish` or `ProcessAndProduce` is refused
+    /// (`DESIGN-aterm-fabric` §14 Open Question 7 & §15;
+    /// [`Broker::set_sticky_batch_refusal`](crate::Broker::set_sticky_batch_refusal)),
+    /// refusing pipelined writes past the failed sequence (`gap-fenced=<seq>: ...`) until
+    /// an idempotent retry at `<= <seq>` commits. Ignored by [`BrokerLog::open_opts`].
+    pub sticky_batch_refusal: bool,
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
     pub(crate) mutation: Mutation,
@@ -3289,6 +3296,13 @@ impl OpenOptions {
     #[must_use]
     pub const fn with_rate_limit(mut self, limit: RateLimit) -> Self {
         self.rate_limit = Some(limit);
+        self
+    }
+
+    /// Builder helper setting [`Self::sticky_batch_refusal`].
+    #[must_use]
+    pub const fn with_sticky_batch_refusal(mut self, on: bool) -> Self {
+        self.sticky_batch_refusal = on;
         self
     }
 
@@ -3364,7 +3378,8 @@ impl fmt::Debug for OpenOptions {
             .field("boot", &self.boot)
             .field("volume", &self.volume)
             .field("health_every", &self.health_every)
-            .field("selective_tail_wake", &self.selective_tail_wake);
+            .field("selective_tail_wake", &self.selective_tail_wake)
+            .field("sticky_batch_refusal", &self.sticky_batch_refusal);
         // Keys and secrets are never printed.
         #[cfg(feature = "cap")]
         {
@@ -5758,6 +5773,62 @@ impl BrokerLog {
     /// and the next open reads a log this broker owns again.
     pub fn declare_replica(&mut self) -> io::Result<()> {
         self.mark_replica()
+    }
+
+    /// Whether a replica log encountered a divergent record during replication.
+    #[must_use]
+    pub const fn is_diverged(&self) -> bool {
+        self.diverged
+    }
+
+    /// Promote a clean, idle replica log (`<log>.replica`) to become the new cluster
+    /// leader:
+    ///
+    /// - Refused if the log is poisoned, closed, released, not a replica, marked
+    ///   diverged, or currently staging/writing a batch.
+    /// - Flushes `<log>` in full and durably advances `<log>.id` generation past
+    ///   `min_cluster_epoch` (recording a [`Lineage`](crate::Lineage) step `(next_gen,
+    ///   head)` when `head > 0`) BEFORE removing `<log>.replica` and syncing the parent
+    ///   directory.
+    pub fn promote_replica(
+        &mut self,
+        min_cluster_epoch: Option<crate::LogIdentity>,
+    ) -> io::Result<(crate::LogIdentity, crate::Lineage)> {
+        self.check_poisoned()?;
+        if self.closed || self.released {
+            return Err(io::Error::other(
+                "promote_replica: log is closed or released",
+            ));
+        }
+        if !self.replica {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "promote_replica applies only to a replica log",
+            ));
+        }
+        if self.diverged {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "promote_replica refused: replica log is diverged",
+            ));
+        }
+        if self.writing || !self.staged.is_empty() {
+            return Err(io::Error::other(
+                "promote_replica: a batch is staged or writing; promote when idle",
+            ));
+        }
+        self.file.sync_data()?;
+        self.durable_head = self.next.0;
+        self.identity = logid::promote(&self.dir, &self.identity, min_cluster_epoch)?;
+        let marker = replica_marker_path(&self.path);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        sync_parent_dir(&marker)?;
+        self.replica = false;
+        Ok((self.identity.identity, self.identity.lineage().clone()))
     }
 
     /// Operator-invoked tail truncation on a REPLICA log (`self.replica == true`) to

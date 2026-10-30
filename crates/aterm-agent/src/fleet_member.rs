@@ -99,9 +99,11 @@ any such address and this machine's own listener, writing nothing.
 the node key this machine's book binds, run `aterm ctl --host <this Mac> …`
 here (spawn agent=<word> and await task; any session's status, text, screen,
 result, turn, key, send and hold; close of a worker that node spawned; `aterm
-help workers`), and nobody else does. `--all` instead admits every node the
-issuer's book binds, under the key it binds. No plain join and no remote call
-turns either grant on; `sync` applies the default ALab full-membership policy.
+help workers`), and nobody else does. `--all` instead admits members whose keys
+this Mac's membership log admits or whose node keys its eligible peer books bind.
+Removing an entry from one book does not revoke it in every book. No plain join
+and no remote call turns either grant on; `sync` applies the default ALab
+full-membership policy.
 `init --rotate` mints the issuer a new secret, keeping the place [fleet]
 listen names unless --host or --port names others (every member joins again;
 the book keeps each until then; no drive grant is kept, here or on a member
@@ -121,6 +123,8 @@ thread_local! {
     static ISSUER_READ_WITHIN: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
     static PEER_READ_WITHIN: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    static SERVES_WITHIN: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -184,6 +188,17 @@ const JOIN_WITHIN: Duration = Duration::from_secs(10);
 /// an issuer gone silent: their joins wait the hang detector.
 #[cfg(test)]
 const JOIN_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// How long a join's dial of its issuer, and its registration there, take at most:
+/// [`JOIN_WITHIN`], or what a test of the binary set through the dev seam [`JOIN_WITHIN_SEAM`]
+/// (milliseconds), as every issuer it joins is an aterm on the same machine that serves, which a
+/// loaded machine can keep from answering within [`JOIN_WITHIN`].
+fn join_within() -> Duration {
+    seamed_within(JOIN_WITHIN_SEAM, JOIN_WITHIN)
+}
+
+/// The dev seam that sets [`join_within`] for a test of the binary.
+const JOIN_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_JOIN_WITHIN_MS";
 
 const CODE_READ_MAX: u64 = 4096;
 
@@ -472,14 +487,31 @@ fn read_code(code_file: Option<&Path>) -> Result<(String, CodeFrom), Failure> {
         .ok_or_else(|| failed("no join code came: pipe it in, or name its file with --code-file"))
 }
 
-static UNSHOWN_TTY: std::sync::OnceLock<(i32, libc::termios)> = std::sync::OnceLock::new();
+static UNSHOWN_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static UNSHOWN_LFLAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn after_now(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365))
+}
 
 extern "C" fn restore_and_end(signal: libc::c_int) {
-    if let Some((fd, saved)) = UNSHOWN_TTY.get() {
-        // SAFETY: `fd` is the /dev/tty `read_unshown` holds open while this handler is
-        // installed, and `saved` a termios `tcgetattr` filled.
+    let fd = UNSHOWN_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: `termios` is plain C data, and `fd` is the open `/dev/tty` held by
+        // `read_unshown` while `UNSHOWN_FD >= 0`; both `tcgetattr` and `tcsetattr` are POSIX
+        // async-signal-safe.
         unsafe {
-            libc::tcsetattr(*fd, libc::TCSAFLUSH, saved);
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut term) == 0 {
+                #[allow(clippy::cast_possible_truncation, clippy::unnecessary_cast)]
+                {
+                    term.c_lflag =
+                        UNSHOWN_LFLAG.load(std::sync::atomic::Ordering::SeqCst) as libc::tcflag_t;
+                }
+                libc::tcsetattr(fd, libc::TCSAFLUSH, &term);
+            }
         }
     }
     // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no
@@ -502,9 +534,11 @@ extern "C" fn restore_and_end(signal: libc::c_int) {
 
 fn read_unshown(prompt: &str) -> io::Result<String> {
     use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::Ordering;
     struct Restore {
         fd: i32,
         saved: libc::termios,
+        claimed: bool,
         interrupt: Option<libc::sigaction>,
     }
     impl Drop for Restore {
@@ -520,6 +554,9 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
                     libc::sigaction(libc::SIGINT, was, std::ptr::null_mut());
                 }
             }
+            if self.claimed {
+                UNSHOWN_FD.store(-1, Ordering::SeqCst);
+            }
         }
     }
     let mut tty = std::fs::OpenOptions::new()
@@ -534,9 +571,15 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
     if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let interrupt = UNSHOWN_TTY
-        .set((fd, saved))
-        .is_ok()
+    #[allow(clippy::unnecessary_cast)]
+    let saved_lflag = saved.c_lflag as u64;
+    let claimed = UNSHOWN_FD
+        .compare_exchange(-1, fd, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    if claimed {
+        UNSHOWN_LFLAG.store(saved_lflag, Ordering::SeqCst);
+    }
+    let interrupt = claimed
         .then(|| {
             // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty
             // mask, no flags).
@@ -555,6 +598,7 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
     let restore = Restore {
         fd,
         saved,
+        claimed,
         interrupt,
     };
     // SAFETY: `fd` is open, and `quiet` is a termios `tcgetattr` filled, then edited.
@@ -2111,7 +2155,7 @@ fn register_with(
         .next()
         .or_else(|| advertised.get_or_insert_with(|| more().into_iter()).next())
     {
-        let left = (started + JOIN_WITHIN).saturating_duration_since(Instant::now());
+        let left = (started + join_within()).saturating_duration_since(Instant::now());
         if left.is_zero() && first.is_some() {
             break;
         }
@@ -2155,7 +2199,10 @@ fn register_at(
     {
         return Err(JoinFailed::OtherKey(proof.node.clone()));
     }
-    let deadline = (started + within).max(Instant::now() + Duration::from_secs(1));
+    let deadline = started
+        .checked_add(within)
+        .unwrap_or_else(|| after_now(within))
+        .max(after_now(Duration::from_secs(1)));
     let joined =
         member::register_by(&mut reached, registration, deadline).map_err(|e| match e {
             member::Unregistered::Answered(why) => JoinFailed::Registration(why),
@@ -2212,7 +2259,7 @@ fn peers(places: &Places, args: &[String]) -> Result<String, Failure> {
             let began = ReadUnder::now(places, Held::read(&places.state), true);
             let secret = began.held.secret().cloned();
             let within = issuer_read_within();
-            let check = (Instant::now() + within, within);
+            let check = (after_now(within), within);
             let me = own_identity(places);
             let (read, mut unread) =
                 copy_first(places, (secret.as_ref(), me.as_ref()), what, check);
@@ -2385,10 +2432,34 @@ fn remove_peer(
 /// to now ([`DriveGrant::admitting`], as the listener's admission asks).
 fn drives_here(places: &Places, node: &str) -> bool {
     let grants = granted_here(places);
-    !grants.is_empty()
-        && Keyring::read(&places.state)
-            .bound(node)
-            .is_some_and(|key| DriveGrant::admitting(&grants, node, key).is_some())
+    if grants.is_empty() {
+        return false;
+    }
+    let Some(key) = Keyring::read(&places.state).bound(node) else {
+        return false;
+    };
+    let vault_paths = vault_paths_for(places);
+    let denied = vault_paths
+        .as_ref()
+        .and_then(|paths| {
+            aterm_secrets::client::swarm_denied_nodes(paths)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
+    if aterm_net::fleet::is_denied_node(node, &denied)
+        || aterm_net::fleet::is_denied_key(&key, &denied)
+    {
+        return false;
+    }
+    if vault_paths
+        .as_ref()
+        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys())
+        .is_some_and(|log| log.holds_out(&key))
+    {
+        return false;
+    }
+    DriveGrant::admitting(&grants, node, key).is_some()
 }
 
 /// Every node [`drives_here`] lets drive this Mac now, among the nodes its books bind.
@@ -2397,13 +2468,29 @@ fn driving(places: &Places) -> Vec<String> {
     if grants.is_empty() {
         return Vec::new();
     }
+    let vault_paths = vault_paths_for(places);
+    let denied = vault_paths
+        .as_ref()
+        .and_then(|paths| {
+            aterm_secrets::client::swarm_denied_nodes(paths)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
+    let log = vault_paths
+        .as_ref()
+        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
     let keys = Keyring::read(&places.state);
     member::bound_peers(&places.state)
         .into_iter()
         .filter_map(|peer| peer.node)
         .filter(|node| {
-            keys.bound(node)
-                .is_some_and(|key| DriveGrant::admitting(&grants, node, key).is_some())
+            !aterm_net::fleet::is_denied_node(node, &denied)
+                && keys.bound(node).is_some_and(|key| {
+                    !aterm_net::fleet::is_denied_key(&key, &denied)
+                        && !log.as_ref().is_some_and(|log| log.holds_out(&key))
+                        && DriveGrant::admitting(&grants, node, key).is_some()
+                })
         })
         .collect()
 }
@@ -2691,13 +2778,13 @@ fn drop_copied_grant(
     };
     let still = drives_here(places, node);
     Ok(Some(format!(
-        "aterm fleet peers: {} ({}) stays in the fleet issuer's book, which this machine copies \
-         (`aterm fleet peers rm` on the issuer takes it out); {}\n{}{}",
+        "aterm fleet peers: {} ({}) stays in the fleet issuer's book, which this machine copies; \
+         removing an entry from one book does not revoke it in every book; {}\n{}{}",
         peer.target(),
         short(node),
         if still {
-            "it may still drive this Mac, as [fleet] drive_from's \"*\" lets every member its \
-             issuer binds (`aterm fleet allow content` takes that back)"
+            "it may still drive this Mac, as [fleet] drive_from's \"*\" still admits it \
+             (`aterm fleet allow content` takes that back)"
         } else {
             "it drives this Mac no more"
         },
@@ -2997,14 +3084,27 @@ const PROBE_MIN: Duration = Duration::from_millis(500);
 
 const PROBE_MAX: Duration = Duration::from_secs(1);
 
+/// [`serves_new_key`]'s whole wait and the most one look of it waits: [`SERVES_NEW_KEY`] and
+/// [`PROBE_MAX`], or, for both, what a unit test set on its thread: its hang detector for a
+/// listener that serves in process, which a loaded machine can keep from proving itself within
+/// either.
+fn serves_within() -> (Duration, Duration) {
+    #[cfg(test)]
+    if let Some(within) = SERVES_WITHIN.get() {
+        return (within, within);
+    }
+    (SERVES_NEW_KEY, PROBE_MAX)
+}
+
 /// Once a verb wrote `secret` as the key an aterm running here serves, wait, at most
-/// [`SERVES_NEW_KEY`], until its `[fleet] listen` place proves this machine's node under it, so a
-/// reader or a join that comes next meets the new key; the line saying why it still does not,
-/// which the report's close then follows ([`follows`]). Only that proof is served: the wait ends
-/// at once without a line where nothing listens there and no aterm here answers, and with one
-/// where the place takes a connection and finishes no handshake beside an aterm here that answers
-/// nothing ([`answers_no_handshake`]) or beside none ([`held_by_another`]), or where nothing
-/// listens beside one that answers nothing ([`nothing_listens`]).
+/// [`SERVES_NEW_KEY`] ([`serves_within`]), until its `[fleet] listen` place proves this machine's
+/// node under it, so a reader or a join that comes next meets the new key; the line saying why it
+/// still does not, which the report's close then follows ([`follows`]). Only that proof is
+/// served: the wait ends at once without a line where nothing listens there and no aterm here
+/// answers, and with one where the place takes a connection and finishes no handshake beside an
+/// aterm here that answers nothing ([`answers_no_handshake`]) or beside none
+/// ([`held_by_another`]), or where nothing listens beside one that answers nothing
+/// ([`nothing_listens`]).
 fn serves_new_key(places: &Places, secret: &FleetSecret) -> Option<String> {
     let table = ConfigFile::open(&places.config)
         .map_err(failed)
@@ -3013,20 +3113,14 @@ fn serves_new_key(places: &Places, secret: &FleetSecret) -> Option<String> {
         return None;
     };
     let at = own_place(&table)?;
-    let after = format!(
-        " {} s after the new key was written",
-        SERVES_NEW_KEY.as_secs()
-    );
+    let (within, look) = serves_within();
+    let after = format!(" {} s after the new key was written", within.as_secs());
     let line = |line: String| Some(format!("  listener   {line}\n"));
-    let end = Instant::now() + SERVES_NEW_KEY;
+    let end = after_now(within);
     let mut here = None;
     loop {
         let left = end.saturating_duration_since(Instant::now());
-        let seen = match own_listener(
-            &table,
-            (secret, Some(&me)),
-            left.clamp(PROBE_MIN, PROBE_MAX),
-        ) {
+        let seen = match own_listener(&table, (secret, Some(&me)), left.clamp(PROBE_MIN, look)) {
             None | Some(Ok(_)) => return None,
             Some(Err(why)) => why,
         };
@@ -3405,32 +3499,105 @@ fn roster_identities(places: &Places) -> Vec<member::PeerIdentity> {
     let Some(paths) = vault_paths_for(places) else {
         return Vec::new();
     };
-    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(&paths) else {
+    let Ok(Some(mut roster)) = aterm_secrets::client::swarm_roster(&paths) else {
         return Vec::new();
     };
-    roster
-        .members
+    let own_id = own_identity(places);
+    let bound = member::bound_peers(&places.state);
+    std::mem::take(&mut roster.members)
         .into_iter()
-        .map(|member| member::PeerIdentity {
-            node: member.node_id,
-            host: None,
-            label: Some(member.label),
-            aliases: member.aliases,
-            vault_name: (!member.vault_name.is_empty()).then_some(member.vault_name),
+        .filter_map(|member| {
+            let label_denied = roster.is_label_denied(&member.label)
+                || (!member.vault_name.is_empty() && roster.is_label_denied(&member.vault_name))
+                || member.aliases.iter().any(|a| roster.is_label_denied(a));
+            if label_denied {
+                return None;
+            }
+            if member
+                .node_key
+                .as_deref()
+                .is_some_and(|k| roster.is_node_denied(k))
+            {
+                return None;
+            }
+            let node = member.node_id.or_else(|| {
+                let key_hex = member.node_key.as_deref()?;
+                if let Some(ref id) = own_id
+                    && id.key().hex().eq_ignore_ascii_case(key_hex)
+                {
+                    return Some(id.node().to_owned());
+                }
+                bound
+                    .iter()
+                    .find(|peer| {
+                        peer.key
+                            .is_some_and(|k| k.hex().eq_ignore_ascii_case(key_hex))
+                    })
+                    .and_then(|peer| peer.node.clone())
+            });
+            if node.as_deref().is_some_and(|n| roster.is_node_denied(n)) {
+                return None;
+            }
+            let vault_name = (!member.vault_name.is_empty()).then_some(member.vault_name);
+            let host = if node.is_none() {
+                vault_name.clone()
+            } else {
+                None
+            };
+            let aliases = member
+                .aliases
+                .into_iter()
+                .filter(|a| !roster.is_label_denied(a))
+                .collect();
+            Some(member::PeerIdentity {
+                node,
+                host,
+                label: Some(member.label),
+                aliases,
+                vault_name,
+            })
         })
         .collect()
 }
 
 /// This machine's own node, where `word` names it ([`member::names_node`]). Also matches `[fleet]
-/// machine` in aterm.toml.
+/// machine` in aterm.toml and this machine's non-denied swarm roster label or alias.
 fn names_this_machine(places: &Places, word: &str) -> Option<String> {
     let own = own_node(places)?;
     if member::names_node(&own, word) {
         return Some(own);
     }
     let word = word.trim();
-    if !word.is_empty()
-        && let Ok(config) = ConfigFile::open(&places.config)
+    if word.is_empty() {
+        return None;
+    }
+    let vault_paths = vault_paths_for(places);
+    if vault_paths
+        .as_ref()
+        .is_some_and(aterm_secrets::client::local_recipient_denied_in_roster)
+    {
+        return None;
+    }
+    let denied_by_roster = vault_paths
+        .as_ref()
+        .and_then(|paths| aterm_secrets::client::swarm_roster(paths).ok().flatten())
+        .is_some_and(|roster| roster.is_label_denied(word));
+    if denied_by_roster {
+        return None;
+    }
+    if roster_identities(places).iter().any(|id| {
+        id.node
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(&own))
+            && (id
+                .label
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(word))
+                || id.aliases.iter().any(|a| a.eq_ignore_ascii_case(word)))
+    }) {
+        return Some(own);
+    }
+    if let Ok(config) = ConfigFile::open(&places.config)
         && let Ok(text) = text_of(&config)
         && let Ok(table) = fleet_table(text)
         && table
@@ -4977,10 +5144,10 @@ fn write_level(
         .any(|word| word == aterm_net::fleet::ALL_MEMBERS)
     {
         out.push_str(
-            "  every member the fleet's issuer binds, proving the node key its book binds it to, \
-             may drive this Mac's sessions (`aterm ctl --host <this Mac> …` there); a Mac that \
-             book binds no more, or binds under another key, drives nothing. The person here \
-             wins: Take Over refuses every remote write.\n",
+            "  every member this Mac's membership log admits or its eligible peer books bind, \
+             proving that node key, may drive this Mac's sessions (`aterm ctl --host <this Mac> \
+             …` there); removing one book entry does not revoke a valid signed entry held by \
+             another member. The person here wins: Take Over refuses every remote write.\n",
         );
         out.push_str(granted_reads(was));
     } else if !nodes.is_empty() {
@@ -5043,6 +5210,18 @@ fn drive_grants(
             )));
         }
     }
+    let vault_paths = vault_paths_for(places);
+    let denied = vault_paths
+        .as_ref()
+        .and_then(|paths| {
+            aterm_secrets::client::swarm_denied_nodes(paths)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
+    let log = vault_paths
+        .as_ref()
+        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
     let mut nodes = Vec::new();
     for word in words {
         if word == aterm_net::fleet::ALL_MEMBERS {
@@ -5063,6 +5242,17 @@ fn drive_grants(
         let peer = match bound {
             Bound::Node(peer) => peer,
             Bound::Unbound(peer) => {
+                if let Some(node) = peer
+                    .node
+                    .as_deref()
+                    .filter(|node| aterm_net::fleet::is_denied_node(node, &denied))
+                {
+                    return Err(failed(format!(
+                        "`{shown}` is node {}, which the swarm roster or membership log denies: \
+                         a revoked node may not be granted drive",
+                        short(node)
+                    )));
+                }
                 return Err(failed(format!(
                     "`{shown}` is node {}, which this machine binds no key to: it is bound when \
                      that machine joins the issuer again, and only then may it drive",
@@ -5078,6 +5268,16 @@ fn drive_grants(
             Bound::Nobody => return Err(failed(names_no_peer(places, word, missed.as_ref()))),
         };
         if let (Some(node), Some(key)) = (peer.node, peer.key) {
+            if aterm_net::fleet::is_denied_node(&node, &denied)
+                || aterm_net::fleet::is_denied_key(&key, &denied)
+                || log.as_ref().is_some_and(|log| log.holds_out(&key))
+            {
+                return Err(failed(format!(
+                    "`{shown}` is node {}, which the swarm roster or membership log denies: a \
+                     revoked node may not be granted drive",
+                    short(&node)
+                )));
+            }
             if let Some(missed) = missed.as_ref().filter(|_| peer.via == Via::IssuerBook) {
                 unconfirmed.push_str(&format!(
                     "  key        node {} is bound here only by this machine's copy of its \
@@ -5499,13 +5699,13 @@ fn leave_within_node(
 /// can.
 fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
     let own = own_node(places);
-    let lifts = |rm| aterm_ctl::lifts_there(own.as_deref().unwrap_or("-"), rm);
+    let lifts = || aterm_ctl::lifts_there(own.as_deref().unwrap_or("-"));
     let found = held_elsewhere(places);
-    let held = found.held.iter().map(|(at, sid, rm)| {
+    let held = found.held.iter().map(|(at, sid)| {
         format!(
             "  hold       {sid} on {at} stays held by this machine, which reaches that Mac no more \
              {once}: {}{}\n",
-            lifts(*rm),
+            lifts(),
             again.map_or_else(String::new, |again| format!(
                 ", and so does `aterm ctl --host {at} hold {sid} off` here once this machine \
                  {again}"
@@ -5513,11 +5713,11 @@ fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
         )
     });
     // A Mac it could not read may hold a tab of its own: that is said too, never left out.
-    let unread = found.unread.iter().map(|(at, why, rm)| {
+    let unread = found.unread.iter().map(|(at, why)| {
         format!(
             "  unread     {at}: this machine could not read it just now ({why}), so it cannot say \
              which tabs it holds there, and any it holds stays held {once}: {}\n",
-            lifts(*rm)
+            lifts()
         )
     });
     let book = found.book.iter().map(|why| {
@@ -5525,7 +5725,7 @@ fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
             "  unread     its issuer's book was not read just now ({why}), so this machine cannot \
              say which tabs it holds on a member only that book names, and any it holds stays \
              held {once}: {}\n",
-            lifts(aterm_ctl::RmLifts::Issuer)
+            lifts()
         )
     });
     held.chain(unread).chain(book).collect()
@@ -5534,11 +5734,10 @@ fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
 /// What [`held_elsewhere`] read of the fleet.
 #[derive(Default)]
 struct HeldElsewhere {
-    /// Each tab this machine holds on another Mac, beside the name a drive dials that Mac by and
-    /// whose `peers rm` of this machine lifts it there.
-    held: Vec<(String, String, aterm_ctl::RmLifts)>,
-    /// Each Mac it could not read, beside why and whose `peers rm` lifts a hold there.
-    unread: Vec<(String, String, aterm_ctl::RmLifts)>,
+    /// Each tab this machine holds on another Mac, beside the name a drive dials that Mac by.
+    held: Vec<(String, String)>,
+    /// Each Mac it could not read, beside why.
+    unread: Vec<(String, String)>,
     /// Why the issuer's book, which names the members, was not read.
     book: Option<String>,
 }
@@ -5573,34 +5772,24 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
         },
         ..HeldElsewhere::default()
     };
-    // A Mac's own book binds this machine where one of them is the other's issuer; any other
-    // member binds it through its copy of the issuer's book.
-    let issues = in_state(places, CODE_FILE).unwrap_or(false);
     let held = &mut found.held;
     for read in reads {
         if read.peer.node.as_deref() == Some(own.as_str()) {
             continue;
         }
         let name = || aterm_codec::tty::one_line(&shown_name(&read.peer), 80);
-        let rm = if issues || read.peer.via == Via::Issuer {
-            aterm_ctl::RmLifts::There
-        } else {
-            aterm_ctl::RmLifts::Issuer
-        };
         let surveyed = match read.read {
             Ok(surveyed) if surveyed.proven => surveyed,
             Ok(_) => {
                 found
                     .unread
-                    .push((name(), "it proved no node of the fleet".to_owned(), rm));
+                    .push((name(), "it proved no node of the fleet".to_owned()));
                 continue;
             }
             Err(why) => {
-                found.unread.push((
-                    name(),
-                    aterm_codec::tty::one_line(&why.to_string(), 160),
-                    rm,
-                ));
+                found
+                    .unread
+                    .push((name(), aterm_codec::tty::one_line(&why.to_string(), 160)));
                 continue;
             }
         };
@@ -5621,9 +5810,9 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
                 && let Some(sid) = field("sid").filter(|sid| {
                     sid.len() <= 64 && aterm_types::control_request::Sid::parse(sid).is_some()
                 })
-                && !held.iter().any(|(_, seen, _)| seen == sid)
+                && !held.iter().any(|(_, seen)| seen == sid)
             {
-                held.push((name(), sid.to_owned(), rm));
+                held.push((name(), sid.to_owned()));
             }
         }
     }
@@ -5689,13 +5878,13 @@ fn drive_fleet_in(
     if me.node().eq_ignore_ascii_case(host.trim()) {
         return Err(itself(me.node()));
     }
-    let deadline = (Instant::now() + within, within);
+    let deadline = (after_now(within), within);
     let check = issuer_read_within().min(within);
     let (read, mut unread) = copy_first(
         places,
         (Some(&secret), Some(&me)),
         host,
-        (Instant::now() + check, check),
+        (after_now(check), check),
     );
     // A Mac's short name (`m102`) binds the one peer it names, by its whole node id.
     let mut word = host_word(places, host, unread.as_ref())?;
@@ -5729,7 +5918,7 @@ fn drive_fleet_in(
             .into());
         }
         if !read {
-            match copy_again(places, &secret, Some(&me), (Instant::now() + check, check)) {
+            match copy_again(places, &secret, Some(&me), (after_now(check), check)) {
                 Ok(true) => {
                     word = host_word(places, host, None)?;
                     if let Some(own) = this_machine_alone(places, &word)? {
@@ -5916,7 +6105,30 @@ fn copy_again(
     };
     let book = member::fetch_book(&target_of(&issuer), (secret, me), deadline)
         .map_err(|why| Missed::of(&why))?;
-    let copies = member::copies_of(&book, own.as_deref());
+    let vault_paths = vault_paths_for(places);
+    let log = vault_paths
+        .as_ref()
+        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
+    let denied = vault_paths
+        .as_ref()
+        .and_then(|paths| {
+            aterm_secrets::client::swarm_denied_nodes(paths)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
+    member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref());
+    let mut copies = member::copies_of(&book, own.as_deref());
+    copies.retain(|copy| {
+        !copy
+            .node
+            .as_deref()
+            .is_some_and(|node| aterm_net::fleet::is_denied_node(node, &denied))
+            && !copy.key.is_some_and(|key| {
+                aterm_net::fleet::is_denied_key(&key, &denied)
+                    || log.as_ref().is_some_and(|log| log.holds_out(&key))
+            })
+    });
     Ok(book.proven
         && member::keep_issuer_book(&places.state, secret, Some((&book.node, &copies)))
             .unwrap_or(false))
@@ -5986,7 +6198,7 @@ fn survey_fleet_in(
         if let Some(own) = own_node(places).filter(|own| own.eq_ignore_ascii_case(what.trim())) {
             return Err(itself(&own).into());
         }
-        let deadline = (Instant::now() + ask.within, ask.within);
+        let deadline = (after_now(ask.within), ask.within);
         // A member's copy holds no member that joined since its last read: the issuer's book is
         // read in half the deadline at most, so a silent issuer leaves the rest for the host.
         let check = issuer_read_within().min(ask.within / 2);
@@ -5994,7 +6206,7 @@ fn survey_fleet_in(
             places,
             (Some(&secret), me.as_ref()),
             what,
-            (Instant::now() + check, check),
+            (after_now(check), check),
         );
         // A Mac's short name (`m102`) reads the one peer it names, by its whole node id.
         let mut word = host_word(places, what, missed.as_ref())?;
@@ -6022,12 +6234,7 @@ fn survey_fleet_in(
             if read {
                 unread = missed;
             } else {
-                match copy_again(
-                    places,
-                    &secret,
-                    me.as_ref(),
-                    (Instant::now() + check, check),
-                ) {
+                match copy_again(places, &secret, me.as_ref(), (after_now(check), check)) {
                     Ok(true) => {
                         let known = known_peers(places).map_err(failure_words)?;
                         keys = known.keys;

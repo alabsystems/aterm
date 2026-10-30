@@ -216,62 +216,93 @@ pub fn resolve_local_pool_identity(
 ) -> Option<LocalPoolIdentity> {
     let config_machine = read_config_machine_raw(config);
     #[cfg(unix)]
-    let (roster_members, recipient, vault_fallback) = if let Some(home) = home {
-        let paths = aterm_secrets::client::Paths::for_home(home);
-        let denied_nodes = aterm_secrets::client::swarm_denied_nodes(&paths)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let members = aterm_secrets::client::swarm_roster(&paths)
-            .ok()
-            .flatten()
-            .map(|mut r| {
-                r.deny_nodes.extend(denied_nodes);
-                r.canonicalize();
-                let deny_labels = std::mem::take(&mut r.deny_labels);
-                let deny_nodes = std::mem::take(&mut r.deny_nodes);
-                let is_label_denied = |lbl: &str| {
-                    deny_labels
-                        .iter()
-                        .any(|d| d.eq_ignore_ascii_case(lbl.trim()))
-                };
-                let is_node_denied =
-                    |n: &str| deny_nodes.iter().any(|d| d.eq_ignore_ascii_case(n.trim()));
-                r.members
-                    .into_iter()
-                    .filter(|m| {
-                        !is_label_denied(&m.label)
-                            && !m.aliases.iter().any(|a| is_label_denied(a))
-                            && !m.node_id.as_deref().is_some_and(is_node_denied)
-                            && !m.node_key.as_deref().is_some_and(is_node_denied)
-                    })
-                    .map(|m| (m.recipient, m.label, m.aliases))
-                    .collect::<Vec<_>>()
+    let (roster_members, recipient, vault_fallback, deny_labels, recipient_denied) =
+        if let Some(home) = home {
+            let paths = aterm_secrets::client::Paths::for_home(home);
+            let status_opt = aterm_secrets::client::status(&paths).ok();
+            let rec_obj = status_opt
+                .as_ref()
+                .and_then(|s| s.machine.as_ref())
+                .map(|(rec, _)| *rec);
+            let rec = rec_obj
+                .as_ref()
+                .map(aterm_secrets::age::Recipient::to_bech32);
+            let config_host = status_opt
+                .as_ref()
+                .and_then(|s| s.config.as_ref())
+                .map(|c| c.host.clone())
+                .filter(|h| !h.trim().is_empty());
+            let mut deny_labels = Vec::new();
+            let mut recipient_denied = status_opt.as_ref().is_some_and(|s| {
+                matches!(
+                    s.membership,
+                    aterm_secrets::client::Membership::Revoked { .. }
+                )
             })
-            .unwrap_or_default();
-        let rec = aterm_secrets::client::status(&paths)
-            .ok()
-            .and_then(|s| s.machine)
-            .map(|(rec, _)| rec.to_bech32());
-        let fallback = if members.is_empty() {
-            aterm_secrets::client::resolve_local_swarm_label(&paths, &[])
+                || aterm_secrets::client::local_recipient_denied_in_roster(&paths);
+            let members = aterm_secrets::client::swarm_roster(&paths)
                 .ok()
                 .flatten()
+                .map(|mut r| {
+                    if config_host.as_deref().is_some_and(|h| r.is_label_denied(h)) {
+                        recipient_denied = true;
+                    }
+                    let members = r
+                        .members
+                        .iter()
+                        .filter(|m| {
+                            let ok = !r.is_label_denied(&m.label)
+                                && !m.aliases.iter().any(|a| r.is_label_denied(a))
+                                && !m.node_id.as_deref().is_some_and(|n| r.is_node_denied(n))
+                                && !m.node_key.as_deref().is_some_and(|k| r.is_node_denied(k));
+                            if !ok && rec.as_deref() == Some(m.recipient.as_str()) {
+                                recipient_denied = true;
+                            }
+                            ok
+                        })
+                        .map(|m| (m.recipient.clone(), m.label.clone(), m.aliases.clone()))
+                        .collect::<Vec<_>>();
+                    deny_labels = std::mem::take(&mut r.deny_labels);
+                    members
+                })
+                .unwrap_or_default();
+            let fallback = if members.is_empty() && !recipient_denied {
+                aterm_secrets::client::resolve_local_swarm_label(&paths, &[])
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            (members, rec, fallback, deny_labels, recipient_denied)
         } else {
-            None
+            (Vec::new(), None, None, Vec::new(), false)
         };
-        (members, rec, fallback)
-    } else {
-        (Vec::new(), None, None)
-    };
     #[cfg(not(unix))]
-    let (roster_members, recipient, vault_fallback): (
+    let (roster_members, recipient, vault_fallback, deny_labels, recipient_denied): (
         Vec<(String, String, Vec<String>)>,
         Option<String>,
         Option<String>,
+        Vec<String>,
+        bool,
     ) = {
         let _ = home;
-        (Vec::new(), None, None)
+        (Vec::new(), None, None, Vec::new(), false)
+    };
+
+    if machine_override.is_none() && recipient_denied {
+        return None;
+    }
+    let filter_denied = |mut id: LocalPoolIdentity| -> Option<LocalPoolIdentity> {
+        if machine_override.is_none()
+            && deny_labels
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&id.primary))
+        {
+            return None;
+        }
+        id.aliases
+            .retain(|a| !deny_labels.iter().any(|d| d.eq_ignore_ascii_case(a)));
+        Some(id)
     };
 
     let effective_config = config_machine.or(vault_fallback);
@@ -281,7 +312,9 @@ pub fn resolve_local_pool_identity(
         effective_config.as_deref(),
         machine_override,
         &[],
-    ) {
+    )
+    .and_then(&filter_denied)
+    {
         return Some(resolved);
     }
     if !roster_members.is_empty() || machine_override.is_some() {
@@ -295,6 +328,7 @@ pub fn resolve_local_pool_identity(
         machine_override,
         &hosts,
     )
+    .and_then(filter_denied)
 }
 
 fn read_config_machine_raw(config: Option<&Path>) -> Option<String> {
@@ -320,7 +354,13 @@ fn read_config_machine_raw(config: Option<&Path>) -> Option<String> {
     None
 }
 
+/// This Mac's host names (`LocalHostName`, `ComputerName`, `hostname`). None in this crate's tests,
+/// which name the Mac by a scratch `aterm.toml` or roster: on a fleet Mac the host's own `m<N>`
+/// name would be a member more than a test counts (7544d9d046, 9271393b1b).
 fn system_hostnames() -> Vec<String> {
+    if cfg!(test) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for (prog, args) in [
         ("/usr/sbin/scutil", &["--get", "LocalHostName"][..]),
@@ -1046,6 +1086,112 @@ warm = ["m3"]
         assert!(id.matches("m32"));
         assert!(!id.matches("m999"));
         assert!(!id.matches("m4"));
+
+        // When `m100` is denied in `aterm-swarm-roster` (`deny_labels = ["m100"]`), neither its
+        // recipient row, `[fleet] machine = "m100"` in `aterm.toml`, nor `resolve_local_swarm_label`
+        // may grant `m100` a pool identity.
+        let denied_home = tmp.path().join("denied-home");
+        let denied_vault = tmp.path().join("denied.vault");
+        let denied_paths = aterm_secrets::client::Paths::for_home(&denied_home);
+        aterm_secrets::client::create(
+            &denied_paths,
+            denied_vault.to_str().unwrap(),
+            None,
+            Some("m100"),
+        )
+        .expect("create denied vault");
+        let denied_rec = aterm_secrets::client::machine_identity(&denied_paths)
+            .expect("identity")
+            .recipient()
+            .to_bech32();
+        let adm = aterm_secrets::client::admin_open(&denied_paths).expect("admin open");
+        let mut doc = adm.doc.clone();
+        let mut denied_roster = aterm_secrets::swarm_roster::SwarmRoster {
+            members: vec![aterm_secrets::swarm_roster::SwarmMember {
+                recipient: denied_rec,
+                vault_name: "m100".to_owned(),
+                label: "m100".to_owned(),
+                aliases: vec!["m32".to_owned()],
+                hint: None,
+                admitted_ms: 1,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: None,
+            }],
+            deny_labels: vec!["m100".to_owned()],
+            deny_nodes: Vec::new(),
+        };
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            aterm_secrets::swarm_roster::ROSTER_ENTRY,
+            denied_roster.to_toml().as_bytes(),
+        )
+        .unwrap();
+        aterm_secrets::client::admin_publish(&denied_paths, &adm, &doc).unwrap();
+        aterm_secrets::client::sync(&denied_paths, None).unwrap();
+        let denied_cfg = denied_home.join(".config/aterm/aterm.toml");
+        fs::create_dir_all(denied_cfg.parent().unwrap()).unwrap();
+        fs::write(&denied_cfg, "[fleet]\nmachine = \"m100\"\n").unwrap();
+        assert_eq!(
+            aterm_secrets::client::resolve_local_swarm_label(&denied_paths, &["m100".to_owned()])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None),
+            None
+        );
+
+        // Removing `m100` from `members` while keeping `deny_labels = ["m100"]` also refuses
+        // fallback to `aterm.toml` (`machine = "m100"`) or `source.toml` (`host = "m100"`).
+        denied_roster.members.clear();
+        let adm2 = aterm_secrets::client::admin_open(&denied_paths).expect("admin open 2");
+        let mut doc2 = adm2.doc.clone();
+        doc2.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            aterm_secrets::swarm_roster::ROSTER_ENTRY,
+            denied_roster.to_toml().as_bytes(),
+        )
+        .unwrap();
+        aterm_secrets::client::admin_publish(&denied_paths, &adm2, &doc2).unwrap();
+        aterm_secrets::client::sync(&denied_paths, None).unwrap();
+        assert_eq!(
+            aterm_secrets::client::resolve_local_swarm_label(&denied_paths, &["m100".to_owned()])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None),
+            None
+        );
+        // Even if `aterm.toml` claims a different label (`m200`), a machine whose vault
+        // `source.toml` host (`m100`) is in `deny_labels` has `recipient_denied = true` and
+        // cannot fall back to `aterm.toml`.
+        fs::write(&denied_cfg, "[fleet]\nmachine = \"m200\"\n").unwrap();
+        assert_eq!(
+            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None),
+            None
+        );
+    }
+
+    #[test]
+    fn with_no_roster_this_mac_is_its_first_host_name_that_starts_with_a_label() {
+        let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let id =
+            resolve_pool_identity_pure(&[], None, None, None, &names(&["Mac-mini-M4", "m7.local"]))
+                .expect("m7.local names this Mac");
+        assert_eq!((id.primary.as_str(), id.from_roster), ("m7", false));
+        assert_eq!(
+            resolve_pool_identity_pure(&[], None, None, None, &names(&["Mac-mini-M4"])),
+            None
+        );
+        let roster = [("age1m100".to_owned(), "m100".to_owned(), Vec::new())];
+        assert_eq!(
+            resolve_pool_identity_pure(&roster, None, None, None, &names(&["m7.local"])),
+            None,
+            "a roster that gives this Mac no row leaves its host names unread"
+        );
     }
 
     #[test]

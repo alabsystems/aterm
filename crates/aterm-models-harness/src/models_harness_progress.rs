@@ -5,6 +5,8 @@
 //! and the owner's press of the ⬆️ (`pressed`): a one-shot Now that passes what only defers a
 //! move (an Autopilot or an agent switched off, the agent's own background work) and waits only
 //! for what a restart would lose (a held tab, a box, a draft), a wall, or a running turn.
+//! It leaves out the quiet flow, which `HarnessUpgradeQuiet` binds (§4.5), the owner's tell, Codex
+//! and the move clock.
 
 use aterm_spec::derive::*;
 

@@ -385,7 +385,14 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
             "inbox",
             format!(
                 "{} from={} kind={} off={}",
-                text(f, Key::Inbox),
+                text(
+                    f,
+                    if f.get(Key::Inbox).is_some() {
+                        Key::Inbox
+                    } else {
+                        Key::Re
+                    }
+                ),
                 text(f, Key::From),
                 text(f, Key::MailKind),
                 text(f, Key::Off)
@@ -446,7 +453,14 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
             "inbox-seen",
             format!(
                 "{} off={} floor={} seen={}{}",
-                text(f, Key::Inbox),
+                text(
+                    f,
+                    if f.get(Key::Inbox).is_some() {
+                        Key::Inbox
+                    } else {
+                        Key::Re
+                    }
+                ),
                 text(f, Key::Off),
                 text(f, Key::Floor),
                 text(f, Key::Seen),

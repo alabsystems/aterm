@@ -204,7 +204,7 @@ impl Record {
     /// The record at `path`, where one is whole.
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
-        Self::parse(&std::fs::read_to_string(path).ok()?)
+        Self::parse(&crate::read_small_text(path, 64 * 1024)?)
     }
 }
 
@@ -429,7 +429,7 @@ impl DiskLock {
             .write(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         #[expect(
             clippy::disallowed_methods,

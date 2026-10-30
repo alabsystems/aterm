@@ -29,6 +29,7 @@ struct Lock(std::fs::File);
 
 impl Lock {
     fn take(paths: &Paths) -> crate::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         fsx::ensure_private_dir(&paths.dir)?;
         let path = paths.dir.join(LOCK);
         let file = std::fs::OpenOptions::new()
@@ -36,7 +37,20 @@ impl Lock {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::new(format!(
+                "{}: not a regular file",
+                path.display()
+            )));
+        }
+        aterm_uds::keep_out_of_children(&file)
             .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         #[expect(
             clippy::disallowed_methods,
@@ -449,6 +463,18 @@ pub fn absorb(paths: &Paths, moves: &[([u8; 16], super::Absorb)]) -> crate::Resu
                     record: Some(record.clone()),
                     ..next
                 }),
+                Absorb::Reissued { nonce, record } if !need.state.ended() && need.posted => {
+                    let fresh = Need {
+                        raises: need.raises.saturating_add(1),
+                        refused: need.refused,
+                        ..super::fresh(*nonce, need.want.clone(), need.purpose, facts)
+                    };
+                    act(&fresh, facts, &Act::Flush).map(|next| Need {
+                        record: Some(record.clone()),
+                        ..next
+                    })
+                }
+                Absorb::Reissued { .. } => None,
                 Absorb::Decided(decision) => {
                     super::decided(need, facts, decision).map(|next| settle(&next, facts))
                 }

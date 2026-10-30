@@ -374,3 +374,146 @@ fn a_mac_that_left_the_vault_drops_its_desk_and_allows_nothing() {
         .expect_err("an asking Mac is refused");
     assert!(why.to_string().contains(not_member), "{why}");
 }
+
+/// F16: a Mac the log removed that asks again shows as removed, not new: the row says who removed
+/// it and when and offers [Allow again], a person's own press that shows the phrase and marks the
+/// run to restore it; `aterm ctl members requests` says `state=removed by=m7`. A Mac a quorum
+/// removed gets no Allow at all.
+///
+/// NEGATIVE CONTROL: in `notice`, drop the `row.removed` branch: the row reads "j wants to join
+/// ALab" with a plain Allow (the ghost returns), and the title assert fails.
+#[test]
+fn a_removed_mac_shows_as_removed_and_allow_again_is_a_persons_press() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let j = device(root.path(), "j");
+    let request = j.request(TRUST.network, TRUST.authority).expect("request");
+    let note = |quorum| client::RemovedNote {
+        label: "m12".into(),
+        by: vec!["m7".into()],
+        on_ms: 1_793_318_400_000,
+        quorum,
+    };
+    let desk_for = |quorum| {
+        let mut notes = client::RemovedNotes::default();
+        notes
+            .by_recipient
+            .insert(request.binding().recipient().to_bech32(), note(quorum));
+        let local = Local::with(device(root.path(), "m1"), TRUST, true, "m1")
+            .expect("member")
+            .with_removed(notes);
+        let mut desk = Desk::new(local);
+        let now = aterm_time::Instant::now();
+        let asked = signed_ask(&j, &desk, &request, "j");
+        desk.hear(&asked.asking(), [10, 0, 0, 9].into(), now)
+            .expect("heard");
+        let id = desk.rows(now)[0].id;
+        (Arc::new(Mutex::new(desk)), id)
+    };
+
+    let (desk, request_id) = desk_for(false);
+    let mut app = app_with(Arc::clone(&desk));
+    let id = row_of(&app, request_id);
+    let live = app.messages.live(id).expect("live").msg.clone();
+    assert_eq!(live.title, "m12 was removed by m7 on Oct 30. Allow again?");
+    assert_eq!(
+        live.actions,
+        [
+            Intent::AllowJoinAgain {
+                request: request_id
+            },
+            Intent::IgnoreJoin {
+                request: request_id
+            }
+        ]
+    );
+    let requests = app.take_members(&Asked::parse("requests").expect("requests"));
+    assert!(requests.contains("state=removed by=m7"), "{requests}");
+    let plain = app.take_members(&Asked::parse("allow j").expect("allow"));
+    assert!(
+        plain.contains("Allow again"),
+        "a plain Allow says why: {plain}"
+    );
+
+    let acted =
+        app.take_notice(wire::NoticeRequest::parse(&format!("act {id} Allow again")).expect("act"));
+    assert!(acted.contains("person's own press"), "{acted}");
+    let wid = crate::WindowId(0);
+    assert!(!app.with_gesture_source(true, |app| {
+        app.perform_intent(
+            wid,
+            id,
+            Intent::AllowJoinAgain {
+                request: request_id,
+            },
+        )
+    }));
+    assert!(app.members.recorded().is_empty(), "no phrase showed");
+    assert!(app.with_gesture_source(false, |app| {
+        app.perform_intent(
+            wid,
+            id,
+            Intent::AllowJoinAgain {
+                request: request_id,
+            },
+        )
+    }));
+    assert_eq!(app.members.recorded().len(), 1);
+    let row = desk.lock_or_recover().rows(aterm_time::Instant::now())[0].clone();
+    assert!(matches!(row.state, RowState::Allowed(_)) && row.restore);
+
+    let (desk, request_id) = desk_for(true);
+    let app = app_with(desk);
+    let live = app
+        .messages
+        .live(row_of(&app, request_id))
+        .expect("live")
+        .msg
+        .clone();
+    assert!(
+        live.title.starts_with("m12 was removed by a quorum of m7"),
+        "{}",
+        live.title
+    );
+    assert_eq!(
+        live.actions,
+        [Intent::IgnoreJoin {
+            request: request_id
+        }],
+        "no Allow for a quorum's removal"
+    );
+}
+
+/// F16: the "Undo m7's removals?" row a removed Mac shows offers [Undo removals] until it signed
+/// its share, then says how many more the quorum needs.
+#[test]
+fn the_undo_row_offers_undo_until_this_mac_signed() {
+    let offer = |signed| client::UndoOffer {
+        remover: [7; 48],
+        label: "m7".into(),
+        code: "abcd-efgh-ijkl-mn23".into(),
+        others: 3,
+        signed,
+        needed: if signed { 1 } else { 2 },
+    };
+    let row = undo_notice(&offer(false));
+    assert_eq!(
+        row.title,
+        "m7 removed this Mac and 3 others. Undo m7's removals?"
+    );
+    assert_eq!(
+        row.actions,
+        [Intent::UndoRemovals {
+            remover: "abcd-efgh-ijkl-mn23".into()
+        }]
+    );
+    assert!(row.actions[0].person_only() && row.actions[0].never_default());
+    assert_eq!(row.key.as_deref(), Some("members.undo.abcd-efgh-ijkl-mn23"));
+    let signed = undo_notice(&offer(true));
+    assert!(signed.actions.is_empty(), "{:?}", signed.actions);
+    // Both rows stand on the band: a complete ask, keyed.
+    let mut app = App::headless_for_test();
+    for row in [row, signed] {
+        let posted = app.post_unsynced(row, wall_stamp_now());
+        assert!(app.messages.live(posted).is_some(), "the undo row shows");
+    }
+}

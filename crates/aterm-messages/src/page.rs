@@ -676,6 +676,8 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         | Intent::ApproveJoin { .. }
         | Intent::AllowJoin { .. }
         | Intent::IgnoreJoin { .. }
+        | Intent::AllowJoinAgain { .. }
+        | Intent::UndoRemovals { .. }
         | Intent::RestartService { .. } => live,
         Intent::ShowTab { .. } => false,
         Intent::ApplyUpdate { build } => host.staged_build() == Some(*build),
@@ -765,6 +767,10 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::AllowJoin { .. }, false) => "Could not allow that Mac".to_string(),
         (Intent::IgnoreJoin { .. }, true) => "Ignored that Mac on this Mac".to_string(),
         (Intent::IgnoreJoin { .. }, false) => "That request is gone".to_string(),
+        (Intent::AllowJoinAgain { .. }, true) => "The phrase is on this Mac's screen".to_string(),
+        (Intent::AllowJoinAgain { .. }, false) => "Could not allow that Mac again".to_string(),
+        (Intent::UndoRemovals { .. }, true) => "Signed this Mac's share of the undo".to_string(),
+        (Intent::UndoRemovals { .. }, false) => "Could not sign the undo".to_string(),
         (Intent::RestartService { .. }, true) => {
             "Opened a tab that asks for your password once".to_string()
         }

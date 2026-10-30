@@ -144,6 +144,186 @@ fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
 }
 
 #[test]
+fn an_expired_retry_keeps_its_owner_when_another_sign_in_is_running() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, true);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    let path = desk.roster();
+    let roster = Roster::load(&path).unwrap();
+    let fx = bench.fx();
+    let ctx = LadderCtx::of(&fx, &path);
+    let clock = Instant::now();
+    let row = roster.row("w3").unwrap();
+    let LadderStep::Go { inputs, .. } =
+        ladder_route_with_clock(&desk.home, &store, row, NOW, &bench.guard, &ctx, &|| clock)
+    else {
+        panic!("the configured profile provides a route");
+    };
+    let later = {
+        let mut guard = bench.guard.lock().unwrap();
+        let wait = guard.ladder.failed("w3", &inputs, clock);
+        guard
+            .ladder_owners
+            .insert("w3".into(), LoginOwner::new(&store, Cli::Claude, "w3", NOW));
+        guard.in_flight = true;
+        clock + wait
+    };
+    assert!(matches!(
+        ladder_route_with_clock(&desk.home, &store, row, NOW, &bench.guard, &ctx, &|| later),
+        LadderStep::Go { .. }
+    ));
+    assert!(AutoRenewPermit::claim(&bench.guard, "w3", later, false).is_none());
+    let guard = bench.guard.lock().unwrap();
+    assert!(guard.ladder.retry_at("w3", later).is_none());
+    assert!(guard.ladder.has_backoff("w3"));
+    assert!(guard.ladder_owners.contains_key("w3"));
+}
+
+#[test]
+fn a_published_alternate_keeps_the_requested_retry_and_the_actual_login() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, true);
+    let store = desk.store();
+    let path = desk.roster();
+    let mut roster = Roster::load(&path).unwrap();
+    roster.rows.push(accounts::Row {
+        label: "alternate".into(),
+        email: Some("alternate@example.test".into()),
+        dir: Some(
+            store
+                .login_dir("alternate")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .into(),
+        ),
+        ..accounts::Row::default()
+    });
+    fs::write(&path, format_roster_toml(&roster).unwrap()).unwrap();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    {
+        let mut guard = bench.guard.lock().unwrap();
+        let clock = Instant::now();
+        guard.last_attempt.insert("alternate".into(), clock);
+        guard.parked.insert("alternate".into(), clock);
+        guard.bot_checked.insert("alternate".into(), clock);
+        guard.activity_owners.insert(
+            "alternate".into(),
+            LoginOwner::new(&store, Cli::Claude, "alternate", NOW - 1),
+        );
+        guard.ladder.failed("alternate", "old inputs", clock);
+        guard.ladder_owners.insert(
+            "alternate".into(),
+            LoginOwner::new(&store, Cli::Claude, "alternate", NOW - 1),
+        );
+    }
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let called = Arc::clone(&calls);
+    let retained = Arc::new(Mutex::new(None));
+    let saved = Arc::clone(&retained);
+    let completion_store = desk.store();
+    let completion_guard = Arc::clone(&bench.guard);
+    let mut fx = bench.fx();
+    fx.run_attempt = Some(Arc::new(move |_, _| {
+        called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let logins = completion_store.load_logins(NOW).unwrap().0;
+        let rows = accounts::bound(&roster, &logins);
+        let staging = completion_store.claim_staging_dir("w3").unwrap();
+        fs::write(staging.join(".claude.json"),
+            br#"{"oauthAccount":{"emailAddress":"alternate@example.test","accountUuid":"alternate"}}"#).unwrap();
+        let result = complete_auto_staging_renewal(
+            &completion_store,
+            accounts::RenewalPolicy {
+                roster_path: &path, roster: &roster,
+                row: rows.row("w3").unwrap(), logins: &logins,
+            },
+            &staging, staging.to_str().unwrap(),
+            (&super::super::align::Captured {
+                stdout: br#"{"loggedIn":true,"authMethod":"claude.ai","email":"alternate@example.test"}"#.to_vec(),
+                code: Some(0),
+            }, Some("profile")), NOW,
+            (&completion_guard, Cli::Claude),
+        );
+        *saved.lock().unwrap() = Some(staging);
+        result
+    }));
+    assert!(auto_renew_next_account(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW,
+        &fx
+    ));
+    let staging = retained.lock().unwrap().clone().unwrap();
+    assert!(staging.join(".claude.json").is_file());
+    assert!(staging.join(accounts::RENEWAL_CHECKPOINT_FILE).is_file());
+    let logins = store.load_logins(NOW).unwrap().0;
+    assert_eq!(
+        logins.get("alternate").unwrap().dir.as_deref(),
+        staging.to_str()
+    );
+    assert_eq!(logins.get("w3").unwrap().wrong_at, Some(NOW));
+    assert_eq!(
+        attempt_of(&desk, "w3").unwrap().outcome,
+        accounts::AttemptOutcome::Failed
+    );
+    assert_eq!(
+        attempt_of(&desk, "alternate").unwrap().outcome,
+        accounts::AttemptOutcome::SignedIn
+    );
+    {
+        let guard = bench.guard.lock().unwrap();
+        let activity = login_activity_of(&guard, &store, Cli::Claude, NOW, Instant::now());
+        assert!(
+            activity.iter().all(|entry| entry.label != "alternate"),
+            "the published alternate must no longer report a local retry: {activity:?}"
+        );
+        assert!(activity.iter().any(|entry| entry.label == "w3"));
+        assert!(!guard.last_attempt.contains_key("alternate"));
+        assert!(!guard.parked.contains_key("alternate"));
+        assert!(!guard.bot_checked.contains_key("alternate"));
+        assert!(!guard.activity_owners.contains_key("alternate"));
+        assert!(!guard.ladder_owners.contains_key("alternate"));
+        assert!(guard.ladder.retry_at("alternate", Instant::now()).is_none());
+    }
+    assert!(
+        bench
+            .guard
+            .lock()
+            .unwrap()
+            .ladder
+            .retry_at("w3", Instant::now())
+            .is_some()
+    );
+    bench.cool();
+    assert!(!auto_renew_next_account(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW + 1,
+        &fx
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
 fn a_roster_identity_edit_reconsiders_the_row_without_roster_rewrite_noise() {
     let desk = Desk::new("m30");
     hand_roster(&desk, false);

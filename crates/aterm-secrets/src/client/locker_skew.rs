@@ -11,7 +11,6 @@
 use super::{Error, Paths};
 use crate::service::{self, Job};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// A release number: `MAJOR.MINOR.PATCH`.
 pub(super) type Version = (u64, u64, u64);
@@ -50,6 +49,7 @@ pub(super) fn version(text: &str) -> Option<Version> {
 }
 
 /// The release a `--version` answer names on its first line, `aterm <version>`.
+#[cfg(test)]
 pub(super) fn version_answer(stdout: &str) -> Option<Version> {
     version(stdout.lines().next()?.strip_prefix("aterm ")?.trim())
 }
@@ -275,15 +275,7 @@ fn program_of(pid: u32) -> Option<PathBuf> {
 
 /// The release `program --version` names.
 pub(super) fn version_of(program: &Path) -> Result<Version, String> {
-    let mut command = aterm_uds::spawnfd::command(program);
-    command.arg("--version");
-    let out = aterm_uds::deadline::output_within(&mut command, Duration::from_secs(30))
-        .map_err(|error| format!("{} --version: {error}", program.display()))?;
-    if !out.status.success() {
-        return Err(format!("{} --version: {}", program.display(), out.status));
-    }
-    version_answer(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| format!("{} --version named no aterm release", program.display()))
+    crate::service::program_release(program).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

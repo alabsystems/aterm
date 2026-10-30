@@ -3,8 +3,8 @@
 
 //! A configured Mac's secrets vault subscriber, mended at launch
 //! (docs/DESIGN-secrets-2026-10-20.md §7), an admin Mac's vault server job whose program
-//! is gone (`mend_server`), and an admin Mac's approver and server held on an aterm that can
-//! no longer read the vault's admin locker, moved onto this one (`mend_held`, §9).
+//! is gone (`mend_server`), and managed ALab jobs moved onto the installed release
+//! (`mend_held`, §9). Personal vault jobs retain their admin-locker compatibility policy.
 //!
 //! Joining is System State's Secrets vault row's. On a launch whose setup is finished, or
 //! that runs none, and every [`MEND_EVERY`] after, a configured Mac's subscriber is read off
@@ -510,9 +510,9 @@ fn mend_server() {
 }
 
 /// The vault's server and approver, moved off a held program (an admin's `--program`
-/// snapshot) onto this aterm only where the hold can no longer do what it was for: the held
-/// program cannot read the vault's admin locker this Mac holds, this aterm (a release) does,
-/// and no person pinned the job (`aterm_secrets::client::mend_held`); the subscriber only while
+/// snapshot) onto this installed release under the managed ALab update or admin-locker
+/// compatibility policy, and only where no person pinned the job
+/// (`aterm_secrets::client::mend_held`); the subscriber only while
 /// System State's plan keeps the vault in sync (`subscriber`). A job whose mend failed this
 /// launch (`failed`, [`held_pass`]) is not tried again until the next. A move is logged; nothing
 /// is asked or posted.
@@ -532,8 +532,7 @@ fn mend_held(subscriber: bool, failed: &mut Vec<aterm_secrets::service::Job>) {
     for (job, mended) in held_pass(jobs, failed, &mut mend) {
         match mended {
             Ok(HeldMend::Moved(line)) => aterm_log::info!(
-                "secrets vault: the {} job ran a held aterm that cannot read the vault's admin \
-                 locker; {line}",
+                "secrets vault: the {} job moved from its held aterm; {line}",
                 job.label()
             ),
             Ok(HeldMend::NotHeld | HeldMend::Kept(_) | HeldMend::Unread(_)) => {}

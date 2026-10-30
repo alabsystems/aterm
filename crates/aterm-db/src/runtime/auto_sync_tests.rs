@@ -643,8 +643,9 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
         1,
         "unproved m4 enrolled over ACE1 against non-admin m2 and replicated table",
     );
+    // rt_b4 runs on m4: its repair rounds take and release commons.lock.
     assert!(
-        Bootstrap::required(&m4)
+        Bootstrap::required_until(&m4, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
             .unwrap()
             .log_witness()
             .unwrap()

@@ -205,6 +205,145 @@ pub fn targo(args: &[&str]) -> aterm_uds::spawnfd::Command {
     cmd
 }
 
+/// A heavy build's memory claim ([`claim_build`]): held until the build ends, `None` where
+/// nothing was claimed.
+pub type BuildClaim = Option<Box<atpkg::build_admit::Held>>;
+
+/// CLAIM THE MEMORY OF A HEAVY BUILD the lab is about to start in `cwd`
+/// (`docs/DESIGN-adaptive-build-2026-10-24.md`, BUILD-ADMIT), as a plain build's is
+/// ([`atpkg::build_admit::admit`]): the `targo` call `args`, or, for an alias that runs a build of
+/// its own past the shim, the build `like` names (`ship dev-app` builds as `--unverified build
+/// --release -p aterm`). `None` where it claims nothing: a covering claim of this process or an
+/// ancestor's holds it (a verify stage's, the build that runs this lab's test), this process holds
+/// a claim of its own, which a second would wait on (a lane's VM claim: said), the ledger failed
+/// (said), or the call is no build that claims.
+///
+/// # Errors
+/// An interrupt ended its wait: the build is not to start.
+pub fn claim_build(args: &[&str], like: Option<&[&str]>, cwd: &Path) -> Result<BuildClaim, String> {
+    claim_build_at(
+        args,
+        like,
+        cwd,
+        &atpkg::build_admit::Seat::live(),
+        &mut |line| eprintln!("aterm-lab: {line}"),
+    )
+}
+
+/// [`claim_build`] at `seat`, saying through `say`: what a test sets.
+///
+/// # Errors
+/// As [`claim_build`].
+pub fn claim_build_at(
+    args: &[&str],
+    like: Option<&[&str]>,
+    cwd: &Path,
+    seat: &atpkg::build_admit::Seat<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<BuildClaim, String> {
+    use atpkg::build_admit::{Admission, admit, classify};
+    let words: Vec<String> = like
+        .unwrap_or(args)
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+    let Some(build) = classify(&words, atpkg::build_cache::Tool::Targo) else {
+        return Ok(None);
+    };
+    match admit(&build, cwd, seat, say) {
+        Admission::Claimed(held) => Ok(Some(held)),
+        Admission::Stopped(e) => Err(format!("its memory claim was {e}")),
+        Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => Ok(None),
+    }
+}
+
+/// A claimed build's tree, metered while it runs ([`Metered::start`]).
+pub struct Metered {
+    meter: aterm_capacity::tree_meter::TreeMeter,
+    held: Box<atpkg::build_admit::Held>,
+}
+
+impl Metered {
+    /// Meter the build `pid` leads, under `claim`; `None` where nothing was claimed. Only
+    /// [`spawn_claimed`] starts one, once its claim is held.
+    fn start(pid: u32, claim: BuildClaim) -> Option<Metered> {
+        claim.map(|held| Metered {
+            meter: aterm_capacity::tree_meter::TreeMeter::start(pid),
+            held,
+        })
+    }
+
+    /// The build ended: keep its peak (never below `floor`, its reaped tree's largest resident
+    /// peak) when it `succeeded`, and let its claim go.
+    pub fn end(self, succeeded: bool, floor: u64) {
+        let peak = self.meter.stop(floor);
+        self.held
+            .end(succeeded, peak, &mut |line| eprintln!("aterm-lab: {line}"));
+    }
+}
+
+/// START `cmd`, the build [`claim_build`] claimed `claim` for, UNDER ITS CLAIM: taking the claim,
+/// the spawn comes after it, so the build directory's lock the build takes is taken under it
+/// (the order `aterm_models_atpkg::atpkg_build_admit_model` holds), and the build is handed the
+/// claim's cover marker ([`aterm_capacity::COVER_ENV`]), so a build it starts claims nothing
+/// more. The child, and its meter while a claim is held ([`Metered::end`] keeps the peak and lets
+/// the claim go).
+///
+/// # Errors
+/// The spawn's: the claim is let go.
+pub fn spawn_claimed(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    claim: BuildClaim,
+) -> io::Result<(aterm_uds::spawnfd::Child, Option<Metered>)> {
+    if let Some(held) = &claim {
+        cmd.env(
+            aterm_capacity::COVER_ENV,
+            held.claim().record().cover_marker(),
+        );
+    }
+    let child = cmd.spawn()?;
+    let metered = Metered::start(child.id(), claim);
+    Ok((child, metered))
+}
+
+/// Run `cmd`, the build [`claim_build`] claimed `claim` for, to its end ([`spawn_claimed`]):
+/// metered while a claim is held, its peak kept as `atpkg::build_admit::Held::end` keeps one.
+/// Its status.
+///
+/// # Errors
+/// The spawn's or the wait's.
+pub fn status_claimed(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    claim: BuildClaim,
+) -> io::Result<std::process::ExitStatus> {
+    let (mut child, metered) = spawn_claimed(cmd, claim)?;
+    let usage = child.wait_with_rusage()?;
+    if let Some(m) = metered {
+        m.end(usage.status.success(), usage.maxrss);
+    }
+    Ok(usage.status)
+}
+
+/// [`status_claimed`], its stdout and stderr captured.
+///
+/// # Errors
+/// The spawn's, reading's or the wait's.
+pub fn output_claimed(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    claim: BuildClaim,
+) -> io::Result<std::process::Output> {
+    let (child, metered) = spawn_claimed(
+        cmd.stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::piped()),
+        claim,
+    )?;
+    let out = child.wait_with_output()?;
+    if let Some(m) = metered {
+        m.end(out.status.success(), 0);
+    }
+    Ok(out)
+}
+
 /// Atomically replaces `path` with `bytes` via [`crate::sys::put`].
 ///
 /// # Errors
@@ -387,6 +526,130 @@ pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use aterm_capacity::{Admit, Fixed, Ledger, Pace, Reading};
+
+    const GIB: u64 = 1 << 30;
+
+    /// A seat on `dir`'s scratch ledger and records, on a 24 GiB machine, asked by `pid`.
+    fn seat<'m>(dir: &std::path::Path, m: &'m Fixed, pid: u32) -> atpkg::build_admit::Seat<'m> {
+        atpkg::build_admit::Seat {
+            ledger: Some(Ledger::at(dir.join("ledger"))),
+            machine: m,
+            own: Some(dir.join("targo-memory.json")),
+            verify: Some(dir.join("stage-memory.json")),
+            mode: Admit::Wait,
+            pace: Pace::default(),
+            pid,
+            marker: None,
+        }
+    }
+
+    /// A heavy build claims as a plain one, an alias as the build it is said to run, and a
+    /// claimed build that succeeded keeps its peak (here its reaped shell's floor, more than 0).
+    /// NEGATIVE CONTROL: the alias named as nothing else claims nothing, and a build that fails
+    /// with a peak below what it claimed keeps none.
+    #[test]
+    fn a_heavy_build_claims_and_keeps_its_peak_as_a_plain_build_does() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let m = Fixed::new(Reading::of_gib(24, 20, 14));
+        let s = seat(dir.path(), &m, std::process::id().wrapping_add(21));
+        let records = || aterm_capacity::book::Records::load(&dir.path().join("targo-memory.json"));
+        let dev_app = ["--unverified", "ship", "dev-app"];
+        let like = ["--unverified", "build", "--release", "-p", "aterm"];
+        let none = super::claim_build_at(&dev_app, None, dir.path(), &s, &mut |_| {});
+        assert!(
+            matches!(none, Ok(None)),
+            "an alias claims nothing by itself"
+        );
+        let run = |script: &str| {
+            let claim = super::claim_build_at(&dev_app, Some(&like), dir.path(), &s, &mut |_| {})
+                .expect("admitted")
+                .expect("claimed");
+            assert_eq!(claim.claim().record().need.what, "targo build -p aterm");
+            assert_eq!(claim.claim().record().need.mem, 12 * GIB, "cold");
+            let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+            cmd.args(["-c", script]);
+            super::status_claimed(&mut cmd, Some(claim)).expect("ran")
+        };
+        assert_eq!(run("exit 1").code(), Some(1));
+        assert!(
+            records().rows().is_empty(),
+            "a failed build below its claim keeps nothing"
+        );
+        assert!(run("exit 0").success());
+        let kept = records();
+        assert_eq!(kept.rows().len(), 1);
+        assert_eq!(kept.rows()[0].key.variant.as_deref(), Some("release"));
+        assert!(kept.rows()[0].peaks[0].bytes > 0);
+    }
+
+    /// A claimed lab build starts under its claim ([`super::spawn_claimed`]): a stand-in that
+    /// looks for its parent's claim (a file `<start>-<ppid>-<seq>.claim`) at its start finds it,
+    /// and is handed that claim's cover marker. NEGATIVE CONTROL (by hand: `spawn_claimed`
+    /// letting the claim go before it spawns): it finds none, and is handed no marker.
+    #[test]
+    fn a_claimed_lab_build_starts_under_its_claim() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let m = Fixed::new(Reading::of_gib(24, 20, 14));
+        let s = seat(dir.path(), &m, std::process::id().wrapping_add(31));
+        let args = ["--unverified", "build", "-p", "aterm-lab", "--bin", "x"];
+        let claim = super::claim_build_at(&args, None, dir.path(), &s, &mut |_| {})
+            .expect("admitted")
+            .expect("claimed");
+        let ledger = dir.path().join("ledger");
+        let marker = claim.claim().record().cover_marker();
+        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "echo \"${{ATERM_CAPACITY_COVER-unset}}\"; \
+                 for f in '{}'/*-\"$PPID\"-*.claim; do [ -e \"$f\" ] && {{ echo held; exit 0; }}; \
+                 done; echo none",
+                ledger.display()
+            ),
+        ])
+        .env_remove(aterm_capacity::COVER_ENV)
+        .stdout(aterm_uds::spawnfd::Stdio::piped());
+        let (child, metered) = super::spawn_claimed(&mut cmd, Some(claim)).expect("spawned");
+        let out = child.wait_with_output().expect("its end");
+        if let Some(m) = metered {
+            m.end(out.status.success(), 0);
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{marker}\nheld\n")
+        );
+    }
+
+    /// A lab process that holds a claim of its own (a lane's VM) builds unclaimed and says so: a
+    /// second claim would wait on its own. NEGATIVE CONTROL: once it lets go, the build claims.
+    #[test]
+    fn a_lab_holding_a_claim_of_its_own_builds_unclaimed() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let m = Fixed::new(Reading::of_gib(24, 20, 14));
+        let me = std::process::id();
+        let vm = aterm_capacity::admit_with(
+            &Ledger::at(dir.path().join("ledger")),
+            &m,
+            aterm_capacity::Need::new("lab vm boot").mem(4 * GIB),
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .expect("the VM's claim");
+        let s = seat(dir.path(), &m, me);
+        let args = ["--unverified", "build", "-p", "aterm-lab", "--bin", "x"];
+        let mut said = Vec::new();
+        let got = super::claim_build_at(&args, None, dir.path(), &s, &mut |l| {
+            said.push(l.to_owned());
+        });
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        assert!(said.iter().any(|l| l.contains("lab vm boot")), "{said:?}");
+        drop(vm);
+        let got = super::claim_build_at(&args, None, dir.path(), &s, &mut |_| {});
+        assert!(matches!(got, Ok(Some(_))), "{got:?}");
+    }
+
     #[test]
     fn a_nested_targo_starts_at_the_checkout_without_what_cargo_said_about_the_lab() {
         // CONTROL: cargo hands this test binary what it hands the lab under `targo run`

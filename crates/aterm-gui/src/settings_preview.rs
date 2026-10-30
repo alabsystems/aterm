@@ -346,12 +346,38 @@ impl CursorPreviewSpec {
         }
     }
 
-    /// The preview's glow config on `theme`, resolved as a window's is. Its light
-    /// (`docs/design/PRISM-GLASS.md` §15.2 1.11) has no latch: the preview's theme is both its
-    /// configured scheme and its page, and no program moves either, so the light is
-    /// [`crate::cursor_glow::Light::admitted`] the two tests a window's latch gates on
-    /// (`scheme_light`, `raw_light`) at `prism_glass::LIVE`, from the first frame.
-    fn glow_config(&self, theme: Theme, head_dx: f32) -> crate::cursor_glow::GlowConfig {
+    /// The preview's glow config on `theme`, resolved as a window's is, over a card whose page
+    /// is `clear` (no wallpaper under it). Its light (`docs/design/PRISM-GLASS.md` §15.2 1.11)
+    /// has no latch: the preview's theme is both its configured scheme and its page, and no
+    /// program moves either, so the light is [`crate::cursor_glow::Light::admitted`] the two
+    /// tests a window's latch gates on (`scheme_light`, `raw_light`) at `prism_glass::LIVE`,
+    /// from the first frame, on its page as a window's is (§15.2 1.7,
+    /// [`crate::cursor_glow::Light::on_page`]): over a wallpaper the light is sheer and draws
+    /// main's paper arm. The card draws no translucency, so its page is clear unless a wallpaper
+    /// lies under it.
+    fn glow_config(
+        &self,
+        theme: Theme,
+        head_dx: f32,
+        clear: bool,
+    ) -> crate::cursor_glow::GlowConfig {
+        self.glow_config_at(
+            theme,
+            head_dx,
+            clear,
+            aterm_effects::rainbow_kitty::prism_glass::LIVE,
+        )
+    }
+
+    /// [`Self::glow_config`] at the live level `live`, which the tests preview before `LIVE`
+    /// takes it.
+    fn glow_config_at(
+        &self,
+        theme: Theme,
+        head_dx: f32,
+        clear: bool,
+        live: aterm_effects::cursor_glow::Live,
+    ) -> crate::cursor_glow::GlowConfig {
         use aterm_effects::host::light_latch::{raw_light, scheme_light};
         let presentation = self.resolved_trail_presentation();
         let (fg, bg, dark_theme) = (
@@ -379,8 +405,9 @@ impl CursorPreviewSpec {
         );
         cfg.light = crate::cursor_glow::Light::admitted(
             scheme_light(bg) && raw_light(fg, bg, dark_theme),
-            aterm_effects::rainbow_kitty::prism_glass::LIVE,
-        );
+            live,
+        )
+        .on_page(clear);
         cfg
     }
 
@@ -4222,6 +4249,7 @@ fn scene_pet_frame(
         facing_left: false,
         scale_x: fit,
         scale_y: fit,
+        stretch_from: aterm_effects::kitty_pet::StretchFrom::Centre,
         purr: 0.0,
         contented: false,
         under_ink: false,
@@ -4550,6 +4578,10 @@ pub(crate) struct CursorScene {
     controls: SceneControls,
     /// The whole rows the card shows (`None`: every row of the grid).
     card_rows: Option<usize>,
+    /// The card's page is clear (§15.2 1.7's page law, [`aterm_effects::host::PageFacts::clear`]
+    /// as a window reads its own): the card draws no translucency, so it is clear unless a
+    /// wallpaper lies under it; only a clear page's light draws the glass.
+    page_clear: bool,
     /// Total over every field above but the phase.
     script_key: u64,
     /// Total over every field above, for the raster frame memo.
@@ -4683,6 +4715,11 @@ impl CursorScene {
             #[cfg(test)]
             controls,
             card_rows,
+            page_clear: aterm_effects::host::PageFacts {
+                opaque: true,
+                wallpaper: spec.wallpaper.is_some(),
+            }
+            .clear(),
             script_key: script.finish(),
             fingerprint: hash.finish() | 1,
         }
@@ -4993,9 +5030,9 @@ impl CursorScene {
             ((0, 0), stage.geom.cols),
             now,
         );
-        let mut glow = self
-            .cursor
-            .glow_config(self.theme, head_dx_for(stage.cursor_style));
+        let mut glow =
+            self.cursor
+                .glow_config(self.theme, head_dx_for(stage.cursor_style), self.page_clear);
         let presentation = self.cursor.resolved_trail_presentation();
         let mut comet = TrailConfig {
             enabled: self.cursor.trail_enabled && presentation.comet,
@@ -8363,8 +8400,8 @@ mod tests {
         let underline = rainbow_cursor("rainbow kitty underline");
         let tall = rainbow_cursor("rainbow kitty tall");
 
-        assert!(!underline.glow_config(theme, 0.5).ribbon_tall);
-        assert!(tall.glow_config(theme, 0.5).ribbon_tall);
+        assert!(!underline.glow_config(theme, 0.5, true).ribbon_tall);
+        assert!(tall.glow_config(theme, 0.5, true).ribbon_tall);
         assert_eq!(
             underline.effective_trail_style_raw(),
             "rainbow kitty underline"
@@ -8419,7 +8456,7 @@ mod tests {
             });
             assert!(aterm_render::theme_is_dark(theme.bg), "{ground} is dark");
             for raw in RAINBOW_LOOKS {
-                let cfg = rainbow_cursor(raw).glow_config(theme, 0.5);
+                let cfg = rainbow_cursor(raw).glow_config(theme, 0.5, true);
                 let broke = preview_breaks(&cfg, (theme.fg, theme.bg));
                 assert!(broke.is_empty(), "{ground}, {raw}: {broke:?}");
                 drawn += 1;
@@ -8455,7 +8492,7 @@ mod tests {
                 continue;
             }
             for raw in RAINBOW_LOOKS {
-                let cfg = rainbow_cursor(raw).glow_config(theme, 0.5);
+                let cfg = rainbow_cursor(raw).glow_config(theme, 0.5, true);
                 assert_eq!(cfg.light, Light::at(LIVE), "{name}, {raw}");
                 assert_eq!(
                     preview_breaks(&cfg, (theme.fg, theme.bg)),
@@ -8476,9 +8513,55 @@ mod tests {
             ..paper
         };
         assert_eq!(
-            rainbow_cursor("rainbow kitty").glow_config(pale, 0.5).light,
+            rainbow_cursor("rainbow kitty")
+                .glow_config(pale, 0.5, true)
+                .light,
             Light::OFF,
             "ink under 3:1 on a light page"
+        );
+    }
+
+    /// The preview keeps the window's page law (§15.2 1.7, `host::PageFacts::clear`): at the
+    /// glass level the Cursor card over a wallpaper lights a sheer light, so its bed draws
+    /// main's paper table, where the same card with no wallpaper draws the glass (the negative
+    /// control); each scene reads its page off its spec's wallpaper.
+    #[cfg(unix)]
+    #[test]
+    fn the_preview_s_glass_keeps_the_page_law() {
+        use aterm_effects::cursor_glow::Live;
+        use aterm_effects::rainbow_kitty::{self as rk, ribbon::BedInkLut};
+
+        let paper = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("Default Light").expect("built-in light theme"),
+        )
+        .into_theme();
+        let cursor = rainbow_cursor("rainbow kitty");
+        let bed = |clear: bool| {
+            let cfg = cursor.glow_config_at(paper, 0.5, clear, Live::Glass);
+            let lut = BedInkLut::synced(&rk::Config::from_glow(&cfg, false));
+            (cfg.light, lut.glass_lit())
+        };
+        let (light, glass) = bed(true);
+        assert!(
+            light.glass() && glass,
+            "control: a clear card draws the glass: {light:?}"
+        );
+        let (light, glass) = bed(false);
+        assert!(
+            light.on() && light.sheer() && !light.glass() && !glass,
+            "a card over a wallpaper draws main's paper table: {light:?}"
+        );
+        let page_clear = |wallpaper| {
+            let spec = SettingsPreviewSpec {
+                wallpaper,
+                ..SettingsPreviewSpec::cursor(cursor.clone())
+            };
+            CursorScene::new(&spec, paper, None).page_clear
+        };
+        assert!(page_clear(None), "no wallpaper: a clear page");
+        assert!(
+            !page_clear(Some(solid_wallpaper([200, 30, 30], 0.0, false))),
+            "a wallpaper under the card"
         );
     }
 
@@ -8794,6 +8877,74 @@ mod tests {
         assert!(
             !control.is_empty(),
             "negative control: the pet at the station beside the caret lies on the letters"
+        );
+    }
+
+    /// review9's finding 10, the preview's half: THE COMPANION KEEPS OFF A LETTERED ROW ABOVE
+    /// THE PROMPT ([`scene_pet_seat`]) when the row above is written across, so no seat along
+    /// the prompt's row clears it (descenders, `gjpqy`, and a sentence): the resident cat's and
+    /// dog's drawn texels lie on no lettered cell and not on the caret's at any phase of the
+    /// scene. Negative control (`pet_seat_law` off): stood at the station beside the caret, its
+    /// head lies on the row above's letters.
+    #[test]
+    fn the_preview_companion_keeps_off_a_row_above_written_across() {
+        let cell = (8, 17);
+        let on_letters = |seat_law: bool| {
+            SCENE_CONTROLS.with(|controls| {
+                controls.set(SceneControls {
+                    pet_seat_law: seat_law,
+                    ..controls.get()
+                });
+            });
+            let mut on = Vec::new();
+            for raw in ["rainbow kitty pet", "rainbow dog pet"] {
+                for above in ["gjpqy ", "the quick brown fox jumps over the lazy dog "] {
+                    for phase in [0_u64, 300, 700, 1_100, 1_500, 1_900, 2_300] {
+                        let spec = SettingsPreviewSpec::cursor(rainbow_cursor(raw))
+                            .with_phase(phase)
+                            .normalized();
+                        let (base, _) = build_terminal_specimen_input(&spec, Theme::default());
+                        let mut base = RenderInput::clone(&base);
+                        let row = CursorScene::new(&spec, Theme::default(), None)
+                            .decorate(&base, cell)
+                            .cursor_row;
+                        assert!(row >= 1, "{raw}: the prompt has a row above it");
+                        let letters: Vec<char> = above.chars().collect();
+                        for (i, c) in base.cells[row - 1].iter_mut().enumerate() {
+                            c.ch = letters[i % letters.len()];
+                        }
+                        let input =
+                            CursorScene::new(&spec, Theme::default(), None).decorate(&base, cell);
+                        let pet = sprites(&input)
+                            .into_iter()
+                            .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                            .unwrap_or_else(|| panic!("{raw} at {phase} ms draws its companion"));
+                        let caret = (input.cursor_row, input.cursor_col);
+                        let lettered: Vec<(usize, usize)> = inked_cells(&pet, cell)
+                            .into_iter()
+                            .filter(|&(r, c)| {
+                                (r, c) == caret
+                                    || input
+                                        .cells
+                                        .get(r)
+                                        .and_then(|cells| cells.get(c))
+                                        .is_some_and(|cell| !matches!(cell.ch, ' ' | '\0'))
+                            })
+                            .collect();
+                        if !lettered.is_empty() {
+                            on.push(format!("{raw} under {above:?} at {phase} ms: {lettered:?}"));
+                        }
+                    }
+                }
+            }
+            on
+        };
+        let control = on_letters(false);
+        let law = on_letters(true);
+        assert!(law.is_empty(), "{law:#?}");
+        assert!(
+            !control.is_empty(),
+            "negative control: stood at the station, the pet never met the row above's letters"
         );
     }
 

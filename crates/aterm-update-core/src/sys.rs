@@ -67,7 +67,7 @@ impl FileLock {
     #[cfg(unix)]
     pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
         let file: std::fs::File = Self::open_lock_file(path)?;
-        let deadline = std::time::Instant::now() + limit;
+        let deadline = std::time::Instant::now().checked_add(limit);
         loop {
             #[expect(
                 clippy::disallowed_methods,
@@ -77,7 +77,7 @@ impl FileLock {
             match taken {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
@@ -101,7 +101,7 @@ impl FileLock {
         use std::os::windows::fs::OpenOptionsExt;
         const ERROR_SHARING_VIOLATION: i32 = 32;
         const ERROR_LOCK_VIOLATION: i32 = 33;
-        let deadline = std::time::Instant::now() + limit;
+        let deadline = std::time::Instant::now().checked_add(limit);
         loop {
             match std::fs::OpenOptions::new()
                 .create(true)
@@ -119,7 +119,7 @@ impl FileLock {
                     ) {
                         return Err(e);
                     }
-                    if std::time::Instant::now() >= deadline {
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
@@ -275,6 +275,12 @@ mod tests {
             !same_volume(&a, Path::new("/no/such/path-aterm-xyz")),
             "a missing path is not same-volume (fail closed)"
         );
+        let free_lock = d.join(format!("aterm-sv-max-lock-{}", std::process::id()));
+        drop(
+            FileLock::acquire_within(&free_lock, std::time::Duration::MAX)
+                .expect("Duration::MAX must not overflow Instant::now() + limit"),
+        );
+        let _ = std::fs::remove_file(&free_lock);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

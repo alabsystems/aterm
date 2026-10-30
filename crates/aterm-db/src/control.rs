@@ -1080,6 +1080,32 @@ pub(super) fn check_log_witness(
     if !log.has_historical_seat(binding)
         || log.membership().removal(&binding.actor()).is_some()
         || log.recipient_is_removed(&binding.recipient())
+        || log.audience_left_out(
+            &aterm_secrets::membership_log::EpochAudience::Commons,
+            &binding.actor(),
+        )
+        || log.audience_left_out(
+            &aterm_secrets::membership_log::EpochAudience::Everyone,
+            &binding.actor(),
+        )
+        || log.audience_left_out_recipient(
+            &aterm_secrets::membership_log::EpochAudience::Commons,
+            &binding.recipient(),
+        )
+        || log.audience_left_out_recipient(
+            &aterm_secrets::membership_log::EpochAudience::Everyone,
+            &binding.recipient(),
+        )
+        || log.membership().members().iter().any(|(m_actor, m)| {
+            (*m_actor == binding.actor() || m.binding.recipient() == binding.recipient())
+                && m.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            log.membership().nodes().get(&nk),
+                            Some(aterm_secrets::membership_log::NodeStanding::Removed(_))
+                        )
+                })
+        })
     {
         return Err(Error::new("Commons peer lacks historical log approval"));
     }
@@ -1108,18 +1134,81 @@ fn verify_peer_against_local_log(
     let Some(paths) = paths else {
         return Ok(());
     };
+    let recipient = peer_req.binding().recipient();
+    let recipient_bech32 = recipient.to_bech32();
+    let roster = aterm_secrets::client::swarm_roster(paths)
+        .ok()
+        .flatten()
+        .map(|mut r| {
+            if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes(paths) {
+                r.deny_nodes.extend(denied);
+                r.canonicalize();
+            }
+            r
+        });
+    if let Some(ref roster) = roster {
+        let denied_in_roster = roster
+            .members
+            .iter()
+            .filter(|m| m.recipient.trim() == recipient_bech32)
+            .any(|m| {
+                roster.is_label_denied(&m.label)
+                    || m.aliases.iter().any(|a| roster.is_label_denied(a))
+                    || m.node_id
+                        .as_deref()
+                        .is_some_and(|n| roster.is_node_denied(n))
+                    || m.node_key
+                        .as_deref()
+                        .is_some_and(|k| roster.is_node_denied(k))
+            });
+        if denied_in_roster {
+            return Err(Error::new(
+                "Commons peer was removed from the membership log",
+            ));
+        }
+    }
     let Ok(Some((local_log, _))) = aterm_secrets::client::trusted_commons_log(paths, trust) else {
         return Ok(());
     };
-    let recipient = peer_req.binding().recipient();
     let denied_by = |log: &aterm_secrets::membership_log::Log| {
-        use aterm_secrets::membership_log::EpochAudience;
-        log.membership().removal(&actor).is_some()
+        use aterm_secrets::membership_log::{EpochAudience, NodeStanding};
+        let log_roster = aterm_secrets::client::local_swarm_roster_for_log(paths, log)
+            .or_else(|| roster.clone());
+        let membership = log.membership();
+        membership.removal(&actor).is_some()
             || log.recipient_is_removed(&recipient)
-            || log.membership().members().iter().any(|(m_actor, m)| {
+            || log.audience_left_out_recipient(&EpochAudience::Commons, &recipient)
+            || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+            || log_roster.as_ref().is_some_and(|r| {
+                r.members
+                    .iter()
+                    .filter(|m| m.recipient.trim() == recipient_bech32)
+                    .any(|m| {
+                        r.is_label_denied(&m.label)
+                            || m.aliases.iter().any(|a| r.is_label_denied(a))
+                            || m.node_id.as_deref().is_some_and(|n| r.is_node_denied(n))
+                            || m.node_key.as_deref().is_some_and(|k| r.is_node_denied(k))
+                    })
+            })
+            || membership.members().iter().any(|(m_actor, m)| {
                 (*m_actor == actor || m.binding.recipient() == recipient)
                     && (log.audience_left_out(&EpochAudience::Commons, m_actor)
-                        || log.audience_left_out(&EpochAudience::Everyone, m_actor))
+                        || log.audience_left_out(&EpochAudience::Everyone, m_actor)
+                        || m.node_key.is_some_and(|nk| {
+                            nk != [0; 32]
+                                && matches!(
+                                    membership.nodes().get(&nk),
+                                    Some(NodeStanding::Removed(_))
+                                )
+                        })
+                        || log_roster.as_ref().is_some_and(|r| {
+                            r.is_label_denied(&m.label)
+                                || r.is_label_denied(&m.name)
+                                || m.node_key.is_some_and(|nk| {
+                                    nk != [0; 32]
+                                        && r.is_node_denied(&aterm_codec::hex::encode_lower(&nk))
+                                })
+                        }))
             })
     };
     if denied_by(&local_log) {

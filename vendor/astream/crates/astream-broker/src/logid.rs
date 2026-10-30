@@ -1052,6 +1052,47 @@ pub(crate) fn adopt(dir: &Dir, sidecar: &Sidecar, leader: LogIdentity) -> io::Re
     write(dir, &adopted).map(|()| adopted)
 }
 
+/// Promote a replica sidecar to cluster leader: advances `identity.generation`
+/// monotonically past `min_cluster_epoch` (when sharing `sidecar.identity.id`),
+/// records a [`Lineage`] step `(next_gen, sidecar.head)` when `sidecar.head > 0`
+/// and `next_gen == sidecar.identity.generation + 1`, and writes `<log>.id` durably.
+pub(crate) fn promote(
+    dir: &Dir,
+    sidecar: &Sidecar,
+    min_cluster_epoch: Option<LogIdentity>,
+) -> io::Result<Sidecar> {
+    let base_gen = match min_cluster_epoch {
+        Some(ep) if ep.id == sidecar.identity.id => {
+            crate::failover::failover_epoch_advance(sidecar.identity.generation, ep.generation)
+        }
+        _ => sidecar.identity.generation,
+    };
+    let next_gen = crate::failover::failover_epoch_advance(base_gen, base_gen.saturating_add(1));
+    let lineage =
+        if sidecar.head > 0 && sidecar.identity.generation.checked_add(1) == Some(next_gen) {
+            step(&sidecar.lineage, next_gen, sidecar.head)
+        } else {
+            Lineage::default()
+        };
+    let promoted = Sidecar {
+        identity: LogIdentity {
+            id: sidecar.identity.id,
+            generation: next_gen,
+        },
+        base: sidecar.base,
+        head: sidecar.head,
+        newest: sidecar.newest,
+        format: FORMAT,
+        state: sidecar.state,
+        served: sidecar.served,
+        boot: sidecar.boot,
+        boot_volume: sidecar.boot_volume,
+        floor: sidecar.floor,
+        lineage,
+    };
+    write(dir, &promoted).map(|()| promoted)
+}
+
 const fn frame_header_len(header: &[u8; HEADER_SIZE]) -> usize {
     ((header[4] as u32)
         | ((header[5] as u32) << 8)

@@ -43,7 +43,9 @@ fn capture_for(
     caps: crate::seamless::WireCaps,
 ) -> Result<Vec<u64>, CaptureFailure> {
     let live = app.handoff_live_sessions();
-    let window = std::time::Duration::from_secs(30);
+    let window = crate::app_update_handoff::park_budget_for_test::deadline_budget(
+        std::time::Duration::from_secs(30),
+    );
     app.capture_parked_screens(
         &live,
         std::time::Instant::now() + window,
@@ -570,7 +572,9 @@ fn a_repaint_rung_session_still_carries_its_foreground_holder() {
         .store(4242, std::sync::atomic::Ordering::Release);
 
     let live = app.handoff_live_sessions();
-    let window = std::time::Duration::from_secs(30);
+    let window = crate::app_update_handoff::park_budget_for_test::deadline_budget(
+        std::time::Duration::from_secs(30),
+    );
     let parked = app
         .capture_parked_screens(
             &live,
@@ -649,7 +653,9 @@ fn a_journal_key_rides_the_record_it_names_and_no_other() {
 /// `stamp_render_debts` records `render_debt` only for alternate-screen sessions with non-zero debt carried under `CarryCeiling::Full`.
 #[test]
 fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() {
-    let window = std::time::Duration::from_secs(30);
+    let window = crate::app_update_handoff::park_budget_for_test::deadline_budget(
+        std::time::Duration::from_secs(30),
+    );
     let capture = |app: &mut crate::App, ceiling| {
         let live = app.handoff_live_sessions();
         let parked = app
@@ -785,7 +791,9 @@ fn the_park_hands_its_logs_to_the_export_and_a_stand_down_lifts_the_fence() {
     };
     let fenced = written(5);
     let live = app.handoff_live_sessions();
-    let window = std::time::Duration::from_secs(30);
+    let window = crate::app_update_handoff::park_budget_for_test::deadline_budget(
+        std::time::Duration::from_secs(30),
+    );
     let parked = app
         .capture_parked_screens(
             &live,

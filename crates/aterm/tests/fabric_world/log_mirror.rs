@@ -292,6 +292,11 @@ fn fabric_brief_folds_what_the_bus_holds() {
     let mut cmd = aterm_uds::spawnfd::command(super::harness::aterm_to_launch());
     cmd.args(["link", "fabric", "brief", &format!("@{a}")])
         .env("ATERM_FABRIC_COMMAND", &fabric)
+        // The bus it reads serves: a loaded machine's late answer is waited for, not its 3 s.
+        .env(
+            super::harness::FABRIC_IO_WAIT.0,
+            super::harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
+        )
         .env("HOME", w.tmp.join("home"))
         .env("XDG_CONFIG_HOME", w.tmp.join("cfg"))
         .env("XDG_RUNTIME_DIR", w.tmp.join("run"))

@@ -881,12 +881,12 @@ fn approved(admin: &Paths) -> Vec<String> {
     approved
 }
 
-/// An open vault (`open = yes`) lets no machine in by itself: not one that asks with no
+/// A personal open vault (`open = yes`) lets no machine in by itself: not one that asks with no
 /// password, nor one that proves an old one. Only a request carrying a member's Allow is
 /// admitted, recorded as a person's decision, and once the vault lets that machine go, its
 /// Allow, still queued, cannot bring it back (docs/DESIGN-fluid-swarm-2026-10-28.md F10).
 #[test]
-fn a_request_with_no_allow_is_never_admitted() {
+fn a_personal_vault_request_with_no_allow_is_never_admitted() {
     let lab = Lab::changing("open");
     let admin = lab.home("ma");
     let token = synthetic("gh");
@@ -961,6 +961,93 @@ fn a_request_with_no_allow_is_never_admitted() {
         client::sync(&machine, None).expect("sync"),
         SyncOutcome::NotIn
     ));
+}
+
+/// A first-time LAN join needs no member's Allow, password or interaction under the
+/// default ALab policy. It gains the same authenticated secrets and Commons writer
+/// enrollment as an explicitly admitted member, and a later revoke still keeps it out.
+#[test]
+fn the_default_alab_lan_policy_admits_a_new_machine_and_converges_commons() {
+    use aterm_secrets::commons::binding::Pending;
+    use aterm_secrets::commons::roster::Role;
+
+    let lab = Lab::changing("alab");
+    let admin = lab.home("m1");
+    let token = synthetic("gh");
+    write_private(&admin.home.join(".secrets/gh_access_token"), &token);
+    let created = client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("m1"),
+    )
+    .unwrap();
+    let machine = lab.home("m2");
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    assert!(matches!(
+        join_unattended(&machine, &pinned, "m2").unwrap(),
+        JoinOutcome::Pending { .. }
+    ));
+    let requests = client::requests(&admin, None).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].lan && requests[0].allowed.is_none() && requests[0].proof.is_none());
+    // The fixture's key is not the compiled ALab key, even though its vault is named alab.
+    assert!(client::auto_approve(&admin).unwrap().approved.is_empty());
+    let done = client::test_auto_approve_alab_lan(&admin).unwrap();
+    assert_eq!(done.approved, ["m2"]);
+    assert!(done.allowed.is_empty() && done.asking.is_empty());
+    assert_eq!(
+        client::admin_cached(&admin)
+            .unwrap()
+            .commons_admission("m2")
+            .unwrap()
+            .method,
+        client::AdmissionMethod::Open
+    );
+    applied(client::sync(&machine, None).unwrap());
+    assert_eq!(
+        read(&machine, "gh_access_token").as_deref(),
+        Some(token.as_str())
+    );
+    assert!(matches!(
+        client::status(&machine).unwrap().membership,
+        Membership::In { .. }
+    ));
+
+    let owner = Bootstrap::required(&admin).unwrap();
+    let peer = Bootstrap::required(&machine).unwrap();
+    assert_eq!(owner.trust(), peer.trust());
+    let request = peer.request().unwrap();
+    let (mut pending, challenge) =
+        Pending::issue(&request, owner.trust().network, owner.trust().authority).unwrap();
+    let answer = peer.device().answer(&request, &challenge).unwrap();
+    let possession = pending.verify(&answer).unwrap();
+    let mut owner_journal = Journal::open_existing(owner.journal_dir(), owner.trust()).unwrap();
+    let node = client::admin_cached(&admin)
+        .unwrap()
+        .enroll_commons_member(&owner, &mut owner_journal, possession)
+        .unwrap();
+    let mut peer_journal = Journal::open_existing(peer.journal_dir(), peer.trust()).unwrap();
+    peer_journal.ingest(node.bytes()).unwrap();
+    let access = peer
+        .access_in(&peer_journal)
+        .unwrap()
+        .expect("new member is a Commons writer");
+    assert_eq!(access.local().role(), Role::Writer);
+    assert_eq!(access.local().binding(), request.binding());
+    drop(access);
+    drop(peer_journal);
+    drop(owner_journal);
+
+    let open = client::admin_open(&admin).unwrap();
+    client::admin_revoke(&admin, &open, "m2", false).unwrap();
+    assert!(
+        client::test_auto_approve_alab_lan(&admin)
+            .unwrap()
+            .approved
+            .is_empty()
+    );
+    assert_eq!(client::sync(&machine, None).unwrap(), SyncOutcome::NotIn);
 }
 
 /// What `paths` holds of Commons control: its state (one head, or a conflict of several) and
@@ -1095,6 +1182,7 @@ fn an_allowed_signed_by_a_key_no_roster_member_binds_is_refused() {
             host: "mb".into(),
             code: client::join_code(&recipient),
             time: None,
+            lan: false,
             allowed: Some(allowed.to_text()),
             proof: None,
         }

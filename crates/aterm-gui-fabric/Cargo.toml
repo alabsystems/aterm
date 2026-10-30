@@ -34,13 +34,17 @@ aterm-types = { workspace = true }
 # The seamless carry rides the update's TOML manifest
 # (`#[derive(Serialize, Deserialize)]`, so the row asks for the derive).
 serde = { workspace = true, features = ["derive"] }
+aterm-toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+aterm-uds = { workspace = true }
 
 [dev-dependencies]
 # The hang detector, the environment refusal, and the link's bind to its
 # derived model.
 aterm-spec = { workspace = true }
 # The carry's TOML round trips.
-aterm-toml = { workspace = true }
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

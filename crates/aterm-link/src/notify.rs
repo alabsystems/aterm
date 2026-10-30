@@ -2982,7 +2982,7 @@ mod tests {
             window_ms: 60_000,
             since: Since::Head,
             once: true,
-            exec_timeout: DEFAULT_EXEC_TIMEOUT,
+            exec_timeout: aterm_spec::wait::MUST_HAPPEN,
         }
     }
 

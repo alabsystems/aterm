@@ -9,6 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "build_cache_package.rs"]
+pub mod package;
+
 /// The internal front-door call a managed compiler shim makes before it execs Cargo.
 pub const REGISTER_VERB: &str = "__build_cache_register";
 
@@ -40,6 +43,10 @@ struct Receipt {
     owners_unknown: bool,
     #[serde(default)]
     pending: Option<Pending>,
+    /// Explicitly disposable package targets use schema2 so old reclaimers cannot silently
+    /// discard their coordinator/producer contract while rewriting a schema1 receipt.
+    #[serde(default)]
+    package: Option<package::Policy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -190,7 +197,8 @@ fn key(path: &Path) -> Option<String> {
 fn read(path: &Path) -> Option<Receipt> {
     let bytes = crate::metadata_io::read_bounded_regular(path, MAX_RECORD).ok()?;
     let receipt: Receipt = aterm_json::from_slice(&bytes).ok()?;
-    (receipt.schema == 1
+    (((receipt.schema == 1 && receipt.package.is_none())
+        || (receipt.schema == 2 && receipt.package.as_ref().is_some_and(package::Policy::valid)))
         && receipt.owners.len() <= MAX_OWNERS
         && receipt.nonce.len() == 32
         && receipt.nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -209,6 +217,8 @@ fn same(home: &Path, receipt: &Receipt) -> bool {
             marker.root == receipt.root
                 && marker.identity == receipt.identity
                 && marker.nonce == receipt.nonce
+                && marker.schema == receipt.schema
+                && package::same_declaration(marker.package.as_ref(), receipt.package.as_ref())
         })
 }
 
@@ -313,6 +323,10 @@ fn already_recorded(home: &Path, root: &Path, workspace: &Path) -> bool {
             && receipt.pending.is_none()
             && same(home, &receipt)
             && (receipt.owners_unknown || receipt.owners.iter().any(|owner| owner == workspace))
+            && receipt
+                .package
+                .as_ref()
+                .is_none_or(|policy| package::producer_allows(home, policy, workspace))
     })
 }
 
@@ -324,8 +338,19 @@ fn already_recorded(home: &Path, root: &Path, workspace: &Path) -> bool {
 /// The registration gate was busy or an admitted cache's owner could not be published.
 #[cfg(unix)]
 pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Result<bool> {
+    create_with_policy(home, root, workspace, None).map(|(recorded, _)| recorded)
+}
+
+#[cfg(unix)]
+fn create_with_policy(
+    home: &Path,
+    root: &Path,
+    workspace: &Path,
+    policy: Option<package::Policy>,
+) -> std::io::Result<(bool, bool)> {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let mut must_record = false;
+    let mut created = false;
     let mut attempt = || -> Option<()> {
         if !scope(home, root) || !scope(home, workspace) {
             return None;
@@ -392,6 +417,9 @@ pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Re
             && before.pending.is_some()
         {
             must_record = true;
+            if before.package.is_some() {
+                return None;
+            }
             pending_copy(&index, &key, &before)?;
             must_record = declared;
         }
@@ -401,14 +429,16 @@ pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Re
         let mut receipt = match std::fs::DirBuilder::new().mode(0o700).create(root) {
             Ok(()) => {
                 must_record = true;
+                created = true;
                 let receipt = Receipt {
-                    schema: 1,
+                    schema: if policy.is_some() { 2 } else { 1 },
                     root: root.to_path_buf(),
                     identity: identity(root)?,
                     nonce: aterm_uds::rand::hex_token::<16>().ok()?,
                     owners: Vec::new(),
                     owners_unknown: false,
                     pending: None,
+                    package: policy.clone(),
                 };
                 write(&root.join(MARKER), &receipt)?;
                 receipt
@@ -419,6 +449,14 @@ pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Re
                     return None;
                 }
                 must_record = true;
+                if policy.is_none()
+                    && receipt
+                        .package
+                        .as_ref()
+                        .is_some_and(|policy| !package::producer_allows(home, policy, workspace))
+                {
+                    return None;
+                }
                 if receipt.pending.take().is_some() {
                     write(&path, &receipt)?;
                 }
@@ -438,13 +476,13 @@ pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Re
         write(&path, &receipt)
     };
     if attempt().is_some() {
-        Ok(true)
+        Ok((true, created))
     } else if must_record {
         Err(std::io::Error::other(
             "the managed build cache's owner could not be recorded",
         ))
     } else {
-        Ok(false)
+        Ok((false, false))
     }
 }
 
@@ -488,10 +526,11 @@ pub fn roots(home: &Path) -> Vec<Registered> {
 #[cfg(unix)]
 fn settle(path: &Path, receipt: &mut Receipt) {
     let still_root = identity(&receipt.root).as_ref() == Some(&receipt.identity);
-    if !still_root
-        || path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().ends_with(".retired.json"))
+    if receipt.package.is_none()
+        && (!still_root
+            || path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".retired.json")))
     {
         let _ = std::fs::remove_file(path);
     } else {
@@ -502,7 +541,8 @@ fn settle(path: &Path, receipt: &mut Receipt) {
 
 fn pending_owned(home: &Path, receipt: &Receipt, pending: &Pending) -> bool {
     let payload = pending.directory.join("cache.noindex");
-    scope(home, &pending.directory)
+    package::payload_safe(receipt, pending)
+        && scope(home, &pending.directory)
         && std::fs::canonicalize(&pending.directory).ok().as_ref() == Some(&pending.directory)
         && identity(&pending.directory).as_ref() == Some(&pending.identity)
         && (pending.authorized
@@ -672,16 +712,51 @@ fn suppress_configured(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Only a recognized builtin query can skip owner observation. In particular, a query name
+/// used as an option value, an external alias or the lint's arguments is not a query command.
+fn query_command(args: &[String], tool: super::Tool) -> bool {
+    if tool == super::Tool::Tippy {
+        return false;
+    }
+    let mut words = args.iter().map(String::as_str).peekable();
+    if tool == super::Tool::Cargo && words.peek().is_some_and(|word| word.starts_with('+')) {
+        let _ = words.next();
+    }
+    while let Some(word) = words.next() {
+        match word {
+            "--" => return false,
+            "--config" | "--color" | "--manifest-path" | "--target-dir" | "--explain" | "-Z"
+            | "-C" => {
+                if words.next().is_none() {
+                    return false;
+                }
+            }
+            "--unverified" | "--locked" | "--offline" | "--frozen" | "--verbose" | "-v" | "-vv"
+            | "--quiet" | "-q" => {}
+            _ if word.starts_with("--config=")
+                || word.starts_with("--color=")
+                || word.starts_with("--manifest-path=")
+                || word.starts_with("--target-dir=")
+                || word.starts_with("--explain=")
+                || word.starts_with("-Z")
+                || word.starts_with("-C") => {}
+            _ => return word == "help" || crate::reroute::LANE_FREE_QUERIES.contains(&word),
+        }
+    }
+    false
+}
+
 fn observe_on(
     args: &[String],
     tool: super::Tool,
     home: &Path,
     machine: &super::Machine<'_>,
 ) -> std::io::Result<bool> {
-    if args
-        .iter()
-        .take_while(|word| word.as_str() != "--")
-        .any(|word| matches!(word.as_str(), "-h" | "--help" | "-V" | "--version"))
+    if query_command(args, tool)
+        || args
+            .iter()
+            .take_while(|word| word.as_str() != "--")
+            .any(|word| matches!(word.as_str(), "-h" | "--help" | "-V" | "--version"))
     {
         return Ok(false);
     }
@@ -890,6 +965,12 @@ fn recover_unstarted(
 pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
     let mut planned = Vec::new();
     for cache in roots(home) {
+        let Some(preliminary) = read(&cache.receipt_path) else {
+            continue;
+        };
+        let Ok(coordination) = package::coordinate(home, &preliminary) else {
+            continue;
+        };
         let Some(lock_path) = gate_path(&cache.receipt_path) else {
             continue;
         };
@@ -902,6 +983,12 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
         let Some(receipt) = read(&cache.receipt_path) else {
             continue;
         };
+        if coordination
+            .as_ref()
+            .is_some_and(|guard| !guard.current(home, &receipt))
+        {
+            continue;
+        }
         if let Some(pending) = &receipt.pending {
             if pending_owned(home, &receipt, pending) {
                 planned.push(super::Planned {
@@ -936,6 +1023,17 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
                 }),
         );
         let held = super::hold(&seen.locks).is_none();
+        if let Some(coordinator) = coordination {
+            if let Some(why) = coordinator.reason(home, &receipt) {
+                planned.push(super::Planned {
+                    path: cache.root.clone(),
+                    paths: vec![cache.root],
+                    why,
+                    held,
+                });
+            }
+            continue;
+        }
         let idle = super::age(now, seen.newest);
         if idle >= super::RECLAIM_GONE && owners_gone(home, &receipt, None) {
             // An unheld whole-root retirement already contains these stages.
@@ -1014,8 +1112,38 @@ pub(super) fn reclaim_on(
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
 ) -> Vec<(PathBuf, super::Unused)> {
+    reclaim_selected_on(home, now, gone_after, placing, record, fence, None)
+}
+
+#[cfg(unix)]
+fn reclaim_selected_on(
+    home: &Path,
+    now: std::time::SystemTime,
+    gone_after: std::time::Duration,
+    placing: Option<&super::checkout::Placing>,
+    record: &mut dyn FnMut(&Path, super::Unused) -> bool,
+    fence: &super::fence::Fence<'_>,
+    policy_context: Option<package::Context<'_>>,
+) -> Vec<(PathBuf, super::Unused)> {
+    let selected_cache = policy_context.as_ref().and_then(|context| context.cache);
+    let kernel = policy_context
+        .as_ref()
+        .map_or(&package::Live as &dyn package::Kernel, |context| {
+            context.kernel
+        });
     let mut removed = Vec::new();
     for cache in roots(home) {
+        let Some(preliminary) = read(&cache.receipt_path) else {
+            continue;
+        };
+        if selected_cache.is_some_and(|selected| !package::belongs(&preliminary, selected)) {
+            continue;
+        }
+        // Take a package's whole-build coordinator BEFORE its receipt gate, including the
+        // resume path. Keep it alive until the last staged entry and receipt are settled.
+        let Ok(coordination) = package::coordinate(home, &preliminary) else {
+            continue;
+        };
         let Some(lock_path) = gate_path(&cache.receipt_path) else {
             continue;
         };
@@ -1031,12 +1159,59 @@ pub(super) fn reclaim_on(
         if receipt.root != cache.root || !scope(home, &receipt.root) {
             continue;
         }
+        if let Some(coordinator) = &coordination
+            && (!coordinator.recover_on(home, &cache.receipt_path, &mut receipt, fence, kernel)
+                || !coordinator.current(home, &receipt))
+        {
+            continue;
+        }
         if let Some(mut pending) = receipt.pending.clone() {
+            // The remover may have finished before the final receipt write reached disk.
+            // A policy's coordinator still excludes another generation: only two genuinely
+            // absent names and unchanged authorization permit this metadata-only settlement.
+            let absent = |path: &Path| {
+                std::fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            };
+            if let Some(coordinator) = &coordination
+                && pending.authorized
+                && scope(home, &pending.directory)
+                && absent(&receipt.root)
+                && absent(&pending.directory)
+                && fence.clear(&receipt.root, &pending.directory)
+                && read(&cache.receipt_path).as_ref() == Some(&receipt)
+                && coordinator.current(home, &receipt)
+                && absent(&receipt.root)
+                && absent(&pending.directory)
+            {
+                settle(&cache.receipt_path, &mut receipt);
+                continue;
+            }
             if !pending_owned(home, &receipt, &pending) {
                 let _ = recover_unstarted(home, &cache.receipt_path, &mut receipt, fence);
                 continue;
             }
+            let pending_locks = if coordination.is_some() {
+                let payload = pending.directory.join("cache.noindex");
+                match std::fs::symlink_metadata(&payload) {
+                    Ok(_) => match super::locks_under(&payload) {
+                        Ok(locks) => locks,
+                        Err(_) => continue,
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(_) => continue,
+                }
+            } else {
+                Vec::new()
+            };
+            let Some(_held_pending) = super::hold(&pending_locks) else {
+                continue;
+            };
             if fence.clear(&cache.root, &pending.directory)
+                && read(&cache.receipt_path).as_ref() == Some(&receipt)
+                && coordination
+                    .as_ref()
+                    .is_none_or(|guard| guard.current(home, &receipt))
                 && record(&pending.directory, super::Unused::Unfinished)
             {
                 pending.authorized = true;
@@ -1044,7 +1219,13 @@ pub(super) fn reclaim_on(
                 if write(&cache.receipt_path, &receipt).is_none() {
                     continue;
                 }
-                if !fence.clear(&cache.root, &pending.directory) {
+                if !fence.clear(&cache.root, &pending.directory)
+                    || read(&cache.receipt_path).as_ref() != Some(&receipt)
+                    || !pending_owned(home, &receipt, &pending)
+                    || coordination
+                        .as_ref()
+                        .is_some_and(|guard| !guard.current(home, &receipt))
+                {
                     continue;
                 }
                 let left = super::remove::tree(&pending.directory);
@@ -1076,17 +1257,28 @@ pub(super) fn reclaim_on(
             continue;
         }
         let gone = owners_gone(home, &receipt, placing);
-        let whole = gone.then(|| {
-            super::unused(&cache.root, &|seen| {
-                let idle = super::age(now, seen.newest);
-                (idle >= gone_after).then_some(super::Unused::Gone {
-                    idle,
-                    after: gone_after,
+        let budget = coordination
+            .as_ref()
+            .and_then(|guard| guard.reason_on(home, &receipt, kernel));
+        let whole = budget
+            .map(|why| super::unused(&cache.root, &|_| Some(why)))
+            .or_else(|| {
+                gone.then(|| {
+                    super::unused(&cache.root, &|seen| {
+                        let idle = super::age(now, seen.newest);
+                        (idle >= gone_after).then_some(super::Unused::Gone {
+                            idle,
+                            after: gone_after,
+                        })
+                    })
                 })
-            })
-        });
+            });
         if let Some(Some((held_cargo, why))) = whole {
             if !same(home, &receipt)
+                || read(&cache.receipt_path).as_ref() != Some(&receipt)
+                || coordination
+                    .as_ref()
+                    .is_some_and(|guard| !guard.current(home, &receipt))
                 || !fence.clear(&cache.root, &cache.root)
                 || !record(&cache.root, why)
                 || !fence.clear(&cache.root, &cache.root)
@@ -1117,7 +1309,11 @@ pub(super) fn reclaim_on(
             }
             let staged = directory.join("cache.noindex");
             if !same(home, &receipt)
-                || !owners_gone(home, &receipt, placing)
+                || (coordination.is_none() && !owners_gone(home, &receipt, placing))
+                || coordination
+                    .as_ref()
+                    .is_some_and(|guard| !guard.current(home, &receipt))
+                || read(&cache.receipt_path).as_ref() != Some(&receipt)
                 || super::locks_under(&cache.root).ok().as_ref() != Some(&seen.locks)
                 || !fence.clear(&cache.root, &cache.root)
                 || std::fs::rename(&cache.root, &staged).is_err()
@@ -1133,7 +1329,12 @@ pub(super) fn reclaim_on(
             {
                 continue;
             }
-            if !fence.clear(&cache.root, &directory) {
+            if !fence.clear(&cache.root, &directory)
+                || coordination
+                    .as_ref()
+                    .is_some_and(|guard| !guard.current(home, &receipt))
+                || read(&cache.receipt_path).as_ref() != Some(&receipt)
+            {
                 continue;
             }
             if let Some(pending) = receipt.pending.as_mut() {
@@ -1143,7 +1344,16 @@ pub(super) fn reclaim_on(
                 continue;
             }
             drop(held_cargo);
-            if !fence.clear(&cache.root, &directory) {
+            if !fence.clear(&cache.root, &directory)
+                || coordination
+                    .as_ref()
+                    .is_some_and(|guard| !guard.current(home, &receipt))
+                || read(&cache.receipt_path).as_ref() != Some(&receipt)
+                || !receipt
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending_owned(home, &receipt, pending))
+            {
                 continue;
             }
             let left = super::remove::tree(&directory);
@@ -1160,6 +1370,11 @@ pub(super) fn reclaim_on(
                 ));
             }
         } else {
+            // An opted-in live package is bounded only by whole-generation retirement.
+            // It never uses the ordinary stale-unit/partial current-deps pruning path.
+            if coordination.is_some() {
+                continue;
+            }
             let mut sweep = super::Sweep {
                 root: &cache.root,
                 home: Some(home),
@@ -1759,6 +1974,117 @@ mod tests {
     }
 
     #[test]
+    fn builtin_queries_leave_registered_receipts_unchanged_even_when_writes_are_refused() {
+        struct RestorePermissions<'a>(&'a Path, std::fs::Permissions);
+        impl Drop for RestorePermissions<'_> {
+            fn drop(&mut self) {
+                std::fs::set_permissions(self.0, self.1.clone()).unwrap();
+            }
+        }
+
+        let world = World::new();
+        world.build();
+        let path = world.path();
+        let before = std::fs::read(&path).unwrap();
+        let marker = std::fs::read(world.target.join(MARKER)).unwrap();
+        let fresh = world.home.join("query-only.noindex");
+        let config = world.owner.join(".cargo/config.toml");
+        let env =
+            |name: &str| (name == "CARGO_TARGET_DIR").then(|| world.target.as_os_str().to_owned());
+        let read_config = |path: &Path| {
+            Ok((path == config)
+                .then(|| format!("[build]\ntarget-dir = '{}'\n", world.target.display())))
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &read_config,
+            writable: &|_| Some(false),
+        };
+        let index = path.parent().unwrap();
+        let permissions =
+            RestorePermissions(index, std::fs::metadata(index).unwrap().permissions());
+        std::fs::set_permissions(index, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // The held gate also makes a mistaken owner observation fail before writing, even
+        // when a test runner has privileges that let it ignore the directory's mode.
+        let gate = crate::metadata_io::open_regular(&gate_path(&path).unwrap()).unwrap();
+        let held = crate::lock::Flock::try_lock(gate).unwrap();
+        for (tool, args) in [
+            (super::super::Tool::Targo, vec!["metadata".into()]),
+            (
+                super::super::Tool::Targo,
+                vec![
+                    "--unverified".into(),
+                    "metadata".into(),
+                    "--format-version=1".into(),
+                    format!("--target-dir={}", fresh.display()),
+                ],
+            ),
+            (
+                super::super::Tool::Cargo,
+                vec![
+                    "+nightly".into(),
+                    "--config".into(),
+                    "elsewhere.toml".into(),
+                    "-Z".into(),
+                    "unstable-options".into(),
+                    "-C".into(),
+                    "another-directory".into(),
+                    "metadata".into(),
+                ],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["locate-project".into(), "--workspace".into()],
+            ),
+            (super::super::Tool::Cargo, vec!["version".into()]),
+            (
+                super::super::Tool::Targo,
+                vec!["help".into(), "build".into()],
+            ),
+        ] {
+            assert!(
+                !observe_on(&args, tool, &world.home, &machine).unwrap(),
+                "{tool:?} {args:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{args:?}");
+            assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+            assert!(!fresh.exists());
+        }
+        for (tool, words) in [
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "metadata-alias"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--config", "metadata", "build"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--unknown-option", "metadata"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "run", "--", "metadata"],
+            ),
+            (super::super::Tool::Tippy, vec!["metadata"]),
+        ] {
+            let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                observe_on(&args, tool, &world.home, &machine).is_err(),
+                "a possible producer must still observe its owners: {tool:?} {args:?}"
+            );
+        }
+        drop(held);
+        drop(permissions);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!read(&path).unwrap().owners_unknown);
+    }
+
+    #[test]
     fn unknown_invocations_suppress_retirement_but_never_claim_fresh_targets() {
         let world = World::new();
         world.build();
@@ -1775,6 +2101,17 @@ mod tests {
         let args = ["--unverified".into(), "an-unknown-alias".into()];
         observe_on(&args, super::super::Tool::Targo, &world.home, &machine).unwrap();
         assert!(read(&world.path()).unwrap().owners_unknown);
+        let unknown = std::fs::read(world.path()).unwrap();
+        assert!(
+            !observe_on(
+                &["metadata".into()],
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+            )
+            .unwrap()
+        );
+        assert_eq!(std::fs::read(world.path()).unwrap(), unknown);
         let fresh = world.home.join("unknown-fresh.noindex");
         let env = |name: &str| (name == "CARGO_TARGET_DIR").then(|| fresh.as_os_str().to_owned());
         let machine = super::super::Machine {

@@ -1133,6 +1133,208 @@ fn the_dark_comet_s_plume_fans_out_and_thins() {
     );
 }
 
+/// What [`comet_typed_over`] returns: the glow, its config, the frame's rows,
+/// the last key's time, and each frame's grains `(key, cy)`.
+type CometTyped = (
+    CursorGlow,
+    GlowConfig,
+    Vec<Vec<aterm_core::terminal::RenderCell>>,
+    Instant,
+    Vec<(u16, i32)>,
+);
+
+/// The dark Comet typing `m` on row 3 of `tall_geom` from column 2 to
+/// `caret - 1` at 70 ms a key, row 4 holding `below` from its first column;
+/// `tune` sets the comet's controls. Returns the glow, its config and the
+/// frame's rows, and the last key's time.
+fn comet_typed_over(below: &str, caret: u16, tune: impl FnOnce(&mut CursorGlow)) -> CometTyped {
+    let g = tall_geom();
+    let row = 3u16;
+    let mut c = cfg(GlowStyle::Comet, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = (0x00D0_D0D0, 0x0011_1318);
+    let mut glow = CursorGlow::default();
+    tune(&mut glow);
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    text[0] = '$';
+    let rows_of = |text: &[char]| {
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (col, &ch) in text.iter().enumerate() {
+            rows[usize::from(row)][col].ch = ch;
+        }
+        for (col, ch) in below.chars().enumerate() {
+            rows[usize::from(row + 1)][col].ch = ch;
+        }
+        rows
+    };
+    let mut t = Instant::now();
+    let mut grains = Vec::new();
+    for k in 2..caret {
+        t += Duration::from_millis(70);
+        text[usize::from(k)] = 'm';
+        glow.note_synthetic_typed(t, 1);
+        glow.observe_row(row, k + 1, &text, t);
+        glow.observe_frame_text(Some((row, k + 1)), &rows_of(&text), t);
+        glow.tick(Some((row, k + 1)), t, &c, g, &mut out);
+        for h in glow.halos().iter().filter(|h| h.rx <= (g.ch / 4) as u16) {
+            grains.push((k, i32::from(h.cy)));
+        }
+    }
+    let rows = rows_of(&text);
+    (glow, c, rows, t, grains)
+}
+
+/// looks9's review of Q1: THE DARK COMET'S DUST FLOATS ONLY INTO A ROW BLANK
+/// ACROSS ON THE PAGE'S OWN GROUND (the ruling). Read by the cells round
+/// each grain's column, a row holding letters three cells off took the
+/// dust, and a grain drifting toward them went out in one frame (the
+/// review: under row 4's `mmmmmmmmmmmmm`, a grain shed at column 15 floated
+/// into it for 13 frames, then dropped a row and went out). Typed on row 3
+/// to column 30 over a row 4 lettered from its first column to its 13th, no
+/// grain floats into row 4; over a bare row 4 the dust does. Negative
+/// control (`comet_air_by_column`): read by the grain's column, grains float
+/// into the lettered row.
+#[test]
+fn the_dark_comet_s_dust_floats_only_into_a_row_blank_across() {
+    let g = tall_geom();
+    let into = i32::from(4u16) * g.ch as i32 + g.ch as i32 / 10;
+    let floated = |below: &str, by_column: bool| {
+        let (.., grains) = comet_typed_over(below, 31, |glow| {
+            glow.comet_air_by_column = by_column;
+        });
+        (
+            grains.iter().filter(|&&(_, cy)| cy > into).count(),
+            grains.len(),
+        )
+    };
+    let (bare, shown) = floated("", false);
+    assert!(
+        shown >= 20 && bare >= 10,
+        "fixture: over a bare row the dust floats into it ({bare} of {shown} grains)"
+    );
+    let lettered = "mmmmmmmmmmmmm";
+    let (into_letters, shown) = floated(lettered, false);
+    assert!(shown >= 20, "fixture: the dust shows ({shown} grains)");
+    assert_eq!(
+        into_letters, 0,
+        "{into_letters} of {shown} grains float into the lettered row below"
+    );
+    let (old, _) = floated(lettered, true);
+    assert!(
+        old > 0,
+        "control: read by the grain's column, no grain floats into the lettered row"
+    );
+}
+
+/// One grain shed below row 3 of [`comet_typed_over`] (typed to column 17,
+/// rows 4 and 5 bare, row 2 holding `let a = 1;`), its seat low and never
+/// thinned out, drifting back at 6 px a second; each 16 ms frame the host
+/// reads the frame and ticks, the caret stepping up to row 2 at `step_ms`.
+/// Returns the grain's height each frame (`None`: not drawn).
+fn comet_grain_heights(step_ms: Option<u64>, unlatched: bool) -> Vec<Option<i32>> {
+    let g = tall_geom();
+    let (row, caret) = (3u16, 18u16);
+    let (mut glow, c, mut rows, born, _) = comet_typed_over("", caret, |glow| {
+        glow.comet_seat_unlatched = unlatched;
+    });
+    let mut up = vec![' '; g.cols];
+    for (col, ch) in "let a = 1;".chars().enumerate() {
+        up[col] = ch;
+        rows[usize::from(row - 1)][col].ch = ch;
+    }
+    let text: Vec<char> = rows[usize::from(row)].iter().map(|cell| cell.ch).collect();
+    // A grain seated below the row (its seat past the dust's share above)
+    // that the fan never thins out.
+    let hue = (1u32..)
+        .map(|i| i as f32 / 100_003.0)
+        .find(|h| (0.3..0.8).contains(&(h * 977.0).fract()) && (h * 6007.0).fract() > 0.85)
+        .unwrap_or(0.5);
+    glow.particles.clear();
+    glow.particles.push(Particle {
+        x0: 14.4 * g.cw as f32,
+        y0: (i32::from(row) * g.ch as i32 + g.ch as i32 / 2) as f32,
+        vx: -6.0,
+        vy: 0.0,
+        gy: 0.25 * g.ch as f32,
+        life: 1.05,
+        hue,
+        cov_scale: 1.0,
+        born,
+        latch: ParticleLatch::FRESH,
+        edge_cut: false,
+    });
+    let mut out = Vec::new();
+    (1..66u64)
+        .map(|f| {
+            let ms = f * 16;
+            let now = born + Duration::from_millis(ms);
+            let cur = match step_ms {
+                Some(s) if ms >= s => (row - 1, caret),
+                _ => (row, caret),
+            };
+            let on: &[char] = if cur.0 == row { &text } else { &up };
+            glow.observe_row(cur.0, cur.1, on, now);
+            glow.observe_frame_text(Some(cur), &rows, now);
+            glow.tick(Some(cur), now, &c, g, &mut out);
+            glow.particles.retain(|p| p.hue == hue);
+            glow.halos()
+                .iter()
+                .find(|h| h.rx <= (g.ch / 4) as u16 && h.cx < 16 * g.cw as u16)
+                .map(|h| i32::from(h.cy))
+        })
+        .collect()
+}
+
+/// looks9's review: A COMET GRAIN KEEPS ITS SEAT FOR ITS LIFE. Seated afresh
+/// every frame, a grain floating in the air under the typed row read the
+/// row past that air off the frame's read of the rows round the caret; when
+/// the caret stepped up a row that row fell out of the read, and every deep
+/// grain snapped up a row's height (14 px in one frame) and stopped. One
+/// grain shed under the row drifts the same whether the caret stays or steps
+/// up a row early, midway or late: drawn on every frame, it never moves more
+/// than 2 px in a frame and ends within a pixel of where it ends with the
+/// caret still. Negative control (`comet_seat_unlatched`): seated afresh,
+/// the grain jumps 4 px and more in a frame.
+#[test]
+fn a_comet_grain_keeps_its_seat_for_its_life() {
+    let read = |heights: &[Option<i32>]| -> (usize, i32, Option<i32>) {
+        let drawn = heights.iter().filter(|h| h.is_some()).count();
+        let jump = heights
+            .windows(2)
+            .filter_map(|w| Some((w[1]? - w[0]?).abs()))
+            .max()
+            .unwrap_or(0);
+        (drawn, jump, heights.iter().rev().find_map(|&h| h))
+    };
+    let (still_drawn, still_jump, still_end) = read(&comet_grain_heights(None, false));
+    assert!(
+        still_drawn >= 60 && still_jump <= 2,
+        "fixture: with the caret still the grain drifts ({still_drawn} frames, {still_jump} px)"
+    );
+    for step in [160u64, 480, 800] {
+        let heights = comet_grain_heights(Some(step), false);
+        let (drawn, jump, end) = read(&heights);
+        assert_eq!(
+            drawn, still_drawn,
+            "caret up at {step} ms: the grain drawn on {drawn} frames ({heights:?})"
+        );
+        assert!(
+            jump <= 2,
+            "caret up at {step} ms: the grain jumps {jump} px in a frame ({heights:?})"
+        );
+        assert!(
+            matches!((end, still_end), (Some(a), Some(b)) if (a - b).abs() <= 1),
+            "caret up at {step} ms: the grain ends at {end:?}, {still_end:?} with the caret still"
+        );
+        let (_, old_jump, _) = read(&comet_grain_heights(Some(step), true));
+        assert!(
+            old_jump >= 4,
+            "control: caret up at {step} ms, seated afresh, the grain jumps only {old_jump} px"
+        );
+    }
+}
+
 /// Comet typed along a dense row (`m`s on filled rows above and below the
 /// caret's row 3, twelve keys) on `(page, ink)`, `seams` set on the glow:
 /// the last frame's under stream on glass, with the caret's far edge, x px.

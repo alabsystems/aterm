@@ -98,10 +98,12 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     let mut diff: u8 = 0;
-    let mut i = 0usize;
-    while i < a.len() && i < b.len() {
-        diff |= a[i] ^ b[i];
-        i += 1;
+    let mut ra = a;
+    let mut rb = b;
+    while let (&[xa, ref at @ ..], &[xb, ref bt @ ..]) = (ra, rb) {
+        diff |= xa ^ xb;
+        ra = at;
+        rb = bt;
     }
     std::hint::black_box(diff) == 0
 }

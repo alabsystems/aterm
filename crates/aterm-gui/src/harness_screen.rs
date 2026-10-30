@@ -3350,11 +3350,18 @@ pub(crate) fn canonical_host_name_gui(
 }
 
 fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
+    aterm_types::dirs::aterm_config_dir()
+        .map(|cfg| cfg.join("machines/machines.toml"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|content| custom_host_names_in(&content))
+        .unwrap_or_default()
+}
+
+/// The `[names]` overrides of a `machines.toml` reading `content`: each key whose display name
+/// is a string.
+fn custom_host_names_in(content: &str) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    if let Some(path) =
-        aterm_types::dirs::aterm_config_dir().map(|cfg| cfg.join("machines/machines.toml"))
-        && let Ok(content) = std::fs::read_to_string(&path)
-        && let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(&content)
+    if let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(content)
         && let Some(names) = val.get("names").and_then(|v| v.as_table())
     {
         for (k, v) in names {
@@ -3936,31 +3943,8 @@ fn collect_remote_machines_tabs(
         let machines_dir = config_dir.join("machines");
         let toml_path = machines_dir.join("machines.toml");
         state_dir_opt = Some(machines_dir.join("state"));
-        if let Ok(content) = std::fs::read_to_string(&toml_path)
-            && let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(&content)
-            && let Some(hosts) = val.get("host").and_then(|v| v.as_array())
-        {
-            for h in hosts {
-                let uuid = h
-                    .get("uuid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let raw_name = h
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = canonical_host_name_gui(&raw_name, &custom_names);
-                let address = h
-                    .get("address")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !uuid.is_empty() && !name.is_empty() {
-                    configured.push((uuid, raw_name, name, address));
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string(&toml_path) {
+            configured = configured_hosts_in(&content, &custom_names);
         }
     }
     let mut tabs = Vec::new();
@@ -3997,6 +3981,42 @@ fn collect_remote_machines_tabs(
         None
     };
     (computers, tabs, lan_waits)
+}
+
+/// The `[[host]]` rows of a `machines.toml` reading `content`, as `(uuid, name, canonical name,
+/// address)`, the name canonical under `custom_names`: a row with no uuid, or whose name reads
+/// as nothing, is none.
+fn configured_hosts_in(
+    content: &str,
+    custom_names: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String, String, String)> {
+    let mut configured = Vec::new();
+    if let Ok(val) = aterm_toml::from_str::<aterm_toml::Value>(content)
+        && let Some(hosts) = val.get("host").and_then(|v| v.as_array())
+    {
+        for h in hosts {
+            let uuid = h
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw_name = h
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = canonical_host_name_gui(&raw_name, custom_names);
+            let address = h
+                .get("address")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !uuid.is_empty() && !name.is_empty() {
+                configured.push((uuid, raw_name, name, address));
+            }
+        }
+    }
+    configured
 }
 
 /// What Tab Control says while it looks for no computer on the local network because System
@@ -4675,14 +4695,7 @@ fn sample_local_vitals_fallback() -> String {
         ));
     }
     if let Some(boottime) = run_cmd_stdout_bounded("/usr/sbin/sysctl", &["-n", "kern.boottime"], 60)
-        .and_then(|s| {
-            s.split_once("sec =")?
-                .1
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse::<u64>()
-                .ok()
-        })
+        .and_then(|s| boot_secs(&s))
     {
         let now_s = (unix_ms_now() / 1000).max(0) as u64;
         if now_s > boottime {
@@ -4690,6 +4703,19 @@ fn sample_local_vitals_fallback() -> String {
         }
     }
     parts.join(" \u{b7} ")
+}
+
+/// The boot time, unix seconds, `sysctl -n kern.boottime` says in `text` (`{ sec = …, usec = … }
+/// …`), past the space after its `=`.
+#[cfg(target_os = "macos")]
+fn boot_secs(text: &str) -> Option<u64> {
+    text.split_once("sec =")?
+        .1
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<u64>()
+        .ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -5179,28 +5205,13 @@ fn discover_bonjour_lan_computers(
         session_scope: TabSessionScope::Observed,
     });
 
-    let candidates: Vec<String> = lan_names
-        .into_iter()
-        .filter(|inst_name| {
-            let canonical = canonical_host_name_gui(inst_name, custom_names);
-            if canonical.eq_ignore_ascii_case(&local_canonical) {
-                return false;
-            }
-            if is_known_swarm_host(known_swarm_names, &canonical)
-                || is_known_swarm_host(known_swarm_names, inst_name)
-            {
-                return false;
-            }
-            let canonical_stem = aterm_agent::fleet_census::canonical_host_stem(&canonical);
-            !computers.iter().any(|c| {
-                c.id != "__local_meta__"
-                    && (c.name.eq_ignore_ascii_case(&canonical)
-                        || c.name.eq_ignore_ascii_case(inst_name)
-                        || aterm_agent::fleet_census::canonical_host_stem(&c.name)
-                            == canonical_stem)
-            })
-        })
-        .collect();
+    let candidates = lan_candidates(
+        lan_names,
+        custom_names,
+        &local_canonical,
+        known_swarm_names,
+        computers,
+    );
 
     if in_swarm_census {
         // DESIGN-alab-swarm §7.2: when in a fleet, `/monitor` never TCP-dials every Mac for
@@ -5318,6 +5329,41 @@ fn discover_bonjour_lan_computers(
     for comp in results {
         computers.push(comp);
     }
+}
+
+/// The Bonjour SSH instances of `lan_names` that become LAN rows: none that is this Mac
+/// (`local_canonical`), a swarm host by its canonical or its own name, or a computer `listed`
+/// already (the local row aside) by either name or by host stem.
+#[cfg(target_os = "macos")]
+fn lan_candidates(
+    lan_names: Vec<String>,
+    custom_names: &std::collections::BTreeMap<String, String>,
+    local_canonical: &str,
+    known_swarm_names: &std::collections::BTreeMap<String, String>,
+    listed: &[TabComputer],
+) -> Vec<String> {
+    lan_names
+        .into_iter()
+        .filter(|inst_name| {
+            let canonical = canonical_host_name_gui(inst_name, custom_names);
+            if canonical.eq_ignore_ascii_case(local_canonical) {
+                return false;
+            }
+            if is_known_swarm_host(known_swarm_names, &canonical)
+                || is_known_swarm_host(known_swarm_names, inst_name)
+            {
+                return false;
+            }
+            let canonical_stem = aterm_agent::fleet_census::canonical_host_stem(&canonical);
+            !listed.iter().any(|c| {
+                c.id != "__local_meta__"
+                    && (c.name.eq_ignore_ascii_case(&canonical)
+                        || c.name.eq_ignore_ascii_case(inst_name)
+                        || aterm_agent::fleet_census::canonical_host_stem(&c.name)
+                            == canonical_stem)
+            })
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]

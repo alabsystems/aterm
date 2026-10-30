@@ -1408,8 +1408,8 @@ pub(crate) fn cmd_notice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// `members requests | allow <name> | invite | ignore <name>` -> the window's reply. `allow` and
-/// `invite` never carry the phrase: it shows on this Mac's screen alone
+/// `members requests | allow [--again] <name> | invite | ignore <name>` -> the window's reply.
+/// `allow` and `invite` never carry the phrase: it shows on this Mac's screen alone
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.5).
 #[cfg(unix)]
 pub(crate) fn cmd_members(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {

@@ -304,6 +304,47 @@ pub struct ConfigRecord {
     pub block: bool,
     pub glyph_span: Option<(i32, i32)>,
     pub light_vivid: bool,
+    pub chosen_hue: bool,
+    pub chosen_base: bool,
+}
+
+/// [`ConfigRecord::ink_byte`]'s bit for `light_vivid`.
+const INK_VIVID: u8 = 1;
+/// [`ConfigRecord::ink_byte`]'s bit for `chosen_hue`.
+const INK_CHOSEN_HUE: u8 = 2;
+/// [`ConfigRecord::ink_byte`]'s bit for `chosen_base`.
+const INK_CHOSEN_BASE: u8 = 4;
+
+impl ConfigRecord {
+    /// The one byte a Tick input writes for the glow's ink: `light_vivid`, `chosen_hue` and
+    /// `chosen_base` as bits 0, 1 and 2. A glow that reads no chosen colour writes `0` or `1`,
+    /// the byte `light_vivid` was written as alone, so every recording made before reads the
+    /// same and its digests and pins stand.
+    #[inline]
+    #[must_use]
+    pub const fn ink_byte(&self) -> u8 {
+        (if self.light_vivid { INK_VIVID } else { 0 })
+            | (if self.chosen_hue { INK_CHOSEN_HUE } else { 0 })
+            | (if self.chosen_base { INK_CHOSEN_BASE } else { 0 })
+    }
+
+    /// The ink byte's three bits, `(light_vivid, chosen_hue, chosen_base)`; a byte with any
+    /// other bit set is `BadTag` for `field`.
+    #[inline]
+    fn read_ink_byte(
+        d: &mut Dec<'_>,
+        field: &'static str,
+    ) -> Result<(bool, bool, bool), WireFault> {
+        let tag = d.u8(field)?;
+        if tag & !(INK_VIVID | INK_CHOSEN_HUE | INK_CHOSEN_BASE) != 0 {
+            return Err(WireFault::BadTag { field, tag });
+        }
+        Ok((
+            tag & INK_VIVID != 0,
+            tag & INK_CHOSEN_HUE != 0,
+            tag & INK_CHOSEN_BASE != 0,
+        ))
+    }
 }
 
 impl From<&MomentumGlowConfig> for ConfigRecord {
@@ -331,6 +372,8 @@ impl ConfigRecord {
             block: c.block,
             glyph_span: c.glyph_span,
             light_vivid: c.light_vivid,
+            chosen_hue: c.chosen_hue,
+            chosen_base: c.chosen_base,
         }
     }
 
@@ -352,6 +395,8 @@ impl ConfigRecord {
             block: self.block,
             glyph_span: self.glyph_span,
             light_vivid: self.light_vivid,
+            chosen_hue: self.chosen_hue,
+            chosen_base: self.chosen_base,
         }
     }
 }
@@ -735,7 +780,7 @@ impl Schema for MomentumSchema {
                     e.i32(first);
                     e.i32(end);
                 });
-                e.bool(cfg.light_vivid);
+                e.u8(cfg.ink_byte());
             }
             MomentumEvent::Query { at, frame_interval } => {
                 e.u8(3);
@@ -769,7 +814,7 @@ impl Schema for MomentumSchema {
                     win_h: d.u16("geom.win_h")?,
                     head: d.u16("geom.head")?,
                 };
-                let cfg = ConfigRecord {
+                let mut cfg = ConfigRecord {
                     enabled: d.bool("cfg.enabled")?,
                     intensity: d.u32("cfg.intensity")?,
                     tau_s: d.u32("cfg.tau_s")?,
@@ -783,8 +828,12 @@ impl Schema for MomentumSchema {
                     glyph_span: d.opt("cfg.glyph_span", |d| {
                         Ok((d.i32("cfg.glyph_span")?, d.i32("cfg.glyph_span")?))
                     })?,
-                    light_vivid: d.bool("cfg.light_vivid")?,
+                    light_vivid: false,
+                    chosen_hue: false,
+                    chosen_base: false,
                 };
+                (cfg.light_vivid, cfg.chosen_hue, cfg.chosen_base) =
+                    ConfigRecord::read_ink_byte(d, "cfg.ink")?;
                 Ok(MomentumEvent::Tick { cur, at, geom, cfg })
             }
             3 => Ok(MomentumEvent::Query {

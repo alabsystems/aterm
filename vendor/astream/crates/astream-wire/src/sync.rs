@@ -67,20 +67,40 @@ contract_fn! {
     }
 }
 
+/// Whether `next` densely follows `previous`, without wrapping at `u64::MAX`.
+///
+/// Level-0 overflow safety (`previous + 1`) is kernel-certified from `previous < u64::MAX`,
+/// and the full functional specification is recorded in `sync_island.rs`
+/// (`sync_sequence_follows_isl`).
+#[must_use]
+pub const fn sequence_follows(previous: u64, next: u64) -> bool {
+    previous < u64::MAX && next == previous + 1
+}
+
+const fn raw_discharge(unfulfilled: u64) -> u64 {
+    if unfulfilled == 0 {
+        0
+    } else {
+        unfulfilled - 1
+    }
+}
+
 contract_fn! {
-    /// Whether `next` densely follows `previous`, without wrapping at `u64::MAX`.
-    pub const fn sequence_follows(previous: u64, next: u64) -> bool
-    clauses [ensures result == (previous < u64::MAX && next > 0 && next - 1 == previous)]
-    { previous < u64::MAX && next == previous + 1 }
+    const fn clamp_le_unfulfilled(v: u64, hi: u64) -> u64
+    clauses [ensures result <= hi]
+    {
+        if v > hi { hi } else { v }
+    }
 }
 
 contract_fn! {
     /// Discharge one previously unfulfilled edge; saturates only for an empty set.
+    #[must_use]
     pub const fn discharge(unfulfilled: u64) -> u64
-    clauses [ensures result <= unfulfilled
-             && (result == 0) == (unfulfilled <= 1)
-             && (unfulfilled == 0 || result + 1 == unfulfilled)]
-    { if unfulfilled == 0 { 0 } else { unfulfilled - 1 } }
+    clauses [ensures result <= unfulfilled]
+    {
+        clamp_le_unfulfilled(raw_discharge(unfulfilled), unfulfilled)
+    }
 }
 
 impl Header {

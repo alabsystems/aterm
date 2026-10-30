@@ -16,7 +16,11 @@
 //! - the ink ledger's per-frame products (the `ledger` line: the rails it noted, its dims and the
 //!   print of its cuts, all read off the frame's under stream) are compared as a stream, equal
 //!   on every drawn frame where no arm touched `glow_under` or `glow_under_ramps`
-//!   (docs/design/PRISM-GLASS.md §15.9's preamble).
+//!   (docs/design/PRISM-GLASS.md §15.9's preamble);
+//! - no light arm draws on a dark ground: a frame where an arm drew in a build whose own
+//!   `light=` bits are 0 there (no light latched), or in a script under a `dark` folder, fails,
+//!   whatever the streams say (§15.0.2(b): the arms are light code, and a dark ground draws by
+//!   main's rule alone).
 //!
 //! The light words are never compared. Both builds run the head's scripts, so the harness
 //! closure (the dump, its support files, the rig and the frame reads it drives the App by, every
@@ -64,10 +68,16 @@ pub const CORPUS: &str = "crates/aterm-effects/tests/fixtures/trail-diff";
 pub const PLANT_FILE: &str = "crates/aterm-effects/src/rainbow_kitty/ribbon.rs";
 /// ...and the constant it lowers by one (§15.1 P0.5).
 pub const PLANT_CONST: &str = "const BODY_FRAME_TOP: f32 = ";
+/// `--control dark-arm`'s file in the base copy: the light arm report the dump reads...
+pub const DARK_ARM_FILE: &str = "crates/aterm-effects/src/pipeline_native.rs";
+/// ...the line after which it notes an arm on every frame...
+pub const DARK_ARM_AFTER: &str = "let mut arms = ArmsDrawn::NONE;";
+/// ...and the arm it notes, which touches no stream.
+pub const DARK_ARM: &str = "planted";
 
 /// The verb's own help (`trail-diff --help`).
 pub const HELP: &str = "\
-usage: targo --unverified lab trail-diff [--base REF|merge-base] [--control same|plant] [--keep] [--jobs N]
+usage: targo --unverified lab trail-diff [--base REF|merge-base] [--control same|plant|dark-arm] [--keep] [--jobs N]
          [SCRIPT.trail|DIR]...
 
 Prism Glass's dark proof (docs/design/PRISM-GLASS.md section 15.0.2, 15.1 P0.5). It builds aterm-gui's trail_dump
@@ -83,14 +93,18 @@ frame by frame:
            must still be equal, and the frame is listed with its arms
   ledger   the ink ledger's per-frame products (its rails, dims and cut notes), compared as a stream: equal on every
            drawn frame where no arm touched glow_under or glow_under_ramps
+  dark     no light arm on a dark ground: a frame where an arm drew in a build whose own light= bits are 0 there,
+           or in a script under a dark folder, fails whatever its streams say
 The light words are never compared. It prints the first difference of each script that has one, the frames where
-an arm drew, then scripts= frames= differing_compared= arm_frames= state_differing=.
+an arm drew, then scripts= frames= differing_compared= arm_frames= state_differing= dark_arms=.
 
   --base REF         the base commit: HEAD~1 (the commit's parent) by default; merge-base is where HEAD left
                      origin/main, so a whole stack compares
   --control same     the base is HEAD itself: the dumps must not differ (the head's working tree must be HEAD's)
   --control plant    the base is HEAD with BODY_FRAME_TOP in rainbow_kitty/ribbon.rs lowered by one: the difference
                      must be reported
+  --control dark-arm the base is HEAD with a light arm (planted, touching no stream) noted on every frame in
+                     pipeline_native.rs's light arm report: its frames on dark grounds must be reported
   --keep             keep the base worktree; the next run checks it out at its base instead of adding it afresh,
                      so its build rebuilds only what the bases' trees change
   --jobs N           dumps run at once per build (default half the cores, at most one per script)
@@ -100,8 +114,9 @@ support/**, crates/aterm-gui/src/trail_rig.rs, crates/aterm-gui/src/trail_frame_
 [profile.trail-diff]) differs between the base and the head: a closure change lands alone and is proved by both
 controls (section 15.0.6).
 
-exit: 0 the dumps agree; 1 a difference; 2 usage; 3 not run (the reason named). Under --control the exit says
-whether the control held: 0 it did (same: no difference; plant: the plant reported), 1 it did not.
+exit: 0 the dumps agree; 1 a difference or an arm on a dark ground; 2 usage; 3 not run (the reason named). Under
+--control the exit says whether the control held: 0 it did (same: no difference; plant: the plant reported;
+dark-arm: the planted arm reported on a dark ground), 1 it did not.
 ";
 
 /// What `--base` names.
@@ -120,6 +135,9 @@ pub enum Control {
     Same,
     /// The base is `HEAD` with [`PLANT_CONST`] lowered by one: the difference must be reported.
     Plant,
+    /// The base is `HEAD` with the light arm [`DARK_ARM`] noted on every frame ([`plant_arm`]):
+    /// its frames on a dark ground must be reported.
+    DarkArm,
 }
 
 /// The verb's arguments.
@@ -144,9 +162,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         None => None,
         Some("same") => Some(Control::Same),
         Some("plant") => Some(Control::Plant),
+        Some("dark-arm") => Some(Control::DarkArm),
         Some(other) => {
             return Err(Fail::usage(format!(
-                "trail-diff: --control takes same or plant, not '{other}'"
+                "trail-diff: --control takes same, plant or dark-arm, not '{other}'"
             )));
         }
     };
@@ -382,6 +401,36 @@ pub fn plant(text: &str) -> Option<String> {
         }
     }
     planted.then_some(out)
+}
+
+/// `text` (the dark-arm plant's file) with [`DARK_ARM`] noted, touching no stream, on the line
+/// after [`DARK_ARM_AFTER`] (indented as it is); `None` when no line holds it, or more than one.
+#[must_use]
+pub fn plant_arm(text: &str) -> Option<String> {
+    let mut found = text.match_indices(DARK_ARM_AFTER);
+    let (at, _) = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+    let indent = &text[line_start..at];
+    if !indent.chars().all(char::is_whitespace) {
+        return None;
+    }
+    let end = at + DARK_ARM_AFTER.len();
+    Some(format!(
+        "{}\n{indent}arms.note({DARK_ARM:?}, crate::state_words::Streams::NONE);{}",
+        &text[..end],
+        &text[end..]
+    ))
+}
+
+/// Whether the script `name` lies under a `dark` folder, whose every frame is a dark ground.
+#[must_use]
+pub fn dark_script(name: &str) -> bool {
+    let mut parts: Vec<&str> = name.split('/').collect();
+    parts.pop();
+    parts.contains(&"dark")
 }
 
 // ---- The dump's output ----------------------------------------------------------------------
@@ -647,6 +696,9 @@ pub struct Report {
     pub arm_frames: usize,
     /// Frames where main's state differs.
     pub state_differing: usize,
+    /// Frames where a light arm drew on a dark ground: in a build whose own `light=` bits are 0
+    /// there, or in a script under a `dark` folder ([`dark_script`]).
+    pub dark_arms: usize,
     /// The first difference of each script that has one.
     pub firsts: Vec<String>,
     /// Each run's frames where an arm drew, grouped by the arms.
@@ -657,19 +709,21 @@ impl Report {
     /// Whether the dumps differ anywhere compared.
     #[must_use]
     pub const fn differs(&self) -> bool {
-        self.differing_compared > 0 || self.state_differing > 0
+        self.differing_compared > 0 || self.state_differing > 0 || self.dark_arms > 0
     }
 
     /// The totals line.
     #[must_use]
     pub fn totals(&self) -> String {
         format!(
-            "scripts={} frames={} differing_compared={} arm_frames={} state_differing={}",
+            "scripts={} frames={} differing_compared={} arm_frames={} state_differing={} \
+             dark_arms={}",
             self.scripts,
             self.frames,
             self.differing_compared,
             self.arm_frames,
-            self.state_differing
+            self.state_differing,
+            self.dark_arms
         )
     }
 
@@ -750,6 +804,10 @@ fn compare_runs(
             }
         };
         let mut armed: Vec<(String, Vec<String>)> = Vec::new();
+        let dark = dark_script(name);
+        // An arm a build drew on a dark ground: its own light bits off there, or a dark script.
+        let dark_armed =
+            |f: &Frame| !f.held && !f.arms.is_empty() && (dark || f.light.trim() == "0");
         for k in 0..h.frames.len().max(b.frames.len()) {
             r.frames += 1;
             let (hf, bf) = (h.frames.get(k), b.frames.get(k));
@@ -776,7 +834,21 @@ fn compare_runs(
             }
             r.differing_compared += usize::from(!verdict.streams.is_empty());
             r.state_differing += usize::from(!verdict.state.is_empty());
-            let diffs: Vec<Diff> = verdict.streams.into_iter().chain(verdict.state).collect();
+            let mut diffs: Vec<Diff> = verdict.streams.into_iter().chain(verdict.state).collect();
+            if hf.is_some_and(dark_armed) || bf.is_some_and(dark_armed) {
+                r.dark_arms += 1;
+                let said = |f: Option<&Frame>| {
+                    f.map_or_else(
+                        || "-".into(),
+                        |f| format!("light={} arms={}", f.light, arms_said(&f.arms)),
+                    )
+                };
+                diffs.push(Diff {
+                    what: "arms on a dark ground".into(),
+                    head: said(hf),
+                    base: said(bf),
+                });
+            }
             note(first, name, &format!("S {label} F{n} t={t}"), &diffs);
         }
         for (said, frames) in armed {
@@ -854,8 +926,9 @@ pub fn ranges(frames: &[String]) -> String {
 }
 
 /// The run's exit and, under a control, the line that says whether it held: without one, 0 when
-/// the dumps agree and 1 when they differ; under `--control same`, 0 when they agree; under
-/// `--control plant`, 0 when they differ.
+/// the dumps agree and 1 when they differ (an arm on a dark ground among the differences); under
+/// `--control same`, 0 when they agree; under `--control plant`, 0 when they differ; under
+/// `--control dark-arm`, 0 when an arm on a dark ground is reported.
 #[must_use]
 pub fn verdict(report: &Report, control: Option<Control>) -> (i32, Option<String>) {
     let differs = report.differs();
@@ -886,6 +959,22 @@ pub fn verdict(report: &Report, control: Option<Control>) -> (i32, Option<String
             Some(
                 "control plant: FAILED, the base draws BODY_FRAME_TOP one lower and no frame \
                  differs (do the scripts draw a full ribbon body?)"
+                    .into(),
+            ),
+        ),
+        Some(Control::DarkArm) if report.dark_arms > 0 => (
+            0,
+            Some(format!(
+                "control dark-arm: held, the base's planted arm is reported on dark grounds \
+                 (dark_arms={})",
+                report.dark_arms
+            )),
+        ),
+        Some(Control::DarkArm) => (
+            1,
+            Some(
+                "control dark-arm: FAILED, the base notes a light arm on every frame and no dark \
+                 frame reports it (do the scripts hold a dark ground?)"
                     .into(),
             ),
         ),
@@ -1089,7 +1178,7 @@ impl Drop for BaseTree {
 /// Build the dump in `tree` into `target`: the example's path.
 fn build(tree: &Path, target: &Path, side: &str) -> Result<PathBuf, Fail> {
     let t = target.to_string_lossy();
-    let status = crate::util::targo(&[
+    let args = [
         "--unverified",
         "build",
         "-p",
@@ -1102,10 +1191,15 @@ fn build(tree: &Path, target: &Path, side: &str) -> Result<PathBuf, Fail> {
         PROFILE,
         "--target-dir",
         &t,
-    ])
-    .current_dir(tree)
-    .stdin(aterm_uds::spawnfd::Stdio::null())
-    .status()
+    ];
+    let claim = crate::util::claim_build(&args, None, tree)
+        .map_err(|e| not_run(format!("the {side} build: {e}")))?;
+    let status = crate::util::status_claimed(
+        crate::util::targo(&args)
+            .current_dir(tree)
+            .stdin(aterm_uds::spawnfd::Stdio::null()),
+        claim,
+    )
     .map_err(|e| not_run(format!("the {side} build: targo: {e}")))?;
     if !status.success() {
         return Err(not_run(format!(
@@ -1269,6 +1363,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
         match a.control {
             Some(Control::Same) => " under --control same",
             Some(Control::Plant) => " under --control plant",
+            Some(Control::DarkArm) => " under --control dark-arm",
             None => "",
         },
         scripts.len(),
@@ -1296,6 +1391,19 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
         })?;
         std::fs::write(&file, planted)
             .map_err(|e| not_run(format!("the plant: {}: {e}", file.display())))?;
+    }
+    if a.control == Some(Control::DarkArm) {
+        let file = base_path.join(DARK_ARM_FILE);
+        let text = std::fs::read_to_string(&file)
+            .map_err(|e| not_run(format!("the dark-arm plant: {}: {e}", file.display())))?;
+        let planted = plant_arm(&text).ok_or_else(|| {
+            not_run(format!(
+                "the dark-arm plant: {} holds `{DARK_ARM_AFTER}` on no line or on more than one",
+                file.display()
+            ))
+        })?;
+        std::fs::write(&file, planted)
+            .map_err(|e| not_run(format!("the dark-arm plant: {}: {e}", file.display())))?;
     }
 
     let t = Instant::now();

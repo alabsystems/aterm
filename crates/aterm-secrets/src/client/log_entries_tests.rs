@@ -11,7 +11,7 @@ use crate::membership_log::{
 use crate::server::Options as ServerOptions;
 use std::collections::VecDeque;
 
-fn join_host(paths: &Paths, source: &str, host: &str) {
+pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
     join(
         paths,
         &JoinOptions {
@@ -65,7 +65,7 @@ fn enroll_commons(owner_paths: &Paths, member_paths: &Paths) {
         .expect("enroll member");
 }
 
-fn clone_identity_to(src: &Paths, dst: &Paths) {
+pub(super) fn clone_identity_to(src: &Paths, dst: &Paths) {
     fsx::ensure_private_dir(&dst.dir).expect("dst dir");
     let id_bytes = std::fs::read(src.identity_file()).expect("read src identity");
     fsx::write_atomic(&dst.identity_file(), &id_bytes, 0o600).expect("write dst identity");
@@ -427,6 +427,8 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
 
 #[test]
 fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let s2 = start_loopback_server(&root.path().join("s2"));
@@ -606,9 +608,12 @@ fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
     assert_eq!(mirrored_seq, s2_seq + 1);
 
     for url in [&url1, &url2] {
-        let Fetched::Body(served) =
-            transport::fetch(&Source::Url(url.clone()), None, Duration::from_secs(5)).unwrap()
-        else {
+        let Fetched::Body(served) = transport::fetch(
+            &Source::Url(url.clone()),
+            None,
+            aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap() else {
             panic!("expected served mirror envelope on {url}");
         };
         let raw_text = std::str::from_utf8(&served).expect("envelope text");
@@ -644,8 +649,10 @@ fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
         .unwrap()
         .expect("healed lease");
     assert_eq!(healed_lease.epoch, 99);
-    let s1_rec = transport::fetch_records(&url1, &[], None, Duration::from_secs(5), None).unwrap();
-    let s2_rec = transport::fetch_records(&url2, &[], None, Duration::from_secs(5), None).unwrap();
+    let s1_rec =
+        transport::fetch_records(&url1, &[], None, aterm_spec::wait::MUST_HAPPEN, None).unwrap();
+    let s2_rec =
+        transport::fetch_records(&url2, &[], None, aterm_spec::wait::MUST_HAPPEN, None).unwrap();
     let st_s1 = crate::membership_log::Store::decode("custom", &s1_rec).unwrap();
     let st_s2 = crate::membership_log::Store::decode("custom", &s2_rec).unwrap();
     assert_eq!(st_s1.inventory(), st_s2.inventory());
@@ -1094,7 +1101,7 @@ fn commons_log_model_conforms_and_catches_its_mutants() {
 }
 
 /// The writer `actor`, `incarnation` and bootstrap of the Mac at `paths` (synthetic test keys).
-fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::MemberId, [u8; 16]) {
+pub(super) fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::MemberId, [u8; 16]) {
     let bootstrap = Bootstrap::required(paths).expect("bootstrap");
     let request = bootstrap.request().expect("request");
     let actor = request.binding().actor();
@@ -1104,22 +1111,22 @@ fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::MemberId, [u8
 
 /// A one-admin vault on a loopback server: `m22` (admin) and `m7` (member), Commons enrolled,
 /// `entries` published, Genesis v2 signed and synced to `m7`.
-struct TwoMacs {
-    root: aterm_tempfile::TempDir,
-    server: crate::server::Running,
-    url: String,
+pub(super) struct TwoMacs {
+    pub(super) root: aterm_tempfile::TempDir,
+    pub(super) server: crate::server::Running,
+    pub(super) url: String,
     /// The vault's signer, as a join source names it after `#`.
-    signer: String,
-    m22: Paths,
-    m7: Paths,
+    pub(super) signer: String,
+    pub(super) m22: Paths,
+    pub(super) m7: Paths,
 }
 
-fn two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
+pub(super) fn two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
     two_macs_with(entries, false)
 }
 
 /// [`two_macs`], with `m7` an admin too where `m7_admin`.
-fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool) -> TwoMacs {
+pub(super) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool) -> TwoMacs {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = start_loopback_server(&root.path().join("s1"));
     let url = format!("http://{}/v1/alab", server.addr);
@@ -1583,9 +1590,12 @@ fn split_admins() -> SplitAdmins {
 
 /// What a `0.145` Mac holding `id` reads from the envelope `url` serves: entry name to value.
 fn envelope_view(url: &str, id: &Identity) -> (u64, BTreeMap<String, Vec<u8>>) {
-    let Fetched::Body(served) =
-        transport::fetch(&Source::Url(url.to_owned()), None, Duration::from_secs(5)).unwrap()
-    else {
+    let Fetched::Body(served) = transport::fetch(
+        &Source::Url(url.to_owned()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap() else {
         panic!("expected a served envelope on {url}");
     };
     let parsed = envelope::parse(&served).unwrap();
@@ -1603,6 +1613,8 @@ fn envelope_view(url: &str, id: &Identity) -> (u64, BTreeMap<String, Vec<u8>>) {
 
 #[test]
 fn after_a_heal_an_admins_own_pass_mirrors_the_lower_seq_sides_edit() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let lab = split_admins();
     let urls = [lab.url1.clone(), lab.url2.clone()];
     let base_seq = load_state(&lab.st1).unwrap().seq;
@@ -1695,6 +1707,8 @@ fn assert_in_commons_control(admin_paths: &Paths, urls: &[String], ids: &[(&str,
 
 #[test]
 fn approvals_on_both_sides_of_a_split_keep_both_macs_in_commons_control() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let lab = split_admins();
     let urls = [lab.url1.clone(), lab.url2.clone()];
     let ma_id = machine_identity(&Paths::for_home(&lab.root.path().join("ma"))).unwrap();
@@ -2056,6 +2070,8 @@ fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
 /// name in `draft_document_diff`): the heal settles the conflict and status names nothing.
 #[test]
 fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let lab = split_admins();
     let urls = [lab.url1.clone(), lab.url2.clone()];
 
@@ -2176,6 +2192,8 @@ fn a_publish_cut_short_after_the_server_stored_it_still_reaches_every_mac() {
 /// back to `v0` on every Mac.
 #[test]
 fn an_anchor_removed_on_one_side_of_a_split_leaves_every_mac_reading() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let lab = split_admins();
     let urls = [lab.url1.clone(), lab.url2.clone()];
 
@@ -2487,6 +2505,133 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
         verify_log.insert(r).unwrap();
     }
     assert!(verify_log.has_historical_seat(req8.binding()));
+    assert!(!verify_log.audience_left_out(&EpochAudience::Commons, &actor8));
+    assert!(
+        !verify_log
+            .audience_left_out_recipient(&EpochAudience::Commons, &req8.binding().recipient())
+    );
+
+    // When a post-Genesis machine `m9` was wrapped in an earlier epoch, then a newer `Commons`
+    // epoch was minted before `m9` enrolled (`Admit` signed after the newer epoch, followed by
+    // `Wrap` for `m9`), `Bootstrap::log_witness()` includes `m9`'s `Wrap` records so the witness
+    // chain does not leave `m9` out of `EpochAudience::Commons` or `EpochAudience::Everyone`.
+    let m9 = Paths::for_home(&macs.root.path().join("m9"));
+    configure_log_member(&m9, &format!("{}#{}", macs.url, macs.signer), "m9").unwrap();
+    let req9 = Device::open(&m9)
+        .unwrap()
+        .unwrap()
+        .request(trust.network, trust.authority)
+        .unwrap();
+    let rec9 = req9.binding().recipient();
+    let mut pre_wrapped_m9 = base_log.clone();
+    let id22_early = read_identity(m22).unwrap().unwrap();
+    let opened_early = pre_wrapped_m9
+        .open_audience_entries(&id22_early)
+        .unwrap()
+        .unwrap();
+    let ep_commons_1 = opened_early.maximal_epochs[&EpochAudience::Commons][0];
+    let key_commons_1 = opened_early.unwrapped_keys[&ep_commons_1].clone();
+    let wrap9_1 = b22
+        .device()
+        .with_seed(|seed22| {
+            pre_wrapped_m9
+                .draft_wrap(&actor22, 300, ep_commons_1, &key_commons_1, rec9)
+                .unwrap()
+                .sign(seed22, inc22)
+        })
+        .unwrap();
+    pre_wrapped_m9.insert(wrap9_1).unwrap();
+    let (ep_commons_2, key_commons_2) = b22.device().with_seed(|seed22| {
+        let (draft, key) = pre_wrapped_m9
+            .draft_epoch(&actor22, 301, EpochAudience::Commons, 50)
+            .unwrap();
+        (draft.sign(seed22, inc22).unwrap(), key)
+    });
+    let ep_commons_2_id = *ep_commons_2.id();
+    pre_wrapped_m9.insert(ep_commons_2).unwrap();
+    let wrap22_2 = b22
+        .device()
+        .with_seed(|seed22| {
+            pre_wrapped_m9
+                .draft_wrap(
+                    &actor22,
+                    302,
+                    ep_commons_2_id,
+                    &key_commons_2,
+                    id22_early.recipient(),
+                )
+                .unwrap()
+                .sign(seed22, inc22)
+        })
+        .unwrap();
+    pre_wrapped_m9.insert(wrap22_2).unwrap();
+    let admit9 = b22
+        .device()
+        .with_seed(|seed22| {
+            pre_wrapped_m9
+                .draft(
+                    &actor22,
+                    303,
+                    Body::Admit {
+                        entrant: Entrant {
+                            request: req9.clone(),
+                            node_key: [0x99; 32],
+                            name: "m9".to_owned(),
+                            label: "m9".to_owned(),
+                        },
+                        evidence: Evidence::Manual,
+                    },
+                )
+                .sign(seed22, inc22)
+        })
+        .unwrap();
+    pre_wrapped_m9.insert(admit9).unwrap();
+    let wrap9_2 = b22
+        .device()
+        .with_seed(|seed22| {
+            pre_wrapped_m9
+                .draft_wrap(&actor22, 304, ep_commons_2_id, &key_commons_2, rec9)
+                .unwrap()
+                .sign(seed22, inc22)
+        })
+        .unwrap();
+    pre_wrapped_m9.insert(wrap9_2).unwrap();
+    let ctrl_plain = opened_early.commons_control.as_ref().unwrap();
+    let put_commons_2 = b22
+        .device()
+        .with_seed(|seed22| {
+            pre_wrapped_m9
+                .draft_commons_put(
+                    &actor22,
+                    305,
+                    ep_commons_2_id,
+                    &key_commons_2,
+                    ctrl_plain.as_slice(),
+                )
+                .unwrap()
+                .sign(seed22, inc22)
+        })
+        .unwrap();
+    pre_wrapped_m9.insert(put_commons_2).unwrap();
+    save_records(
+        &m9,
+        &encode_records(&pre_wrapped_m9.records().cloned().collect::<Vec<_>>()),
+    )
+    .unwrap();
+    let witness9_wire = Bootstrap::required(&m9)
+        .unwrap()
+        .log_witness()
+        .unwrap()
+        .expect("m9 log witness");
+    let decoded9 = crate::membership_log::decode_records(&witness9_wire).unwrap();
+    let mut iter9 = decoded9.into_iter();
+    let mut verify_log9 = Log::new(iter9.next().unwrap()).unwrap();
+    for r in iter9 {
+        verify_log9.insert(r).unwrap();
+    }
+    assert!(verify_log9.has_historical_seat(req9.binding()));
+    assert!(!verify_log9.audience_left_out(&EpochAudience::Commons, &req9.binding().actor()));
+    assert!(!verify_log9.audience_left_out_recipient(&EpochAudience::Commons, &rec9));
 
     // Verify `overlay_log_onto_document` adds a log-admitted member under `member.name` ("b3")
     // before falling back to `member.label` ("m8").
@@ -2624,7 +2769,7 @@ fn configured_log_member_observation_is_stable_across_peer_records_and_concurren
 
 /// A Mac that has never been in the vault at `root/<name>`, its self-signed request for the
 /// Commons network `member` belongs to, and `member`'s Allow of it (synthetic keys).
-fn newcomer(
+pub(super) fn newcomer(
     root: &Path,
     member: &Paths,
     name: &str,
@@ -2652,7 +2797,7 @@ fn newcomer(
 
 /// What `member`'s desk hands the Mac `request` names after a person's Allow and the phrase:
 /// [`hand_over`], as the window's desk runs it.
-fn hand(
+pub(super) fn hand(
     member: &Paths,
     request: &crate::commons::binding::Request,
     allowed: &crate::members::Allowed,
@@ -2662,10 +2807,11 @@ fn hand(
         member,
         &crate::members::desk::Handing {
             request,
-            node: [0x40; 32],
+            node: request.binding().recipient().0,
             name: allowed.name(),
             allowed,
             reads_log,
+            restore: false,
         },
     )
     .expect("hand over");
@@ -2914,7 +3060,7 @@ fn a_lan_and_a_laptop_each_admit_a_mac_and_both_stay_in_after_the_heal() {
 
 /// `member`'s desk running [`hand_over`] for the Mac `request` names, as the window's does,
 /// returning its result rather than a bundle.
-fn hand_result(
+pub(super) fn hand_result(
     member: &Paths,
     request: &crate::commons::binding::Request,
     allowed: &crate::members::Allowed,
@@ -2924,10 +3070,11 @@ fn hand_result(
         member,
         &crate::members::desk::Handing {
             request,
-            node: [0x40; 32],
+            node: request.binding().recipient().0,
             name: allowed.name(),
             allowed,
             reads_log,
+            restore: false,
         },
     )
 }
@@ -2997,9 +3144,22 @@ fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
         .expect("an Allow of a removed Mac's machine key");
     assert!(error.to_string().contains("removed"), "{error}");
 
-    // Another Mac is still let in.
+    // Another Mac, with a fleet node key of its own (`hand`'s is m40's, which the removal keeps
+    // out), is still let in.
     let (_, request3, allowed3) = newcomer(macs.root.path(), m7, "m41");
-    assert!(hand(m7, &request3, &allowed3, true).1);
+    let handout = hand_over(
+        m7,
+        &crate::members::desk::Handing {
+            request: &request3,
+            node: [0x41; 32],
+            name: allowed3.name(),
+            allowed: &allowed3,
+            reads_log: true,
+            restore: false,
+        },
+    )
+    .expect("hand over m41");
+    assert!(handout.logged);
 
     macs.server.stop();
     drop(macs.root);
@@ -3724,6 +3884,21 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
     // and pass `check_log_commons_enrollment`.
     assert!(log_initial.wraps_maximal_audience_to(&EpochAudience::Commons, &m7_rec));
     assert!(log_initial.wraps_maximal_audience_to(&EpochAudience::Commons, &m9_rec));
+    let id7 = read_identity(&m7).unwrap().unwrap();
+    let id9 = read_identity(&m9).unwrap().unwrap();
+    let id_v1 = read_identity(&v1).unwrap().unwrap();
+    assert!(
+        log_initial.open_commons_control(&id7).unwrap().is_some(),
+        "unproved founder m7 wrapped in Commons must open commons control from log"
+    );
+    assert!(
+        log_initial.open_commons_control(&id9).unwrap().is_some(),
+        "unproved founder m9 wrapped in Commons must open commons control from log"
+    );
+    assert!(
+        log_initial.open_commons_control(&id_v1).unwrap().is_none(),
+        "vault-only founder v1 must not open commons control from log"
+    );
     check_log_commons_enrollment(&m22, trust, req7.binding()).expect("m7 eligible");
     check_log_commons_enrollment(&m22, trust, req9.binding()).expect("m9 eligible");
 
@@ -3764,19 +3939,44 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
     assert!(log_after_retire.wraps_maximal_audience_to(&EpochAudience::Commons, &m9_rec));
     assert!(log_after_retire.wraps_maximal_audience_to(&EpochAudience::Everyone, &m9_rec));
     assert!(
+        log_after_retire
+            .open_commons_control(&id7)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        log_after_retire
+            .open_commons_control(&id9)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
         check_log_commons_enrollment(&m22, trust, req7.binding()).is_err(),
         "retired unproved founder m7 must be barred from Commons enrollment"
     );
     check_log_commons_enrollment(&m22, trust, req9.binding()).expect("m9 still eligible");
 
     // Revoking unproved founder `m9` via `admin_revoke` rotates `EpochAudience::Commons` away from
-    // `m9` and bars `m9` from Commons enrollment.
+    // `m9` and bars `m9` from Commons enrollment, while keeping previously retired `m7` out of
+    // `commons_eligibility`, `EpochAudience::Commons`, and `EpochAudience::Everyone`.
     let admin = admin_open(&m22).unwrap();
+    assert!(
+        !admin.commons_eligibility.includes("m7", m7_rec),
+        "overlay_log_onto_document must not restore retired unproved founder m7 into commons_eligibility"
+    );
     let revoked_m9 = admin_revoke(&m22, &admin, "m9", false).expect("revoke unproved m9");
     assert!(revoked_m9.retirement.is_some());
     let log_after_revoke = load_records(&m22).unwrap().log().unwrap().clone();
+    assert!(!log_after_revoke.wraps_maximal_audience_to(&EpochAudience::Commons, &m7_rec));
+    assert!(!log_after_revoke.wraps_maximal_audience_to(&EpochAudience::Everyone, &m7_rec));
     assert!(!log_after_revoke.wraps_maximal_audience_to(&EpochAudience::Commons, &m9_rec));
     assert!(!log_after_revoke.wraps_maximal_audience_to(&EpochAudience::Everyone, &m9_rec));
+    assert!(
+        log_after_revoke
+            .open_commons_control(&id9)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         check_log_commons_enrollment(&m22, trust, req9.binding()).is_err(),
         "revoked unproved founder m9 must be barred from Commons enrollment"
@@ -3814,6 +4014,7 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
         !merged_retire.wraps_maximal_audience_to(&EpochAudience::Commons, &m7_rec),
         "concurrent non-retiring epoch must not undo unproved founder m7's retirement"
     );
+    assert!(merged_retire.open_commons_control(&id7).unwrap().is_none());
     assert!(merged_retire.wraps_maximal_audience_to(&EpochAudience::Commons, &m9_rec));
 
     // Post-Genesis approved machine `p1` (added via `admin_publish_approved` after Genesis v2, so
@@ -3830,10 +4031,10 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
         admin_publish_approved(&m22, &admin, &doc, std::slice::from_ref(&p1_str)).unwrap();
     }
     join_host(&p1, &pinned, "p1");
-    let req_p1 = Device::open(&p1)
-        .unwrap()
-        .unwrap()
-        .request(trust.network, trust.authority)
+    let id_p1 = read_identity(&p1).unwrap().unwrap();
+    let req_p1 = Bootstrap::required(&p1)
+        .expect("post-genesis p1 observes Commons control from log before enrolling")
+        .request()
         .unwrap();
     check_log_commons_enrollment(&m22, trust, req_p1.binding()).expect("post-genesis p1 eligible");
     let admin = admin_open(&m22).unwrap();
@@ -3843,6 +4044,7 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
     let log_after_p1 = load_records(&m22).unwrap().log().unwrap().clone();
     assert!(!log_after_p1.wraps_maximal_audience_to(&EpochAudience::Commons, &p1_rec));
     assert!(!log_after_p1.wraps_maximal_audience_to(&EpochAudience::Everyone, &p1_rec));
+    assert!(log_after_p1.open_commons_control(&id_p1).unwrap().is_none());
     assert!(
         check_log_commons_enrollment(&m22, trust, req_p1.binding()).is_err(),
         "retired post-genesis machine p1 must be barred from Commons enrollment"
@@ -4185,6 +4387,7 @@ fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound(
                 name: allowed.name(),
                 allowed: &allowed,
                 reads_log: true,
+                restore: false,
             },
         );
         let _ = tx.send(handed.map(|handout| handout.logged));
@@ -4206,6 +4409,8 @@ fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound(
 #[test]
 fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over_to_higher_seq_peer()
  {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let (m40, request, allowed) = newcomer(macs.root.path(), m7, "m40");
@@ -4437,10 +4642,16 @@ fn code_only_log_member_is_removed_on_admin_publish_and_not_rewrapped_by_commons
     // `observe_commons` on the log-only path reports `Unavailable::Revoked`.
     sync_records(&m40, None).expect("m40 pulls records");
     assert!(load_state(&m40).unwrap().digest.is_none());
+    let cfg40 = config(&m40).unwrap().unwrap();
     assert!(matches!(
         observe_commons(&m40).unwrap(),
         crate::commons::Observation::Unavailable(crate::commons::Unavailable::Revoked)
     ));
+    assert!(matches!(
+        observe_materialization(&m40, &cfg40, || Ok(())).unwrap(),
+        MaterializationObservation::Blocked(MaterializationBlocker::Revoked)
+    ));
+    assert!(!materialization_ready(&m40).unwrap());
 
     // And a full sync marks m40 Revoked, blocks materialization readiness, and never decrypts
     // `everyone-v2`.
@@ -4728,6 +4939,10 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
             &m7_recipient
         ),
         "admit_by_phrase and admit_member_in_log must not wrap Commons back to Commons-left-out m7"
+    );
+    assert!(
+        reconcile_commons_log(m22, true).unwrap().is_empty(),
+        "reconcile_commons_log must be a clean no-op when Commons-left-out m7 is already wrapped in Everyone"
     );
 
     let (m8, req8, _) = newcomer(macs.root.path(), m22, "m8");
@@ -5142,14 +5357,30 @@ fn reconcile_returns_while_the_vault_source_holds_its_post() {
     assert!(!minted.is_empty(), "the reconcile minted nothing");
     assert_eq!(body, encode_records(&minted));
 
-    // When `StateLock` is held by another local writer, `reconcile_commons_log` yields `Ok(vec![])`
-    // within its 2 s lock bound instead of blocking the Commons exchange indefinitely.
+    // When `StateLock` is held by another local writer, `reconcile_commons_log` and
+    // `publish_local_node_key` yield within their 2 s lock bound instead of blocking the Commons
+    // exchange or fleet listener watch loop indefinitely.
     {
         let _held = StateLock::take(m7).expect("hold m7 StateLock");
         let yielded = reconcile_commons_log(m7, true).expect("reconcile under held StateLock");
         assert!(
             yielded.is_empty(),
             "reconcile_commons_log must yield empty when StateLock is held past its bound"
+        );
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+        let node_pair = Ed25519KeyPair::from_seed_unchecked(&[0x77; 32]).unwrap();
+        let node_pub: [u8; 32] = node_pair.public_key().as_ref().try_into().unwrap();
+        let node_yielded = publish_local_node_key(m7, node_pub, |network, actor| {
+            node_pair
+                .sign(&crate::membership_log::node_proof_message(network, actor))
+                .as_ref()
+                .try_into()
+                .unwrap()
+        })
+        .expect("publish node key");
+        assert!(
+            node_yielded.is_none(),
+            "publish_local_node_key must yield None when StateLock is held past its bound"
         );
     }
 
@@ -5341,11 +5572,54 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         b"for-m50-only"
     );
 
+    // `prepare_account_decision` on `m22` and `read_account_bound_entry` on log-only `m50` both
+    // accept a `SecretRef` naming the prior genesis signer in `config.followed`.
+    let admin = admin_open(m22).unwrap();
+    let genesis_signer = admin.config.followed[0];
+    let (boot22, journal22) =
+        Bootstrap::required_with_journal_until(m22, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    let account_rec = admin
+        .prepare_account_decision(
+            &boot22,
+            &journal22,
+            crate::commons::accounts::Request {
+                account: [0x11; 32],
+                generation: 1,
+                parents: Vec::new(),
+                action: crate::commons::accounts::Action::Prepare(Box::new(
+                    crate::commons::accounts::Preparation {
+                        table: [0x22; 32],
+                        key: "acct-m50".to_owned(),
+                        proposal: [0x33; 32],
+                        configuration: [0x44; 32],
+                        provider: "claude".to_owned(),
+                        method: "oauth".to_owned(),
+                        device: request50.binding().clone(),
+                        secret: Some(crate::commons::accounts::SecretRef {
+                            vault: admin.config.name.clone(),
+                            signer: genesis_signer,
+                            entry: "host_secret".to_owned(),
+                        }),
+                    },
+                )),
+            },
+        )
+        .expect("prepare_account_decision with followed signer");
+    drop(journal22);
+    assert_eq!(
+        read_account_bound_entry(&m50, &cfg50, &account_rec)
+            .unwrap()
+            .expect("read_account_bound_entry on log-only m50")
+            .value()
+            .as_slice(),
+        b"for-m50-only"
+    );
+
     // 4. `machine_named_in_vault` resolves log label `"m23"` to `"andrews-macbook"`, and revoking
     //    `m50` by its log label `"m23"` (`admin_revoke_stolen`) resolves `"m23"` to
     //    `"andrews-macbook"`, adds `"m23"` and its `node_key` to `aterm-swarm-roster`'s deny-lists,
     //    strips `"m23"` from `ai-pool.toml`, and names `"m23"` in `needs_you_line`.
-    let admin = admin_open(m22).unwrap();
     assert_eq!(
         machine_named_in_vault(m22, &admin, "m23").unwrap(),
         "andrews-macbook"
@@ -5361,7 +5635,11 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         .unwrap()
         .expect("roster after revoke");
     assert!(roster.deny_labels.contains(&"m23".to_owned()));
-    assert!(roster.deny_nodes.contains(&hex(&[0x40; 32])));
+    assert!(
+        roster
+            .deny_nodes
+            .contains(&hex(&request50.binding().recipient().0))
+    );
     let pool_text = std::str::from_utf8(
         admin
             .published_doc
@@ -5454,6 +5732,45 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     )
     .unwrap();
     assert!(!pool_text.contains("\"m60\""), "{pool_text}");
+
+    // 7. When an envelope member's recipient (`m7`) is excluded from `EpochAudience::Everyone`
+    //    via `retire_recipients_in_log_local` without a `Body::Remove` record (as in a half-done
+    //    revoke of an unproved founder), `observe_commons` on `m7` must report
+    //    `Observation::Unavailable(Unavailable::Revoked)` rather than falling back to decrypting
+    //    the cached envelope's locker.
+    let m7_rec = read_identity(m7).unwrap().unwrap().recipient();
+    log_entries::retire_recipients_in_log_local(m22, &[], &BTreeSet::from([m7_rec])).unwrap();
+    save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
+    let obs = observe_commons(m7).unwrap();
+    assert!(
+        matches!(
+            obs,
+            crate::commons::Observation::Unavailable(crate::commons::Unavailable::Revoked)
+        ),
+        "m7 excluded from [everyone] must report Revoked in observe_commons, got {obs:?}"
+    );
+    envelope::TEST_RETIRED.with(|cell| {
+        *cell.borrow_mut() = Some(Retired {
+            keys: Vec::new(),
+            current: Some(rotated_signer),
+        });
+    });
+    let check_m7 = steward_revoke_check(m22).unwrap();
+    let finish_m7 = steward_finish_revokes(m22).unwrap();
+    envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
+    assert!(
+        matches!(check_m7, StewardRevoke::Due { .. }),
+        "steward_revoke_check must detect [everyone]-excluded m7, got {check_m7:?}"
+    );
+    assert!(
+        matches!(finish_m7, StewardRevoke::Done(_)),
+        "steward_finish_revokes must clean up [everyone]-excluded m7, got {finish_m7:?}"
+    );
+    let admin = admin_open(m22).unwrap();
+    let roster = crate::swarm_roster::SwarmRoster::from_document(&admin.published_doc)
+        .unwrap()
+        .expect("roster after m7 steward_finish_revokes");
+    assert!(roster.deny_labels.contains(&"m7".to_owned()));
 
     macs.server.stop();
 }

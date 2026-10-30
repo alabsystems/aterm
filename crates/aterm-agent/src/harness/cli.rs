@@ -430,6 +430,8 @@ LIMIT RESET (`[harness] limit_reset = true`, default false):
 const HELP_ACCOUNTS_VERBS: &str = "\n\
 VERBS:
   - `accounts table [--cli <id>|all] [--json]`
+    Includes retained Commons proposals and imported source candidates, with source
+    provenance and explicit provider markers. Unknown authentication methods stay pending.
     Reads the shared source table and local rosters: active, pending and local labels,
     preferred machines, class, region/flow and login readiness. Empty pools are
     `needs-source`; source membership alone is not a working login. Prints no email
@@ -709,10 +711,16 @@ MODES:
     long with it) waits for the shell to come back (`wait:shell-moved`).
     If someone else resumes the conversation in the tab first, the round closes as
     theirs (`done:resumed-by-another`; `failed:resumed-by-another` when they resumed an
-    older build) and nothing is typed. Two things can still be typed: a tasked session
+    older build) and nothing is typed. Three things can still be typed: a tasked session
     whose resumed build says something it ran did not come back gets one line asking it
-    to restore what it relies on (`continued:restore`), and a job the supervisor is
-    continuing gets its next continuation in the resumed session.
+    to restore what it relies on (`continued:restore`); a job the supervisor is
+    continuing gets its next continuation in the resumed session; and a session under
+    Autopilot Cruise or Land whose own work has held the move 1h at the land rung with
+    nobody at the tab is told, at a break or an idle point, what waits and, where the tab
+    offers it and the build is proved to start, that `aterm ctl @self restart` moves it
+    sooner (`told:<why>`; at most 3 times per build and agent process, 2h apart; only about
+    a newer build and where the move can be planned; never past a landed task; it asks and
+    ends nothing).
   - Cooperative mode (`[harness] upgrade_ask = true`): types a readiness notice asking the
     agent to finish background work and confirm. It repeats every 30m, up to 4 notices,
     then rests 2h (then 4h, 8h, and 24h from the fourth unanswered round in a row) and
@@ -765,6 +773,8 @@ const HELP_UPGRADE_STATUS: &str = "\
     `relaunch-stuck`, `hung-exit`, `harness-stuck`, `no-progress`, `no-terminal`,
     `build-fails`, `refused-launch`, `repeating-stop`, `suspended`, `typed-draft`,
     `limit-passed`, `unwatched`, `own-work`, or `-`), and fence refusals (`<n>/<span>`).
+  - `agent_told=`: the quiet tells typed to the agent about this target (`<n>/3@<age>`, or
+    `-`); `--json` has `agent_tells` and `agent_told_at`.
   - `--json` adds `attention` (`quiet`, `fault`, `digest`, `interrupt`), `attention_kind`,
     `cause`, `cause_words`, and `waits` (last 24 wait transitions).
 ";
@@ -2066,6 +2076,18 @@ fn run_accounts_all(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let catalog = super::account_catalog::read(env.home.as_deref());
+    run_accounts_all_with_catalog(json, env, host, catalog, out, err)
+}
+
+fn run_accounts_all_with_catalog(
+    json: bool,
+    env: &Env,
+    host: &dyn AccountsHost,
+    catalog: Option<Result<super::account_catalog::Catalog, String>>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let mut fallback = None;
     let kept: Vec<_> = Cli::ALL
         .into_iter()
@@ -2081,6 +2103,12 @@ fn run_accounts_all(
             if records
                 .as_ref()
                 .is_ok_and(|records| !records.roster_present)
+                && !catalog.as_ref().is_some_and(|catalog| {
+                    catalog.as_ref().is_ok_and(|catalog| {
+                        catalog.rows.iter().any(|row| row.belongs_to(cli))
+                            || (cli == Cli::Claude && !catalog.rows.is_empty())
+                    })
+                })
             {
                 if cli == Cli::Claude {
                     fallback = Some((path, records));
@@ -2092,12 +2120,12 @@ fn run_accounts_all(
         .collect();
     if kept.is_empty() {
         if let Some((path, records)) = fallback {
-            return run_accounts_report_snapshot(
+            return run_accounts_report_snapshot_with_catalog(
                 (Cli::Claude, Launch::default()),
                 env,
                 json,
-                &path,
-                records,
+                (&path, records),
+                catalog.as_ref(),
                 out,
                 err,
             );
@@ -2109,12 +2137,12 @@ fn run_accounts_all(
     for (cli, path, records) in kept {
         let mut report = Vec::new();
         let program = report_program(cli, host);
-        let ran = run_accounts_report_snapshot(
+        let ran = run_accounts_report_snapshot_with_catalog(
             (cli, Launch::of(program.as_deref(), host)),
             env,
             json,
-            &path,
-            records,
+            (&path, records),
+            None,
             &mut report,
             err,
         );
@@ -2132,11 +2160,18 @@ fn run_accounts_all(
         }
     }
     if json {
-        let _ = writeln!(
-            out,
-            "{}",
-            aterm_json::to_string(&aterm_json::json!({"pools": pools})).unwrap_or_default()
-        );
+        let mut value = aterm_json::json!({"pools":pools});
+        if let Some(catalog) = &catalog
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert(
+                "shared_catalog".into(),
+                super::account_catalog::report_all(catalog),
+            );
+        }
+        let _ = writeln!(out, "{}", aterm_json::to_string(&value).unwrap_or_default());
+    } else if let Some(catalog) = &catalog {
+        let _ = write!(out, "{}", super::account_catalog::text_all(catalog));
     }
     code
 }
@@ -2285,34 +2320,34 @@ fn run_accounts_source_table(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let catalog = super::account_catalog::read(env.home.as_deref());
+    run_accounts_source_table_with_catalog(cli, env, json, catalog.as_ref(), out, err)
+}
+
+fn run_accounts_source_table_with_catalog(
+    cli: Option<Cli>,
+    env: &Env,
+    json: bool,
+    catalog: Option<&Result<super::account_catalog::Catalog, String>>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let mut shared = Vec::new();
+    let mut shared_text = String::new();
     let mut tables = Vec::new();
     let mut text = Vec::new();
     for current in cli.map_or_else(|| Cli::ALL.to_vec(), |cli| vec![cli]) {
+        let local = local_source_table(env, current);
+        if let Some(catalog) = catalog {
+            let roster = local
+                .as_ref()
+                .filter(|local| local.error.is_none())
+                .map(|local| &local.records.roster);
+            shared.push(aterm_json::json!({"cli":current.id(), "catalog":super::account_catalog::report(catalog, current, roster)}));
+            shared_text.push_str(&super::account_catalog::text(catalog, current, roster));
+        }
         match super::accounts_sync::account_source_table(current, env, None) {
             Ok(fleet) => {
-                let local = env.accounts_roster_for(current).and_then(|path| {
-                    let store = env.accounts_store_for(current)?;
-                    let (records, error) = match store.read_account_records(Some(&path), env.now) {
-                        Ok(records) => (records, None),
-                        Err(why) => (
-                            accounts::AccountRecords::default(),
-                            Some(match why {
-                                accounts::RosterReadError::Roster(why)
-                                | accounts::RosterReadError::Records(why) => why,
-                            }),
-                        ),
-                    };
-                    Some(LocalSourceTable {
-                        records,
-                        machine: super::accounts_sync::detect_machine_id(
-                            None,
-                            env.config.as_deref(),
-                        ),
-                        now: env.now,
-                        error,
-                        home: env.home.clone(),
-                    })
-                });
                 let (table, rows) = source_table_rows(current, &fleet, local);
                 let source = fleet.roster.source.clone();
                 tables.push(table);
@@ -2322,6 +2357,13 @@ fn run_accounts_source_table(
                 );
             }
             Err(why) if cli.is_none() && why.starts_with("no source table") => {}
+            Err(why)
+                if why.starts_with("no source table")
+                    && catalog.is_some_and(|catalog| {
+                        catalog.as_ref().is_ok_and(|catalog| {
+                            catalog.rows.iter().any(|row| row.belongs_to(current))
+                        })
+                    }) => {}
             Err(why) => {
                 let _ = writeln!(err, "aterm harness accounts table: {why}");
                 return ExitCode::from(1);
@@ -2329,16 +2371,23 @@ fn run_accounts_source_table(
         }
     }
     if json {
-        let _ = writeln!(
-            out,
-            "{}",
-            aterm_json::to_string(&aterm_json::json!({
-                "kind": "account-source-table",
-                "schema": 1,
-                "pools": tables,
-            }))
-            .unwrap_or_default()
-        );
+        let mut value = aterm_json::json!({
+            "kind":"account-source-table", "schema":1, "pools":tables,
+        });
+        if catalog.is_some()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("shared_accounts".into(), Value::Array(shared));
+            if cli.is_none()
+                && let Some(catalog) = catalog
+            {
+                object.insert(
+                    "shared_catalog".into(),
+                    super::account_catalog::report_all(catalog),
+                );
+            }
+        }
+        let _ = writeln!(out, "{}", aterm_json::to_string(&value).unwrap_or_default());
     } else {
         let _ = writeln!(
             out,
@@ -2358,8 +2407,37 @@ fn run_accounts_source_table(
             );
             let _ = writeln!(out, "  source: {source}");
         }
+        if cli.is_none()
+            && let Some(catalog) = catalog
+        {
+            let _ = write!(out, "{}", super::account_catalog::text_all(catalog));
+        } else {
+            let _ = write!(out, "{shared_text}");
+        }
     }
     ExitCode::SUCCESS
+}
+
+fn local_source_table(env: &Env, cli: Cli) -> Option<LocalSourceTable> {
+    let path = env.accounts_roster_for(cli)?;
+    let store = env.accounts_store_for(cli)?;
+    let (records, error) = match store.read_account_records(Some(&path), env.now) {
+        Ok(records) => (records, None),
+        Err(why) => (
+            accounts::AccountRecords::default(),
+            Some(match why {
+                accounts::RosterReadError::Roster(why)
+                | accounts::RosterReadError::Records(why) => why,
+            }),
+        ),
+    };
+    Some(LocalSourceTable {
+        records,
+        machine: super::accounts_sync::detect_machine_id(None, env.config.as_deref()),
+        now: env.now,
+        error,
+        home: env.home.clone(),
+    })
 }
 
 /// The `accounts` command for `form` under `--cli` (`pool`), `--region` and `--flow`: Claude Code's pool (no `--cli`, or `--cli claude`) is [`Cmd::Accounts`], as it always was; another is [`Cmd::AccountsOf`].
@@ -4310,6 +4388,30 @@ pub fn disk_tick(
     remove: &mut disk::Remove<'_>,
     measure: &mut disk::Measure<'_>,
 ) -> DiskTick {
+    disk_tick_with(look, config, remove, measure, None)
+}
+
+/// An automatic watch's pass, advancing its discovery selection across looks. Explicitly
+/// named targets use the unchanged stateless discovery order, and the cursor adds no removal
+/// authority.
+#[must_use]
+pub fn disk_tick_paged(
+    look: &DiskLook<'_>,
+    config: disk::Config,
+    remove: &mut disk::Remove<'_>,
+    measure: &mut disk::Measure<'_>,
+    cursor: &mut disk::discover::Cursor,
+) -> DiskTick {
+    disk_tick_with(look, config, remove, measure, Some(cursor))
+}
+
+fn disk_tick_with(
+    look: &DiskLook<'_>,
+    config: disk::Config,
+    remove: &mut disk::Remove<'_>,
+    measure: &mut disk::Measure<'_>,
+    mut cursor: Option<&mut disk::discover::Cursor>,
+) -> DiskTick {
     let DiskLook {
         state,
         volume,
@@ -4330,11 +4432,37 @@ pub fn disk_tick(
         && free.is_some()
         && (config.below_warn(free) || demand.is_some() || projected.is_some());
     if !admitted {
+        if let Some(cursor) = cursor {
+            cursor.reset_cycle();
+        }
         return DiskTick::Plenty;
+    }
+    let paged = targets.is_empty() && discover.is_some() && cursor.is_some();
+    if let Some(cursor) = cursor.as_deref_mut() {
+        if paged {
+            cursor.scope(&(
+                state,
+                volume,
+                config,
+                demand,
+                projected.is_some(),
+                config.pressed(free, projected.as_ref()),
+                session_cwds,
+                session_cwd_unknown,
+                link_dirs,
+            ));
+        } else {
+            cursor.reset_cycle();
+        }
     }
     let _exposed = disk::discover::expose_placeholders().ok();
     let found = discover.map_or_else(disk::discover::Discovered::default, |r| {
-        disk::discover::discover(r, disk::discover::Budget::SHIPPED)
+        match cursor.as_deref_mut() {
+            Some(cursor) if targets.is_empty() => {
+                disk::discover::discover_page(r, disk::discover::Budget::SHIPPED, cursor)
+            }
+            _ => disk::discover::discover(r, disk::discover::Budget::SHIPPED),
+        }
     });
     let unfinished = found.cut.clone();
     let paths: Vec<PathBuf> = found.found.iter().map(|f| f.path.clone()).collect();
@@ -4373,6 +4501,11 @@ pub fn disk_tick(
     let mut survey = disk::scan(&roots, now, disk::Trigger::Tick, config, free);
     survey.room = room;
     let rep = disk::report(&survey, config);
+    let unfinished = if rep.assessment_complete {
+        unfinished
+    } else {
+        Some("the target assessment or recent-profile plan was cut short".to_owned())
+    };
     let path = state.join(DISK_LEDGER);
     let mut sink = io::sink();
     let mut journal = if std::fs::create_dir_all(state).is_ok() {
@@ -4382,7 +4515,7 @@ pub fn disk_tick(
         Journal::off()
     };
     journal.append_raw(&disk::report_row(now, "", &rep), &mut sink);
-    let done = disk::apply_auto(
+    let applied = disk::apply_auto(
         &rep,
         survey.transcripts_root.as_deref(),
         remove,
@@ -4391,8 +4524,19 @@ pub fn disk_tick(
             disk::beat::beat();
             journal.append_raw(&disk::step_row(now, "", step), &mut io::sink())
         },
-    )
-    .unwrap_or_default();
+    );
+    let exhausted =
+        rep.assessment_complete && applied.as_ref().is_some_and(|done| done.stops.is_empty());
+    let complete = paged && cursor.is_some_and(|cursor| cursor.finish_page(exhausted));
+    let done = applied.unwrap_or_default();
+    let unfinished = if complete {
+        None
+    } else if paged {
+        unfinished
+            .or_else(|| Some("the automatic cache selection cycle has not exhausted".to_owned()))
+    } else {
+        unfinished
+    };
     let done = disk::Applied { unfinished, ..done };
     let there = |p: &Path| {
         !std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
@@ -5342,23 +5486,12 @@ pub(super) fn read_complete_text(path: &Path, cap: u64) -> io::Result<String> {
 
 /// Replace the ledger at `path` with `rows` as [`bound_ledger`] does: written to a sibling `.tmp` file (`0600`), ordered and renamed over it, so a reader sees the old file or the new one and never half of either.
 pub fn replace_ledger_rows(path: &Path, rows: &[String]) -> io::Result<()> {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    let tmp = path.with_file_name(name);
-    let mut o = std::fs::OpenOptions::new();
-    o.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let mut f = io::BufWriter::new(o.open(&tmp)?);
+    let mut body = String::new();
     for row in rows {
-        f.write_all(row.as_bytes())?;
-        f.write_all(b"\n")?;
+        body.push_str(row);
+        body.push('\n');
     }
-    aterm_durable::ordered(&f.into_inner().map_err(io::IntoInnerError::into_error)?)?;
-    std::fs::rename(&tmp, path)
+    super::upgrade_models::write_atomic_ordered(path, &body)
 }
 
 fn ledger_path(env: &Env, file: &LedgerFile) -> Result<PathBuf, String> {
@@ -5613,6 +5746,7 @@ fn run_upgrade_models(
         land: false,
         press: None,
         timings: super::Timings::for_build(),
+        tell: crate::harness::upgrade_drive::Tell::Off,
     };
     match set {
         Some(list) => match super::upgrade_drive::set_models(&opts, list) {
@@ -5693,6 +5827,7 @@ fn upgrade_opts(
         land: false,
         press: None,
         timings: super::Timings::for_build(),
+        tell: crate::harness::upgrade_drive::Tell::Off,
     })
 }
 
@@ -6232,7 +6367,9 @@ impl AccountsHost for LiveAccounts {
             .as_deref()
             .map(super::accounts_sync::resolve_claude_program)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        renew_flow_of(prog.as_os_str(), home, email, browser)
+        renew_flow_of(prog.as_os_str(), home, email, browser, &|name| {
+            std::env::var_os(name)
+        })
     }
 
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
@@ -6583,11 +6720,15 @@ pub(super) fn renew_command(
     cmd
 }
 
+/// A person's `accounts renew` sign-in of `email` into the staging home `home`, at the terminal:
+/// the mailbox and browser profile it may use are the ones `var` (the process's environment, in
+/// a run) and the harness's store name.
 fn renew_flow_of(
     program: &std::ffi::OsStr,
     home: &str,
     email: &str,
     browser: &RenewBrowser,
+    var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<i32, String> {
     terminal_flow(
         || {
@@ -6599,10 +6740,13 @@ fn renew_flow_of(
                 .and_then(Path::parent)
             {
                 let store = accounts::Store::at(harness_state);
-                let user_home = std::env::var_os("HOME").map(PathBuf::from);
-                if std::env::var_os(super::open_url::MAILBOX_ENV).is_none_or(|v| v.is_empty())
-                    && let Some(mailbox) =
-                        super::accounts_sync::resolve_mailbox_dir(user_home.as_deref(), &store)
+                let user_home = var("HOME").map(PathBuf::from);
+                if var(super::open_url::MAILBOX_ENV).is_none_or(|v| v.is_empty())
+                    && let Some(mailbox) = super::accounts_sync::resolve_mailbox_dir_with(
+                        var,
+                        user_home.as_deref(),
+                        &store,
+                    )
                 {
                     cmd.env(super::open_url::MAILBOX_ENV, mailbox);
                 }
@@ -6611,7 +6755,8 @@ fn renew_flow_of(
                     .and_then(|n| n.to_str())
                     .and_then(|s| s.rsplit_once('+').map(|(l, _)| l))
                     .unwrap_or("default");
-                let has_mailbox = super::accounts_sync::has_configured_mailbox_for_row(
+                let has_mailbox = super::accounts_sync::has_configured_mailbox_for_row_with(
+                    var,
                     user_home.as_deref(),
                     &store,
                     Some(label),
@@ -8613,7 +8758,10 @@ fn run_accounts_report(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if write_accounts_report(pool, env, json, out, err).is_some() {
+    if write_accounts_report(pool, env, json, out, err)
+        .local
+        .is_some()
+    {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -8631,12 +8779,65 @@ pub(super) struct ReportedAccounts {
     pub(super) enrolled: BTreeSet<String>,
 }
 
-/// Writes the account report and retains its admitted projection for another view.
-/// Returns `None` only when the required configuration or account read is unavailable;
-/// an empty or own-login-only text report still returns `Some` with an empty roster.
+/// One account-list observation, with local execution state and shared proposals.
+pub(super) struct AccountReport {
+    pub(super) local: Option<ReportedAccounts>,
+    pub(super) catalog: Option<Result<super::account_catalog::Catalog, String>>,
+}
+
+/// Writes shared account descriptions beside the local runtime observation.
+/// Either source remains readable when the other is unavailable. Shared descriptions
+/// never enter the executable local roster.
 /// `pool` is the CLI and, for Codex, the program a worker aterm starts runs here and whether it
 /// would start nothing ([`Launch`]), which narrow `next:` ([`accounts_next`]).
 pub(super) fn write_accounts_report(
+    (cli, launch): (Cli, Launch<'_>),
+    env: &Env,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> AccountReport {
+    let catalog = super::account_catalog::read(env.home.as_deref());
+    let mut local_out = Vec::new();
+    let local = write_local_accounts_report((cli, launch), env, json, &mut local_out, err);
+    write_combined_accounts_report(cli, json, &local_out, local.as_ref(), catalog.as_ref(), out);
+    AccountReport { local, catalog }
+}
+
+fn write_combined_accounts_report(
+    cli: Cli,
+    json: bool,
+    local_out: &[u8],
+    local: Option<&ReportedAccounts>,
+    catalog: Option<&Result<super::account_catalog::Catalog, String>>,
+    out: &mut dyn Write,
+) {
+    let Some(catalog) = catalog else {
+        let _ = out.write_all(local_out);
+        return;
+    };
+    let roster = local.map(|local| &local.roster);
+    if json {
+        let mut value: Value =
+            aterm_json::from_slice(local_out).unwrap_or_else(|_| Value::Object(Map::new()));
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "shared_accounts".into(),
+                super::account_catalog::report(catalog, cli, roster),
+            );
+        }
+        let _ = writeln!(out, "{value}");
+    } else {
+        let _ = out.write_all(local_out);
+        let _ = write!(
+            out,
+            "{}",
+            super::account_catalog::text(catalog, cli, roster)
+        );
+    }
+}
+
+fn write_local_accounts_report(
     (cli, launch): (Cli, Launch<'_>),
     env: &Env,
     json: bool,
@@ -8673,6 +8874,59 @@ pub(super) fn write_accounts_report(
     )
 }
 
+#[cfg(test)]
+mod shared_catalog_tests {
+    use super::*;
+    use crate::harness::account_catalog::{Account, Catalog};
+
+    #[test]
+    fn shared_accounts_are_reported_when_no_local_roster_can_be_read() {
+        let catalog = Ok(Catalog {
+            table: "table-one".into(),
+            history_complete: true,
+            rows: vec![Account {
+                key: "shared-one".into(),
+                operation: "operation-one".into(),
+                label: "Review me".into(),
+                provider: "anthropic".into(),
+                method: Some("oauth".into()),
+                email: Some("shared@example.test".into()),
+                realm: None,
+                secret_reference: true,
+                conflicted: false,
+                stopped: false,
+                import: None,
+            }],
+            ..Default::default()
+        });
+        let mut output = Vec::new();
+        let refused = accounts_refused_json(None, "no local roster", 1);
+        write_combined_accounts_report(
+            Cli::Claude,
+            true,
+            refused.as_bytes(),
+            None,
+            Some(&catalog),
+            &mut output,
+        );
+        let report: Value = aterm_json::from_slice(&output).unwrap();
+        assert_eq!(
+            report["shared_accounts"]["accounts"][0]["key"].as_str(),
+            Some("shared-one")
+        );
+        assert_eq!(
+            report["shared_accounts"]["accounts"][0]["local_label"],
+            Value::Null
+        );
+        assert_eq!(
+            report["shared_accounts"]["accounts"][0]["login_authority"].as_str(),
+            Some("none")
+        );
+        assert_eq!(report["refused"].as_str(), Some("no local roster"));
+    }
+}
+
+#[cfg(test)]
 fn run_accounts_report_snapshot(
     pool: (Cli, Launch<'_>),
     env: &Env,
@@ -8683,6 +8937,28 @@ fn run_accounts_report_snapshot(
     err: &mut dyn Write,
 ) -> ExitCode {
     if write_accounts_report_snapshot(pool, env, json, path, records, out, err).is_some() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_accounts_report_snapshot_with_catalog(
+    pool: (Cli, Launch<'_>),
+    env: &Env,
+    json: bool,
+    (path, records): (
+        &Path,
+        Result<accounts::AccountRecords, accounts::RosterReadError>,
+    ),
+    catalog: Option<&Result<super::account_catalog::Catalog, String>>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let mut local_out = Vec::new();
+    let local = write_accounts_report_snapshot(pool, env, json, path, records, &mut local_out, err);
+    write_combined_accounts_report(pool.0, json, &local_out, local.as_ref(), catalog, out);
+    if local.is_some() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -9875,6 +10151,8 @@ pub(crate) fn machine_entries(hosts: &[String]) -> Result<Vec<(String, String)>,
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Renewal {
     Renewed,
+    /// A different configured account was renewed; the requested account still needs sign-in.
+    OtherRenewed,
     AuthFailed,
     WrongAccount,
     Failed,
@@ -9895,6 +10173,11 @@ pub(super) enum Renewal {
 }
 
 impl Renewal {
+    /// A verified login was published and its directory must be retained.
+    pub(super) fn published(self) -> bool {
+        matches!(self, Self::Renewed | Self::OtherRenewed)
+    }
+
     pub(super) fn authentication_failed(code: Option<i32>) -> Self {
         // The terminal flow maps signals to 128 + signal; bounded captures
         // retain no exit code when a signal ended the child.
@@ -10242,6 +10525,9 @@ fn renew_one_guarded(
         &mut None,
         policy,
         |state, logins| {
+            if !accounts::login_made(&staging) {
+                return Err("staged Claude login disappeared before publication".into());
+            }
             let observed = host.claude_identity_in_home(
                 &staging_text,
                 row.expected_identity_email().unwrap_or(email),
@@ -12934,9 +13220,14 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
     let prices = spend::PriceTable::from_toml(spend::PRICES_TOML).ok();
     let folded = env.claude_dir().zip(prices.as_ref()).map(|(dir, prices)| {
         let mut spend = spend::Spend::new(&dir, prices);
+        let now_inst = std::time::Instant::now();
         let limits = spend::Limits {
             bytes: u64::MAX,
-            until: Some(std::time::Instant::now() + std::time::Duration::from_secs(STATS_FOLD_S)),
+            until: Some(
+                now_inst
+                    .checked_add(std::time::Duration::from_secs(STATS_FOLD_S))
+                    .unwrap_or(now_inst),
+            ),
         };
         let report = spend.fold_claude_home(prices, env.now, limits);
         (spend, report.complete())

@@ -194,6 +194,28 @@ pub fn secret_rules(home: Option<&Path>) -> Vec<crate::supervise::policy::approv
     rules
 }
 
+fn lexical_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir | Component::Prefix(_) | Component::ParentDir)
+                ) {
+                    out.pop();
+                } else if !path.is_absolute() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Returns whether repository-relative path `rel` under `root` matches `rules`.
 #[must_use]
 pub fn looks_secret(
@@ -202,13 +224,23 @@ pub fn looks_secret(
     rules: &[crate::supervise::policy::approval::SecretRule],
 ) -> bool {
     use crate::supervise::policy::approval::SecretRule;
-    let comps: Vec<String> = rel.split('/').map(str::to_ascii_lowercase).collect();
+    let comps: Vec<String> = rel
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let clean_root = lexical_clean(root);
+    let joined = lexical_clean(&clean_root.join(rel));
     rules.iter().any(|rule| match rule {
         SecretRule::Component(name) => comps.iter().any(|c| c.eq_ignore_ascii_case(name)),
         SecretRule::Basename(glob) => comps
             .last()
             .is_some_and(|c| crate::supervise::classify::glob_match(&glob.to_ascii_lowercase(), c)),
-        SecretRule::Under(place) => place.starts_with(root) && root.join(rel).starts_with(place),
+        SecretRule::Under(place) => {
+            let clean_place = lexical_clean(place);
+            (clean_place.starts_with(&clean_root) || !joined.starts_with(&clean_root))
+                && joined.starts_with(&clean_place)
+        }
     })
 }
 

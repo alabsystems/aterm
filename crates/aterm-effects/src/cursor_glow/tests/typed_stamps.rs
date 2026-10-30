@@ -29,6 +29,7 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
             hue: 0.5,
             cov_scale: 1.0,
             born: t1,
+            latch: ParticleLatch::FRESH,
             edge_cut: false,
         });
     }
@@ -43,6 +44,7 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
         hue: 0.5,
         cov_scale: 1.0,
         born: t1,
+        latch: ParticleLatch::FRESH,
         edge_cut: false,
     });
     let mut rewritten = row;

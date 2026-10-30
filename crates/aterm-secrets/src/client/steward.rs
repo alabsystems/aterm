@@ -100,7 +100,9 @@ pub enum StewardRevoke {
 }
 
 /// Read, writing nothing and fetching nothing, whether the locally applied ALab vault copy holds
-/// any half-done revoke cascade (`sync.steward.revoke` probe).
+/// any half-done revoke cascade (`sync.steward.revoke` probe), or, where the vault holds a log, a
+/// member's log removal not yet mirrored into the envelope `0.145` Macs read (F16: any member
+/// removes, and an admin's steward carries it into `[machines]`).
 ///
 /// # Errors
 /// A vault pass is applying on this Mac now, or local state, the signed copy, the admin locker,
@@ -136,16 +138,28 @@ pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
     let mut candidate = text.doc.clone();
     let mut log_removed_machines = Vec::new();
     let local_log = super::log_entries::trusted_local_log(paths, &config)?;
-    if let Some(log) = &local_log
-        && log.has_commons_epochs()
-    {
+    if let Some(log) = &local_log {
         let admins: BTreeSet<String> = candidate.admins().into_iter().collect();
         for machine in candidate.machines() {
             if admins.contains(&machine.name) && admins.len() <= 1 {
                 continue;
             }
             if let Ok(recipient) = Recipient::parse(&machine.recipient)
-                && log.recipient_is_removed(&recipient)
+                && (log.recipient_is_removed(&recipient)
+                    || log.audience_left_out_recipient(
+                        &crate::membership_log::EpochAudience::Everyone,
+                        &recipient,
+                    )
+                    || log.membership().members().values().any(|m| {
+                        m.binding.recipient() == recipient
+                            && m.node_key.is_some_and(|nk| {
+                                nk != [0; 32]
+                                    && matches!(
+                                        log.membership().node(&nk),
+                                        crate::membership_log::NodeStanding::Removed(_)
+                                    )
+                            })
+                    }))
                 && candidate.remove_machine(&machine.name, true) == Ok(true)
             {
                 log_removed_machines.push(machine.name);
@@ -245,17 +259,134 @@ fn local_observed_network_id(paths: &Paths) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+pub(super) fn member_is_denied_in_roster(
+    roster: &crate::swarm_roster::SwarmRoster,
+    member: &crate::swarm_roster::SwarmMember,
+) -> bool {
+    roster.is_label_denied(&member.label)
+        || member.aliases.iter().any(|a| roster.is_label_denied(a))
+        || member
+            .node_id
+            .as_deref()
+            .is_some_and(|n| roster.is_node_denied(n))
+        || member
+            .node_key
+            .as_deref()
+            .is_some_and(|k| roster.is_node_denied(k))
+}
+
+pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
+    let Some(identity) = read_identity(paths).ok().flatten() else {
+        return false;
+    };
+    let my_rec = identity.recipient();
+    let recipient = my_rec.to_bech32();
+    let cfg = super::config(paths).ok().flatten();
+    let local_log = cfg.as_ref().and_then(|c| {
+        super::log_entries::trusted_local_log(paths, c)
+            .ok()
+            .flatten()
+    });
+    if let (Some(c), Some(log)) = (&cfg, &local_log) {
+        if log.removes(&my_rec) {
+            return true;
+        }
+        let state = load_state(paths).ok();
+        let behind = state
+            .as_ref()
+            .and_then(|s| super::held_copy(paths, c, s))
+            .and_then(|bytes| envelope::parse(&bytes).ok())
+            .is_some_and(|env| {
+                super::log_entries::log_base(Some(log), &env, &identity).ok()
+                    == Some(super::log_entries::LogBase::Behind)
+            });
+        if !behind
+            && log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &my_rec,
+            )
+        {
+            return true;
+        }
+    }
+    let Some(r) = roster::swarm_roster(paths).ok().flatten() else {
+        return false;
+    };
+    if let Some(m) = r.member_by_recipient(&recipient)
+        && member_is_denied_in_roster(&r, m)
+    {
+        return true;
+    }
+    if let Some(cfg) = &cfg {
+        if r.is_label_denied(&cfg.host) {
+            return true;
+        }
+        if let Some(log) = &local_log
+            && log_entries::recipient_denied_by_roster_or_log(Some(&r), log, &my_rec)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Option<String>> {
-    if let Some(label) = roster::resolve_local_swarm_label(paths, &[])? {
-        return Ok(Some(label));
+    if local_recipient_denied_in_roster(paths) {
+        return Ok(None);
     }
     let Some(identity) = read_identity(paths)? else {
         return Ok(None);
     };
     let recipient = identity.recipient().to_bech32();
+    let mut doc_roster = crate::swarm_roster::SwarmRoster::from_document(doc)?;
+    if let Some(ref mut r) = doc_roster {
+        if let Ok(Some(denied)) = super::swarm_denied_nodes(paths) {
+            r.deny_nodes.extend(denied);
+            r.canonicalize();
+        }
+        if let Some(log) = config(paths)
+            .ok()
+            .flatten()
+            .and_then(|c| log_entries::trusted_local_log(paths, &c).ok().flatten())
+        {
+            roster::overlay_log_membership(&log, r);
+        }
+    }
+    let local_roster = roster::swarm_roster(paths).ok().flatten();
+    if let Some(ref r) = doc_roster
+        && let Some(member) = r.member_by_recipient(&recipient)
+    {
+        if member_is_denied_in_roster(r, member) {
+            return Ok(None);
+        }
+        return Ok(Some(member.label.clone()));
+    }
+    if let Some(ref r) = local_roster
+        && let Some(member) = r.member_by_recipient(&recipient)
+        && member_is_denied_in_roster(r, member)
+    {
+        return Ok(None);
+    }
+    let candidate_allowed = |canonical: &str| {
+        doc_roster.as_ref().is_none_or(|r| {
+            !r.is_label_denied(canonical)
+                && r.member_by_label_or_alias(canonical)
+                    .is_none_or(|m| m.recipient == recipient)
+        }) && local_roster.as_ref().is_none_or(|r| {
+            !r.is_label_denied(canonical)
+                && r.member_by_label_or_alias(canonical)
+                    .is_none_or(|m| m.recipient == recipient)
+        })
+    };
+    if let Some(label) = roster::resolve_local_swarm_label(paths, &[])?
+        && candidate_allowed(&label)
+    {
+        return Ok(Some(label));
+    }
     for m in doc.machines() {
         if m.recipient == recipient
             && let Some((_, canonical)) = crate::swarm_roster::leading_m_label(&m.name)
+            && candidate_allowed(&canonical)
         {
             return Ok(Some(canonical));
         }
@@ -264,13 +395,34 @@ fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Opt
 }
 
 fn resolve_member_own_label(paths: &Paths, config: &Config) -> crate::Result<Option<String>> {
+    if local_recipient_denied_in_roster(paths) {
+        return Ok(None);
+    }
     if let Some(label) = roster::resolve_local_swarm_label(paths, &[])? {
         return Ok(Some(label));
     }
+    let recipient = read_identity(paths)?.map(|id| id.recipient().to_bech32());
+    let local_roster = roster::swarm_roster(paths)?;
+    if let (Some(r), Some(rec)) = (&local_roster, recipient.as_deref())
+        && let Some(member) = r.member_by_recipient(rec)
+        && member_is_denied_in_roster(r, member)
+    {
+        return Ok(None);
+    }
     if let Some((_, canonical)) = crate::swarm_roster::leading_m_label(&config.host) {
+        if local_roster.as_ref().is_some_and(|r| {
+            r.is_label_denied(&canonical)
+                || r.member_by_label_or_alias(&canonical)
+                    .is_some_and(|m| Some(m.recipient.as_str()) != recipient.as_deref())
+        }) {
+            return Ok(None);
+        }
         return Ok(Some(canonical));
     }
-    if config.host != crate::alab_advertised() && crate::text::valid_machine_name(&config.host) {
+    if local_roster.is_none()
+        && config.host != crate::alab_advertised()
+        && crate::text::valid_machine_name(&config.host)
+    {
         return Ok(Some(config.host.clone()));
     }
     Ok(None)
@@ -288,6 +440,9 @@ pub fn steward_alab_policy_role(paths: &Paths) -> Option<(bool, Option<String>)>
     let state = load_state(paths).ok()?;
     let log_intact = state.seq == 0 && super::log_only_intact(paths, &config, &state);
     if state.membership != Stored::In || (state.seq < 1 && !log_intact) {
+        return None;
+    }
+    if local_recipient_denied_in_roster(paths) {
         return None;
     }
     if let Some(identity) = read_identity(paths).ok().flatten()
@@ -324,6 +479,48 @@ pub enum StewardLease {
     Done(String),
 }
 
+fn expire_denied_lease_holder(
+    paths: &Paths,
+    doc: &Document,
+    current: &mut Option<crate::swarm_roster::SwarmLease>,
+) {
+    let Some(lease) = current.as_mut() else {
+        return;
+    };
+    let Ok(Some(mut roster)) = crate::swarm_roster::SwarmRoster::from_document(doc) else {
+        return;
+    };
+    if let Ok(Some(denied)) = super::fleet::swarm_denied_nodes(paths) {
+        roster.deny_nodes.extend(denied);
+        roster.canonicalize();
+    }
+    if let Some(log) = config(paths)
+        .ok()
+        .flatten()
+        .and_then(|c| log_entries::trusted_local_log(paths, &c).ok().flatten())
+    {
+        roster::overlay_log_membership(&log, &mut roster);
+    }
+    let holder_denied = roster.is_label_denied(&lease.holder)
+        || roster
+            .member_by_label_or_alias(&lease.holder)
+            .is_some_and(|member| {
+                roster.is_label_denied(&member.label)
+                    || member.aliases.iter().any(|a| roster.is_label_denied(a))
+                    || member
+                        .node_id
+                        .as_deref()
+                        .is_some_and(|n| roster.is_node_denied(n))
+                    || member
+                        .node_key
+                        .as_deref()
+                        .is_some_and(|k| roster.is_node_denied(k))
+            });
+    if holder_denied {
+        lease.until = 0;
+    }
+}
+
 /// Read, writing nothing and fetching nothing, whether this steward should claim, renew, or take
 /// over `aterm-swarm-lease` (`sync.steward.lease` probe).
 ///
@@ -354,7 +551,8 @@ pub fn steward_lease_check(
     };
     let fallback_net = local_observed_network_id(paths);
     let effective_net = observed_network_id.or(fallback_net.as_deref());
-    let current = crate::swarm_roster::SwarmLease::from_document(&text.doc)?;
+    let mut current = crate::swarm_roster::SwarmLease::from_document(&text.doc)?;
+    expire_denied_lease_holder(paths, &text.doc, &mut current);
     match crate::swarm_roster::decide_lease_action(
         &policy,
         &own_label,
@@ -451,7 +649,8 @@ pub fn steward_ensure_lease(
                 "this steward has no canonical m<N> label yet".to_owned(),
             ));
         };
-        let current = crate::swarm_roster::SwarmLease::from_document(&admin.published_doc)?;
+        let mut current = crate::swarm_roster::SwarmLease::from_document(&admin.published_doc)?;
+        expire_denied_lease_holder(paths, &admin.published_doc, &mut current);
         let next = match crate::swarm_roster::decide_lease_action(
             &policy,
             &own_label,
@@ -517,8 +716,8 @@ pub enum StewardStandbyServer {
     /// A vault server job (`aterm-vault-server` LaunchDaemon or `aterm-secrets-server` LaunchAgent)
     /// is already running on a current build on this member.
     Current(String),
-    /// This member has no vault server running yet, or holds an unpinned `< 0.146.0` server
-    /// snapshot ready to move onto the new build.
+    /// This member has no vault server running yet, or holds an unpinned server ready
+    /// to move onto the installed release.
     Due {
         /// What the probe found.
         found: String,
@@ -574,6 +773,11 @@ pub(super) fn check_standby_eligibility(
             "this Mac is not an active member of the ALab vault".to_owned()
         ));
     }
+    if local_recipient_denied_in_roster(paths) {
+        return Ok(Err(
+            "this Mac is not an active member of the ALab vault".to_owned()
+        ));
+    }
     if let Some(log) = super::log_entries::trusted_local_log(paths, &config)?
         && (log.recipient_is_removed(&identity.recipient())
             || log.audience_left_out_recipient(
@@ -595,11 +799,11 @@ pub(super) fn check_standby_eligibility(
 /// is put back ([`serves_alab`]).
 pub(crate) const SERVES_WITHIN: Duration = Duration::from_secs(60);
 
-/// A held `< 0.146.0` server job this aterm moves (`sync.steward.server.standby`): its release,
+/// A held server job this aterm moves (`sync.steward.server.standby`): its release,
 /// the store it serves, which holds the ALab vault this build verifies ([`crate::server::holds_alab`]),
 /// so the moved job can be seen serving it, and the URL it answers on this Mac.
 #[cfg(unix)]
-pub(crate) fn held_pre_0146_server_move_due(
+pub(crate) fn held_server_move_due(
     paths: &Paths,
     own: &locker_skew::Own,
     held: &crate::service::Held,
@@ -614,9 +818,10 @@ pub(crate) fn held_pre_0146_server_move_due(
         return None;
     }
     let held_ver = release_of(&held.program).ok()?;
-    if held_ver >= FLUID_SERVER_MIN_RELEASE {
+    if held_ver >= FLUID_SERVER_MIN_RELEASE && !held_alab_release_due(own, held_ver) {
         return None;
     }
+    crate::service::require_program_release(new_program, own.version, release_of).ok()?;
     let (store_dir, url) = crate::cli::served_by(paths, &held.args)?;
     if !crate::server::holds_alab(&store_dir) {
         return None;
@@ -650,6 +855,10 @@ pub(crate) fn serves_alab(url: &str, within: Duration) -> crate::Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(unix)]
+pub(crate) type StandbyInstall<'a> =
+    dyn FnMut(&Path, &[String]) -> crate::Result<Option<String>> + 'a;
 
 #[cfg(unix)]
 #[expect(
@@ -686,7 +895,7 @@ pub(crate) fn steward_standby_server_check_with(
     if let Some(prog) = new_program
         && let Some(held) = held_server(Some(prog))
         && let Some((held_ver, store_dir, _)) =
-            held_pre_0146_server_move_due(paths, own, &held, prog, release_of, starts)
+            held_server_move_due(paths, own, &held, prog, release_of, starts)
     {
         return Ok(StewardStandbyServer::Due {
             found: format!(
@@ -768,7 +977,7 @@ pub(crate) fn steward_ensure_standby_server_with(
     starts: &dyn Fn(&Path) -> crate::Result<()>,
     serves: &dyn Fn(&str) -> crate::Result<()>,
     move_it: &mut MoveHeld<'_>,
-    install_it: &mut dyn FnMut(&Path, &[String]) -> crate::Result<String>,
+    install_it: &mut StandbyInstall<'_>,
 ) -> crate::Result<StewardStandbyServer> {
     let own_label = match check_standby_eligibility(paths, observed_network_id)? {
         Ok(label) => label,
@@ -786,12 +995,23 @@ pub(crate) fn steward_ensure_standby_server_with(
             ),
         }));
     }
-    if let Some(held) = held_server(Some(new_program))
-        && let Some((_, _, url)) =
-            held_pre_0146_server_move_due(paths, own, &held, new_program, release_of, starts)
-        && let Some(moved) = move_it(&held, new_program, &|| serves(&url))?
-    {
-        return Ok(StewardStandbyServer::Done(moved));
+    if let Some(held) = held_server(Some(new_program)) {
+        if let Some((_, _, url)) =
+            held_server_move_due(paths, own, &held, new_program, release_of, starts)
+            && let Some(moved) = move_it(&held, new_program, &|| serves(&url))?
+        {
+            return Ok(StewardStandbyServer::Done(moved));
+        }
+        if let crate::service::State::Installed { pid: Some(pid), .. } = server_state()? {
+            return Ok(StewardStandbyServer::Current(format!(
+                "{} running (pid {pid})",
+                crate::service::Job::Server.label()
+            )));
+        }
+        return Ok(install_it(&held.program, &held.args)?.map_or_else(
+            || StewardStandbyServer::Idle("server policy changed; kept as it is".to_owned()),
+            StewardStandbyServer::Done,
+        ));
     }
     if let crate::service::State::Installed { pid: Some(pid), .. } = server_state()? {
         return Ok(StewardStandbyServer::Current(format!(
@@ -799,6 +1019,7 @@ pub(crate) fn steward_ensure_standby_server_with(
             crate::service::Job::Server.label()
         )));
     }
+    crate::service::require_program_release(new_program, own.version, release_of)?;
     let args = vec![
         "secrets".to_owned(),
         "serve".to_owned(),
@@ -809,8 +1030,10 @@ pub(crate) fn steward_ensure_standby_server_with(
         // Every member serves, laptops too: none is kept from idle sleep for it.
         "--no-keep-awake".to_owned(),
     ];
-    let line = install_it(new_program, &args)?;
-    Ok(StewardStandbyServer::Done(line))
+    Ok(install_it(new_program, &args)?.map_or_else(
+        || StewardStandbyServer::Idle("server policy changed; kept as it is".to_owned()),
+        StewardStandbyServer::Done,
+    ))
 }
 
 /// Ensure the member vault server job runs on this ALab member and moves any held `< 0.146.0`
@@ -842,9 +1065,7 @@ pub fn steward_ensure_standby_server(
         &mut |held, prog, serves| {
             crate::service::move_held_serving(&paths.home, held, prog, serves)
         },
-        &mut |prog, args| {
-            crate::service::install(&paths.home, crate::service::Job::Server, prog, args)
-        },
+        &mut |prog, args| crate::service::ensure_server(&paths.home, prog, args, own.version),
     )
 }
 

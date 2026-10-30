@@ -319,6 +319,10 @@ impl SwarmCensus {
         for member in &inputs.roster.members {
             let member_denied = deny_labels.contains(&canonical_host_stem(&member.label))
                 || member
+                    .aliases
+                    .iter()
+                    .any(|a| deny_labels.contains(&canonical_host_stem(a)))
+                || member
                     .node_id
                     .as_deref()
                     .is_some_and(|n| deny_nodes.contains(&n.to_ascii_lowercase()))
@@ -338,10 +342,15 @@ impl SwarmCensus {
             }
         }
         for member in &inputs.roster.members {
-            let member_denied = member
-                .node_id
-                .as_deref()
-                .is_some_and(|n| deny_nodes.contains(&n.to_ascii_lowercase()))
+            let member_denied = deny_labels.contains(&canonical_host_stem(&member.label))
+                || member
+                    .aliases
+                    .iter()
+                    .any(|a| deny_labels.contains(&canonical_host_stem(a)))
+                || member
+                    .node_id
+                    .as_deref()
+                    .is_some_and(|n| deny_nodes.contains(&n.to_ascii_lowercase()))
                 || member
                     .node_key
                     .as_deref()
@@ -364,6 +373,7 @@ impl SwarmCensus {
         // Map canonical alias/label -> canonical primary `m<N>` label, and detect conflicts/unlabeled.
         let mut alias_to_primary: BTreeMap<String, String> = BTreeMap::new();
         let mut node_to_primary: BTreeMap<String, String> = BTreeMap::new();
+        let mut recipient_to_primary: BTreeMap<String, String> = BTreeMap::new();
         let mut vault_name_to_primary: BTreeMap<String, String> = BTreeMap::new();
         let mut primary_owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut unlabeled = 0usize;
@@ -372,6 +382,10 @@ impl SwarmCensus {
             BTreeMap::new();
         for member in &inputs.roster.members {
             if deny_labels.contains(&canonical_host_stem(&member.label))
+                || member
+                    .aliases
+                    .iter()
+                    .any(|a| deny_labels.contains(&canonical_host_stem(a)))
                 || member
                     .node_id
                     .as_deref()
@@ -391,6 +405,12 @@ impl SwarmCensus {
                 .entry(canon.clone())
                 .or_default()
                 .insert(format!("recipient:{}", member.recipient));
+            if !member.recipient.trim_ascii().is_empty() {
+                recipient_to_primary.insert(
+                    member.recipient.trim_ascii().to_ascii_lowercase(),
+                    canon.clone(),
+                );
+            }
             alias_to_primary.insert(canon.clone(), canon.clone());
             for alias in &member.aliases {
                 if let Some((_, calias)) = ai_pool::leading_m_label(alias) {
@@ -412,12 +432,12 @@ impl SwarmCensus {
                 }
                 Some(prev) => {
                     let prev_key = (
-                        prev.node_id.is_some(),
+                        prev.node_id.is_some() || prev.node_key.is_some(),
                         prev.admitted_ms,
                         prev.recipient.as_str(),
                     );
                     let cur_key = (
-                        member.node_id.is_some(),
+                        member.node_id.is_some() || member.node_key.is_some(),
                         member.admitted_ms,
                         member.recipient.as_str(),
                     );
@@ -609,9 +629,10 @@ impl SwarmCensus {
                 continue;
             }
             let subj_lc = sh.subject.trim_ascii().to_ascii_lowercase();
-            let resolved = vault_name_to_primary
+            let resolved = recipient_to_primary
                 .get(&subj_lc)
                 .cloned()
+                .or_else(|| vault_name_to_primary.get(&subj_lc).cloned())
                 .or_else(|| {
                     alias_to_primary
                         .get(&canonical_host_stem(&subj_lc))
@@ -729,6 +750,21 @@ impl SwarmCensus {
             }
         }
 
+        let active_claims = claims::Book::of(
+            inputs
+                .claims
+                .rows()
+                .filter(|row| {
+                    let stem = canonical_host_stem(&row.label);
+                    let resolved = alias_to_primary
+                        .get(&stem)
+                        .cloned()
+                        .or_else(|| ai_pool::leading_m_label(&stem).map(|(_, c)| c))
+                        .unwrap_or(stem);
+                    resolved.is_empty() || !deny_labels.contains(&resolved)
+                })
+                .cloned(),
+        );
         let mut converge_failed_24h = 0usize;
         for canon in ordered_labels {
             let roster_row = roster_by_label.get(&canon);
@@ -790,15 +826,13 @@ impl SwarmCensus {
                     .count();
             }
 
-            let leased = inputs
-                .claims
+            let leased = active_claims
                 .rows()
                 .filter(|row| identity.matches(&row.label))
                 .flat_map(|row| {
                     row.claims.iter().filter(|claim| {
                         claim.kind == claims::Kind::Lease
-                            && inputs
-                                .claims
+                            && active_claims
                                 .senior(&claim.key, &inputs.claims_view, now_i64)
                                 .is_some_and(|holder| holder.machine == row.machine)
                     })
@@ -1344,25 +1378,43 @@ pub fn collect_local_census_inputs(
 
     if let Some(home) = home_dir {
         let paths = aterm_secrets::client::Paths::for_home(home);
+        let mut has_roster = false;
         if let Ok(Some(r)) = aterm_secrets::client::swarm_roster(&paths) {
+            has_roster = !r.members.is_empty();
             roster = r;
-        }
-        if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes(&paths) {
+        } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes(&paths) {
             roster.deny_nodes.extend(denied);
             roster.canonicalize();
         }
         log_keys = crate::fleet_log::LocalLog::of(&paths).keys();
-        if paths.dir.join("commons").is_dir()
+        if (paths.dir.join("commons").is_dir() || paths.records_file().is_file())
             && let Ok(Some(bootstrap)) =
                 aterm_secrets::commons::bootstrap::Bootstrap::cached(&paths)
             && let Ok(Some(access)) = bootstrap.access()
         {
-            let count = access.members().len();
+            let mut count = 0usize;
             for member in access.members() {
                 let rec = member.binding().recipient().to_bech32();
                 if let Some(rm) = roster.member_by_recipient(&rec) {
+                    let is_denied = roster.is_label_denied(&rm.label)
+                        || (!rm.vault_name.is_empty() && roster.is_label_denied(&rm.vault_name))
+                        || rm.aliases.iter().any(|a| roster.is_label_denied(a))
+                        || rm
+                            .node_id
+                            .as_deref()
+                            .is_some_and(|n| roster.is_node_denied(n))
+                        || rm
+                            .node_key
+                            .as_deref()
+                            .is_some_and(|k| roster.is_node_denied(k));
+                    if is_denied {
+                        continue;
+                    }
                     commons_labels.insert(rm.label.clone());
+                } else if has_roster {
+                    continue;
                 }
+                count += 1;
             }
             commons_member_count = Some(count);
         }
@@ -1416,6 +1468,26 @@ pub fn collect_local_census_inputs(
     });
     if deny_nodes_changed {
         roster.canonicalize();
+    }
+    let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
+        .ok()
+        .flatten();
+    for member in &mut roster.members {
+        if member.node_id.is_none()
+            && let Some(key_hex) = member.node_key.as_deref()
+        {
+            if let Some(ref own) = own_identity
+                && own.key().hex().eq_ignore_ascii_case(key_hex)
+            {
+                member.node_id = Some(own.node().to_owned());
+            } else if let Some(node) = raw_peers
+                .iter()
+                .find(|p| p.key.is_some_and(|k| k.hex().eq_ignore_ascii_case(key_hex)))
+                .and_then(|p| p.node.clone())
+            {
+                member.node_id = Some(node);
+            }
+        }
     }
     let mut fleet_book: Vec<FleetBookPeerInput> = raw_peers
         .into_iter()

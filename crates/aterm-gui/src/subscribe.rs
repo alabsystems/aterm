@@ -33,7 +33,7 @@ pub(crate) struct TargetStreams {
     pub bytes: bool,
     /// The `trim` modifier: a `screen` DELTA stops after the last non-blank row (`DELTA <sid> seq=<n> screen <nrows>`, `<nrows>` the count sent), by the rule of `text trim` ([`crate::control::trimmed_len`]).
     pub trim: bool,
-    /// Emit `MAIL <local> id=<n> off=<n> from=<p> kind=<k> [re=<n>]`, one line per row delivered into the watched session's inbox, and a `GAP` when the ring evicted rows this subscriber had not been shown.
+    /// Emit `MAIL <local> id=<n> off=<n> from=<p> kind=<k> [re=<n>]`, or `id=f<n> off=-` for direct fleet mail. Broker and direct cursors are independent. A `GAP` names broker rows evicted before this subscriber saw them.
     pub mail: bool,
     /// Emit `LOG <local> <record>`, one line per record appended to the watched session's SESSION LOG (phase 3A), at the host tier `log` shows by default (never the content tier: no OSC title), filtered as `log lvl= class=turn` filter ([`crate::session_log::shows`]), and `GAP <local> log-lost=<n> why=<w> resync_to=<seq> ep=<e> base=<b>` (`base=` the log's identity, for a resume's `log-base=`) when the records past the watch's cursor cross a loss or name another log, exactly as the read counts it (seqs have holes across a carried update, so no id arithmetic would do).
     pub log: bool,
@@ -290,6 +290,7 @@ struct Watch {
     pace: Paces,
     records_read: u64,
     last_mail_id: u64,
+    last_direct_mail_id: u64,
     mail: crate::fabric::MailFilter,
     dirty: Arc<AtomicBool>,
     log: Option<LogWatch>,
@@ -829,6 +830,17 @@ fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
         ));
     }
     watch.last_mail_id = watch.last_mail_id.max(since.high);
+    let (high, rows) = watch
+        .src
+        .fabric
+        .direct_mail_since(watch.last_direct_mail_id, &watch.mail);
+    for row in rows {
+        out.push_str(&format!(
+            "MAIL {sid} id=f{} off=- from={} kind={}\n",
+            row.id, row.from, row.kind
+        ));
+    }
+    watch.last_direct_mail_id = watch.last_direct_mail_id.max(high);
 }
 
 fn log_anchor(watch: &Watch) -> String {
@@ -1217,6 +1229,11 @@ fn new_watch_at(
         term: term.clone(),
         last_mail_id: if streams.mail {
             src.fabric.last_msg_id()
+        } else {
+            0
+        },
+        last_direct_mail_id: if streams.mail {
+            src.fabric.last_direct_mail_id()
         } else {
             0
         },
@@ -2253,6 +2270,7 @@ mod tests {
         Watch {
             local_id,
             last_mail_id: 0,
+            last_direct_mail_id: 0,
             mail: crate::fabric::MailFilter::default(),
             log: None,
             closing: false,
@@ -2472,6 +2490,116 @@ mod tests {
                 "{good}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn direct_mail_wakes_subscribers_with_an_independent_cursor_and_body_free_fact() {
+        use crate::fabric::{Driver, DrivingAs, FabricSession};
+        struct Direct<'a> {
+            ctx: &'a crate::SessionCtx,
+            path: std::path::PathBuf,
+        }
+        impl FabricSession for Direct<'_> {
+            fn self_id(&self) -> &aterm_session::SessionId {
+                &self.ctx.self_id
+            }
+            fn fabric(&self) -> &crate::fabric::SessionFabric {
+                &self.ctx.fabric
+            }
+            fn record_fact(&self, kind: &'static str, fact: crate::fabric::FabricFact<'_>) -> bool {
+                self.ctx.record_fact(kind, fact)
+            }
+            fn fabric_changed(&self) {
+                self.ctx.fabric_changed();
+            }
+            fn holder_token(&self) -> Option<String> {
+                None
+            }
+            fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
+                Some(self.path.clone())
+            }
+        }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let h = crate::session_store::test_handle(7);
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(h.clone());
+        let direct = Direct {
+            ctx: &h.ctx,
+            path: scratch.path().join("private/mail.toml"),
+        };
+        let mut watch = new_watch(
+            &target_of(&h),
+            TargetStreams {
+                mail: true,
+                ..Default::default()
+            },
+            &PushOptions::default(),
+        );
+        let subscriber = Subscription::single(&h.ctx.watchers);
+        let post = || {
+            let _driver = DrivingAs::enter(Driver {
+                node: "a".repeat(32),
+                host: "peer.local".to_owned(),
+            });
+            crate::fabric::fleet_mail::post(&direct, "key=one kind=ask -- PRIVATE_DIRECT_BODY")
+        };
+        assert_eq!(post(), "OK f1\n");
+        assert!(
+            subscriber.wait(aterm_spec::wait::MUST_HAPPEN),
+            "an idle subscription must wake"
+        );
+        let bus = crate::fabric::cmd_deliver(
+            &store,
+            &format!(
+                "{} off=7 from=s-peer kind=note trust=agent text=BUS_BODY",
+                h.sid.as_str()
+            ),
+        );
+        assert_eq!(bus, "OK 1\n");
+        let mut out = String::new();
+        drain_mail_events(&mut watch, "7", &mut out);
+        assert!(
+            out.contains("MAIL 7 id=1 off=7 from=s-peer kind=note\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "MAIL 7 id=f1 off=- from=fleet:{} kind=ask\n",
+                "a".repeat(32)
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("BODY"));
+        assert_eq!(h.ctx.fabric.mail_facts().unread, 2);
+        assert_eq!(post(), "OK f1 dup=1\n");
+        out.clear();
+        drain_mail_events(&mut watch, "7", &mut out);
+        assert!(out.is_empty(), "neither cursor replays: {out}");
+        let tl = h.ctx.timeline.lock().unwrap();
+        assert!(
+            tl.since(None)
+                .any(|event| event.kind == "inbox" && event.payload.starts_with("f1 ")),
+            "the timeline view preserves the direct identifier"
+        );
+        let facts: Vec<_> = tl
+            .slog()
+            .log()
+            .window()
+            .map(|rec| aterm_slog::encode(rec, aterm_slog::Tier::Content).unwrap())
+            .collect();
+        let direct: Vec<_> = facts
+            .iter()
+            .filter(|line| line.contains(" re=f1 "))
+            .collect();
+        assert_eq!(direct.len(), 1, "{facts:?}");
+        assert!(direct[0].contains(" kind=ask "));
+        assert!(!direct[0].contains(" off="));
+        assert!(
+            facts
+                .iter()
+                .all(|line| !line.contains("PRIVATE_DIRECT_BODY"))
+        );
     }
 
     #[test]

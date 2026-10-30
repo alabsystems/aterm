@@ -58,6 +58,13 @@ pub(crate) fn pet_seen_for_test(f: impl FnOnce()) -> Vec<PetSeen> {
     PET_SEEN.take()
 }
 
+/// The side of the square picture a script's `page wallpaper` lays under the page
+/// ([`TrailRig::wallpaper`]), pixels.
+pub const WALLPAPER_PX: u32 = 64;
+
+/// The picture's one colour, a pale blue-grey.
+pub const WALLPAPER_RGB: [u8; 3] = [0xC8, 0xD4, 0xE0];
+
 /// The headless App one dump script drives, and the window it reads.
 #[doc(hidden)]
 pub struct TrailRig {
@@ -180,6 +187,27 @@ impl TrailRig {
             .map_err(|error| format!("{}: {error}", themes.display()))?;
         let path = themes.join(format!("{id}.conf"));
         std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /// Write the wallpaper picture a script's `page wallpaper` lays under the page into the rig's
+    /// folder: a [`WALLPAPER_PX`]-square PNG of [`WALLPAPER_RGB`], read back by the config's
+    /// `wallpaper` key on the next [`Self::configure`]. Its path.
+    ///
+    /// # Errors
+    /// When the picture does not encode or its file cannot be written.
+    pub fn wallpaper(&mut self) -> Result<String, String> {
+        let rgba: Vec<u8> = std::iter::repeat_n(
+            [WALLPAPER_RGB[0], WALLPAPER_RGB[1], WALLPAPER_RGB[2], 255],
+            (WALLPAPER_PX * WALLPAPER_PX) as usize,
+        )
+        .flatten()
+        .collect();
+        let png = crate::app_introspect::encode_rgba8_png(&rgba, WALLPAPER_PX, WALLPAPER_PX)?;
+        let path = self.dir.path().join("wallpaper.png");
+        std::fs::write(&path, png).map_err(|error| format!("{}: {error}", path.display()))?;
+        path.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("{}: not UTF-8", path.display()))
     }
 
     /// Admit `toml` as the whole `aterm.toml` at `at`, through the prepared-generation admission
@@ -374,6 +402,35 @@ impl TrailRig {
             },
         );
         self.at(at, |app, _| app.on_output_wake(session, at));
+    }
+
+    /// Pane `pane`'s session (in pane order) wears the theme `selector` from `at`, as the control
+    /// socket's `theme session set` gives a session its own: a built-in's name, or an installed
+    /// theme's id once a [`Self::configure`] discovered it ([`Self::install_theme`]).
+    ///
+    /// # Errors
+    /// When there is no such pane or the App refuses the selector.
+    pub fn pane_theme(&mut self, pane: usize, selector: &str, at: Instant) -> Result<(), String> {
+        let session = *self
+            .panes
+            .get(pane)
+            .ok_or_else(|| format!("pane {pane} theme: {} panes", self.panes.len()))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.at(at, |app, _| {
+            app.theme_control(
+                crate::control_theme::ThemeCtlOp::SessionSet {
+                    selector: selector.to_string(),
+                },
+                Some(session),
+                at,
+                tx,
+            );
+        });
+        match rx.try_recv() {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!("pane {pane} theme {selector}: {error}")),
+            Err(_) => Err(format!("pane {pane} theme {selector}: no answer")),
+        }
     }
 
     /// Pane `pane`'s session (in pane order).

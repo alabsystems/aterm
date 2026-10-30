@@ -127,6 +127,7 @@ pub(crate) struct Inert {
     /// What a founding of the vault's Commons ends in ([`Ports::found_commons`]).
     founded: Mutex<Result<String, String>>,
     accounts: Mutex<AccountsRead>,
+    release: Mutex<ReleaseRead>,
     fabric: Mutex<FabricRead>,
     /// What a renewal of the broker ends in ([`Ports::renew_broker`]).
     renewed: Mutex<Result<String, String>>,
@@ -144,6 +145,7 @@ pub(crate) struct Inert {
     /// Each run handed to another program, and how it ends.
     pub(crate) ran_elsewhere: Mutex<Vec<(PathBuf, Vec<String>)>>,
     pub(crate) elsewhere_exit: Mutex<Result<Option<i32>, String>>,
+    refreshed_subscribers: AtomicU32,
     /// At each sync kind's read, whether another take of the pass's lock found it held.
     locked_at_reads: Mutex<Vec<bool>>,
     sleeps: Mutex<Vec<Duration>>,
@@ -163,6 +165,7 @@ impl Inert {
             fails: Arc::new(Mutex::new(Vec::new())),
             released_at_first_read: Mutex::new(None),
             backgrounds: AtomicU32::new(0),
+            refreshed_subscribers: AtomicU32::new(0),
             build: Mutex::new("0.145.0+gabc".to_owned()),
             routes: Mutex::new(vec!["192.0.2.7".to_owned(), "-".to_owned()]),
             now: AtomicU64::new(1_000_000_000),
@@ -191,6 +194,7 @@ impl Inert {
             )),
             founded: Mutex::new(Ok("founded, approving m2".to_owned())),
             accounts: Mutex::new(AccountsRead::Due("the roster's sources changed".to_owned())),
+            release: Mutex::new(ReleaseRead::NotApplicable("no release ring".into())),
             fabric: Mutex::new(FabricRead::Due(
                 "the broker runs a replaced build".to_owned(),
             )),
@@ -284,6 +288,10 @@ impl Ports for Inert {
     }
     fn installed_release(&self) -> bool {
         self.installed
+    }
+    fn refresh_vault_subscriber(&self) -> Result<Option<String>, String> {
+        self.refreshed_subscribers.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
     }
     fn window_runs(&self) -> bool {
         self.window
@@ -408,6 +416,14 @@ impl Ports for Inert {
         self.applied("accounts");
         *self.accounts.lock().unwrap() = AccountsRead::Current("2 accounts synced".to_owned());
         Ok("synced".to_owned())
+    }
+    fn release(&self) -> Result<ReleaseRead, String> {
+        self.read(&self.release)
+    }
+    fn sync_release(&self) -> Result<String, String> {
+        self.applied("release");
+        *self.release.lock().unwrap() = ReleaseRead::Current("unattended signature proved".into());
+        Ok("unattended signature proved".into())
     }
     fn fabric(&self) -> Result<FabricRead, String> {
         self.read(&self.fabric)
@@ -638,6 +654,22 @@ fn a_second_pass_applies_nothing() {
         "{:?}",
         second.rows
     );
+}
+
+#[test]
+fn signing_files_stay_pending_until_the_automatic_pass_proves_a_signature() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.release.lock().unwrap() =
+        ReleaseRead::Due("authorized files present; signature proof pending".into());
+    let planned = ran(ports.pass(Trigger::Init, Mode::Plan));
+    assert_eq!(row(&planned.rows, RELEASE).outcome, Outcome::Planned);
+    assert!(!ports.applies().contains(&"release"));
+    let applied = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&applied.rows, RELEASE).outcome, Outcome::Changed);
+    assert!(ports.applies().contains(&"release"));
+    let checked = ran(ports.pass(Trigger::Init, Mode::Plan));
+    assert_eq!(row(&checked.rows, RELEASE).outcome, Outcome::Ok);
 }
 
 /// A person's off switch leaves its kind as it is: the row reads `NotApplicable`, naming it, and
@@ -1118,6 +1150,30 @@ fn a_fleet_left_as_a_person_joined_it_waits_and_an_unanswered_join_fails() {
         fleet.why.as_deref(),
         Some("the issuer at m22:7100 did not answer; the next pass tries again")
     );
+}
+
+/// Subscriber refresh runs from the installed apply path, including a headless subscriber
+/// trigger; plans, held copies and swarm-off runs never reach it.
+#[test]
+fn only_installed_apply_passes_refresh_the_managed_subscriber() {
+    for (installed, mode, enabled, refreshed) in [
+        (true, Mode::Apply, true, 1),
+        (true, Mode::Plan, true, 0),
+        (false, Mode::Apply, true, 0),
+        (true, Mode::Apply, false, 0),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert {
+            installed,
+            ..Inert::new(scratch.path())
+        };
+        *ports.swarm.lock().unwrap() = Ok(enabled);
+        ran(ports.pass(Trigger::Subscriber, mode));
+        assert_eq!(
+            ports.refreshed_subscribers.load(Ordering::SeqCst),
+            refreshed
+        );
+    }
 }
 
 /// A plan reads every kind and writes nothing: no lock file, record, journal or apply.

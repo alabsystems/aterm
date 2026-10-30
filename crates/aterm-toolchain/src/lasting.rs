@@ -41,14 +41,17 @@ pub fn temp_roots() -> Vec<PathBuf> {
 #[must_use]
 pub fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let mut push = |candidate: PathBuf| {
+        if candidate.is_absolute() && candidate.parent().is_some() && !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    };
     for root in [temp_dir, PathBuf::from("/tmp"), PathBuf::from("/var/tmp")] {
         if let Ok(real) = std::fs::canonicalize(&root) {
-            roots.push(real);
+            push(real);
         }
-        roots.push(root);
+        push(root);
     }
-    roots.retain(|root| root.is_absolute() && root.parent().is_some());
-    roots.dedup();
     roots
 }
 
@@ -101,5 +104,13 @@ mod tests {
         .unwrap();
         assert!(transient(&inside.join("aterm"), &elsewhere));
         std::fs::remove_dir_all(&cache).unwrap();
+
+        let dup_roots = temp_roots_from(PathBuf::from("/tmp"));
+        for (i, root) in dup_roots.iter().enumerate() {
+            assert!(
+                !dup_roots[i + 1..].contains(root),
+                "duplicate temporary root {root:?} in {dup_roots:?}"
+            );
+        }
     }
 }

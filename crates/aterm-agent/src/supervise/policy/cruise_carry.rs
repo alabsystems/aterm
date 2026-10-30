@@ -29,7 +29,8 @@ pub const BACKGROUND_CARRY: &str = concat!(
     harness_mark!(),
     " Autopilot is Cruise: your turn ended while your own background work runs. Check on that \
      work, then keep going with everything else in hand; never wait idle for it. Put what only \
-     a person can give on a line starting NEEDS YOU: and carry on."
+     a person can give on a line starting NEEDS YOU: and carry on. A go-ahead for your own \
+     reversible work is never a NEEDS YOU item."
 );
 
 /// [`BACKGROUND_CARRY`] with the policy's standing `rules`, fitted as every line the turn-end

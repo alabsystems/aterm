@@ -832,8 +832,12 @@ fn admin_publish_replicates_to_policy_secondary_servers_immediately() {
 
     // Secondary `s2` immediately serves seq 2 without needing PutBack or reconcile, while unlisted
     // `s3` (negative control) remains empty!
-    match transport::fetch(&Source::Url(url2.clone()), None, Duration::from_secs(5))
-        .expect("fetch s2 after seq 2")
+    match transport::fetch(
+        &Source::Url(url2.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("fetch s2 after seq 2")
     {
         Fetched::Body(bytes) => assert_eq!(envelope::parse(&bytes).unwrap().seq, 2),
         other => panic!("expected seq 2 body on policy secondary s2, got {other:?}"),
@@ -856,7 +860,7 @@ fn admin_publish_replicates_to_policy_secondary_servers_immediately() {
         let pub3 = admin_publish(&st1, &admin, &doc).expect("publish seq 3");
         assert_eq!(pub3.seq, 3);
     }
-    match transport::fetch(&Source::Url(url2), None, Duration::from_secs(5))
+    match transport::fetch(&Source::Url(url2), None, aterm_spec::wait::MUST_HAPPEN)
         .expect("fetch s2 after seq 3")
     {
         Fetched::Body(bytes) => assert_eq!(envelope::parse(&bytes).unwrap().seq, 3),
@@ -870,6 +874,8 @@ fn admin_publish_replicates_to_policy_secondary_servers_immediately() {
 
 #[test]
 fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_higher_seq() {
+    // Every server it reads is its own on loopback, which answers or, stopped, refuses at once.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s_primary = start_loopback_server(&root.path().join("s_primary"));
     let s_fresh = start_loopback_server(&root.path().join("s_fresh"));
@@ -1167,7 +1173,11 @@ fn ok_with(body: &[u8]) -> Vec<u8> {
 
 /// The envelope the server at `url` serves.
 fn served(url: &str) -> Vec<u8> {
-    match transport::fetch(&Source::Url(url.to_owned()), None, Duration::from_secs(30)) {
+    match transport::fetch(
+        &Source::Url(url.to_owned()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    ) {
         Ok(Fetched::Body(bytes)) => bytes,
         other => panic!("{url} serves no envelope: {other:?}"),
     }
@@ -1181,6 +1191,9 @@ fn served(url: &str) -> Vec<u8> {
 /// leaving seq 2.
 #[test]
 fn a_forged_newer_seq_at_the_source_does_not_stop_the_failover() {
+    // Every server it reads is its own on loopback, which answers; so does the stand-in at its
+    // gone source's address.
+    let _answering = ServersAnswering::set();
     let at = dead_source();
     let fresh = served(&at.fresh.url);
     let (from, to) = (&b"\nseq: 3\n"[..], &b"\nseq: 999999\n"[..]);
@@ -1219,6 +1232,9 @@ fn a_forged_newer_seq_at_the_source_does_not_stop_the_failover() {
 /// long-poll (the old reading of a pass's whole time) gives a zero pause.
 #[test]
 fn a_failover_pass_with_nothing_new_is_not_followed_at_once() {
+    // Every server it reads is its own on loopback, which answers; its gone source refuses at
+    // once, or its stand-in drops each request.
+    let _answering = ServersAnswering::set();
     let at = dead_source();
     let browsed = [at.fresh.clone()];
     let found = |_: &Config| browsed.to_vec();
@@ -1259,6 +1275,9 @@ fn a_failover_pass_with_nothing_new_is_not_followed_at_once() {
 /// errs here.
 #[test]
 fn a_dead_source_fails_over_to_a_browsed_server_with_a_newer_seq() {
+    // Every server it reads is its own on loopback, which answers; its gone source refuses at
+    // once.
+    let _answering = ServersAnswering::set();
     let at = dead_source();
     // CONTROL: with nothing browsed, the pass has only its gone source.
     assert!(subscriber_pass(&at.member, &mut None, &found_none).is_err());
@@ -1291,6 +1310,9 @@ fn a_dead_source_fails_over_to_a_browsed_server_with_a_newer_seq() {
 /// in place of `verify_for_reader`) picks the forger's seq 5 and errs.
 #[test]
 fn a_forged_higher_seq_on_a_browsed_server_is_ignored() {
+    // Every server it reads is its own on loopback, which answers; its gone source refuses at
+    // once.
+    let _answering = ServersAnswering::set();
     let at = dead_source();
     let alone = [at.rogue.clone()];
     let forger_alone = |_: &Config| alone.to_vec();
@@ -1356,6 +1378,8 @@ fn a_merge_keeps_a_policy_only_another_branch_set_and_its_own_over_another() {
 
 #[test]
 fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_steady() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let s2 = start_loopback_server(&root.path().join("s2"));
@@ -1438,19 +1462,29 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
     }
 
     // Verify the equal-seq split stands (`s1` and `s2` both at seq 4 with distinct digests)!
-    let s1_env =
-        match transport::fetch(&Source::Url(url1.clone()), None, Duration::from_secs(5)).unwrap() {
-            Fetched::Body(b) => envelope::parse(&b).unwrap(),
-            other => panic!("expected s1 at seq 4, got {other:?}"),
-        };
-    let (s2_bytes, s2_env) =
-        match transport::fetch(&Source::Url(url2.clone()), None, Duration::from_secs(5)).unwrap() {
-            Fetched::Body(b) => {
-                let parsed = envelope::parse(&b).unwrap();
-                (b, parsed)
-            }
-            other => panic!("expected s2 at seq 4, got {other:?}"),
-        };
+    let s1_env = match transport::fetch(
+        &Source::Url(url1.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    {
+        Fetched::Body(b) => envelope::parse(&b).unwrap(),
+        other => panic!("expected s1 at seq 4, got {other:?}"),
+    };
+    let (s2_bytes, s2_env) = match transport::fetch(
+        &Source::Url(url2.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    {
+        Fetched::Body(b) => {
+            let parsed = envelope::parse(&b).unwrap();
+            (b, parsed)
+        }
+        other => panic!("expected s2 at seq 4, got {other:?}"),
+    };
     assert_eq!(s1_env.seq, 4);
     assert_eq!(s2_env.seq, 4);
     assert_ne!(s1_env.digest(), s2_env.digest());
@@ -1897,11 +1931,16 @@ fn a_server_pulls_a_newer_head_from_a_browsed_peer() {
         .expect("pinned signer");
 
     // Seed `s2` with `seq 1`, then advance `s2` to `seq 2` and `seq 3` while `s1` is not listed.
-    let seq1_bytes =
-        match transport::fetch(&Source::Url(url1.clone()), None, Duration::from_secs(5)).unwrap() {
-            Fetched::Body(b) => b,
-            other => panic!("expected seq 1 on s1, got {other:?}"),
-        };
+    let seq1_bytes = match transport::fetch(
+        &Source::Url(url1.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    {
+        Fetched::Body(b) => b,
+        other => panic!("expected seq 1 on s1, got {other:?}"),
+    };
     transport::publish(&Source::Url(url2.clone()), &seq1_bytes).expect("seed s2 seq 1");
 
     let admin_s2 = Paths::for_home(&root.path().join("m5"));
@@ -1986,6 +2025,8 @@ fn a_server_pulls_a_newer_head_from_a_browsed_peer() {
 /// `config.source` is down.
 #[test]
 fn a_publish_reaches_every_candidate_server() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let store1 = root.path().join("s1");
     let store2 = root.path().join("s2");
@@ -2043,11 +2084,16 @@ fn a_publish_reaches_every_candidate_server() {
     // - Positive check: `admin_open_with_candidates` + `admin_publish_found` opens from `s2`/`s3`,
     //   publishes `seq 3` to `s2` and `s3`, and syncs `admin_paths` locally (`t-seq3`)!
     s1.stop();
-    let seq2_bytes =
-        match transport::fetch(&Source::Url(url2.clone()), None, Duration::from_secs(5)).unwrap() {
-            Fetched::Body(b) => b,
-            other => panic!("expected seq 2 on s2, got {other:?}"),
-        };
+    let seq2_bytes = match transport::fetch(
+        &Source::Url(url2.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    {
+        Fetched::Body(b) => b,
+        other => panic!("expected seq 2 on s2, got {other:?}"),
+    };
     assert!(
         transport::publish(&Source::Url(url1.clone()), &seq2_bytes).is_err(),
         "negative control: one-URL publish to dead config.source fails"
@@ -2105,10 +2151,9 @@ fn silent_server(
 }
 
 /// A publish PUTs to every candidate server at once. A browsed server that accepts the PUT and
-/// never answers holds the publish, and this Mac's state lock with it, for one exchange
-/// deadline, not one per server, so a LAN full of such adverts cannot hold every secrets
-/// command on an admin's Mac for half an hour (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6,
-/// from the review).
+/// never answers holds the publish for one exchange deadline, not one per server, so a LAN full
+/// of such adverts cannot hold an admin's publish for half an hour
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6, from the review).
 /// NEGATIVE CONTROL: PUT one after another, the second silent server hears nothing until the
 /// first one's 120 s deadline ends, past this test's hang detector.
 #[test]
@@ -2177,6 +2222,82 @@ fn a_publish_puts_to_every_server_at_once() {
         );
         thread.join().expect("the silent server ended");
     }
+    s1.stop();
+}
+
+/// A publish holds this Mac's state lock only to check that the vault configuration is the one
+/// its envelope was sealed for, not across its PUTs: while a browsed server that took the PUT
+/// stays silent, another secrets command takes the state lock at once. Before, every command
+/// that takes it (a sync's materialize, a draft's adopt, the next publish) waited out that
+/// PUT's 120 s exchange deadline.
+/// NEGATIVE CONTROL: holding `configured_admin`'s lock across the PUTs (main before this fix)
+/// keeps the state lock from the other command until the silent server is let go, and the test
+/// fails "never: the state lock while a PUT waits on a silent server".
+#[test]
+fn a_publish_leaves_the_state_lock_while_a_silent_server_holds_its_put() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let s1 = start_loopback_server(&root.path().join("s1"));
+    let url1 = format!("http://{}/v1/alab", s1.addr);
+    let admin_paths = Paths::for_home(&root.path().join("m3"));
+    create(&admin_paths, &url1, None, Some("m3")).expect("create on s1");
+
+    let (heard_tx, heard) = std::sync::mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let (silent_url, silent_thread) =
+        silent_server(0, heard_tx, Arc::clone(&release), Arc::clone(&held));
+    let browsed = vec![crate::discover::DiscoveredVault {
+        url: silent_url.clone(),
+        txt: None,
+    }];
+    let publisher = std::thread::spawn({
+        let admin_paths = admin_paths.clone();
+        move || {
+            let found = move |_: &Config| browsed.clone();
+            let opened = admin_open(&admin_paths).expect("open seq 1");
+            let mut doc = opened.doc.clone();
+            doc.set_entry(&Audience::Everyone, "token", b"t-seq2")
+                .expect("set");
+            admin_publish_found(&admin_paths, &opened, &doc, &found)
+        }
+    });
+    heard
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("never: the PUT reached the silent server");
+
+    let (taken_tx, taken) = std::sync::mpsc::channel();
+    let other = std::thread::spawn({
+        let admin_paths = admin_paths.clone();
+        move || {
+            let lock = crate::client::StateLock::take(&admin_paths).map(drop);
+            let _ = taken_tx.send(lock.is_ok());
+        }
+    });
+    let took = taken.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    // Let the silent PUT fail now, whatever the other command saw, so every thread ends.
+    release.store(true, Ordering::SeqCst);
+    held.lock().expect("held").clear();
+    assert_eq!(
+        took.ok(),
+        Some(true),
+        "never: the state lock while a PUT waits on a silent server"
+    );
+    other.join().expect("the other command ran");
+    let published = publisher
+        .join()
+        .expect("the publish ran")
+        .expect("the source took the publish");
+    assert_eq!(published.seq, 2);
+    assert_eq!(s1.held_seq("alab"), Some(2));
+    // Ends a listener that took nothing since the release.
+    let _ = std::net::TcpStream::connect(
+        silent_url
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1/alab"),
+    );
+    silent_thread.join().expect("the silent server ended");
     s1.stop();
 }
 
@@ -2389,6 +2510,37 @@ fn a_held_0_145_server_job_moves_once_the_new_build_serves_its_store() {
                 unit: plist_path.clone(),
             })
         };
+
+        let stale_destination = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let caller_0147 = locker_skew::Own {
+            version: (0, 147, 0),
+            ..own_0146.clone()
+        };
+        let restarted = steward::steward_ensure_standby_server_with(
+            &m22,
+            None,
+            &caller_0147,
+            stale_destination,
+            &not_installed,
+            &not_installed,
+            &|_| Some(held_before.clone()),
+            &|program| {
+                Ok(if program == stale_destination {
+                    (0, 91, 0)
+                } else {
+                    (0, 146, 0)
+                })
+            },
+            &|_| panic!("a stale destination must not start"),
+            &|_| panic!("a stale destination must not serve"),
+            &mut |_, _, _| panic!("a held job must not move to a stale destination"),
+            &mut |program, args| {
+                assert_eq!(program, held_before.program);
+                assert_eq!(args, held_before.args);
+                Ok(Some("restarted the retained program".to_owned()))
+            },
+        );
+        assert!(matches!(restarted.unwrap(), StewardStandbyServer::Done(_)));
 
         // 0. A store whose ALab vault this build does not verify (another key's) could never be
         //    seen served after a move, so the job stays where it is.
@@ -2629,7 +2781,7 @@ fn a_held_0_145_server_job_moves_once_the_new_build_serves_its_store() {
             &mut |_, _, _| unreachable!(),
             &mut |_prog, args| {
                 installed_args = Some(args.to_vec());
-                Ok("installed".to_owned())
+                Ok(Some("installed".to_owned()))
             },
         )
         .expect("fresh member install");
@@ -2784,10 +2936,23 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
     };
     let watched = std::cell::RefCell::new(Vec::new());
     let mend = || {
-        mend_held_with(&m22, &release, &held, &|_| Ok((0, 145, 0)), &mut |watch| {
-            watched.borrow_mut().push(watch.map(str::to_owned));
-            Ok(Some("moved".to_owned()))
-        })
+        mend_held_with(
+            &m22,
+            &release,
+            &held,
+            Some(Path::new("/installed/aterm")),
+            &|program| {
+                Ok(if program == Path::new("/installed/aterm") {
+                    release.version
+                } else {
+                    (0, 145, 0)
+                })
+            },
+            &mut |watch| {
+                watched.borrow_mut().push(watch.map(str::to_owned));
+                Ok(Some("moved".to_owned()))
+            },
+        )
         .expect("judged")
     };
     assert_eq!(mend(), HeldMend::Moved("moved".to_owned()));
@@ -2795,6 +2960,83 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
         *watched.borrow(),
         [Some("http://127.0.0.1:7999/v1/alab".to_owned())],
         "the move watches the address the job serves"
+    );
+
+    let installed = locker_skew::Own {
+        version: (0, 147, 0),
+        ..release.clone()
+    };
+    for version in [(0, 146, 0), (0, 147, 0)] {
+        let moved = mend_held_with(
+            &m22,
+            &installed,
+            &held,
+            Some(Path::new("/installed/aterm")),
+            &|program| {
+                Ok(if program == Path::new("/installed/aterm") {
+                    installed.version
+                } else {
+                    version
+                })
+            },
+            &mut |watch| {
+                assert_eq!(watch, Some("http://127.0.0.1:7999/v1/alab"));
+                Ok(Some("moved".into()))
+            },
+        )
+        .unwrap();
+        assert_eq!(moved, HeldMend::Moved("moved".into()));
+        assert!(
+            steward::held_server_move_due(
+                &m22,
+                &installed,
+                &held,
+                Path::new("/installed/aterm"),
+                &|program| Ok(if program == Path::new("/installed/aterm") {
+                    installed.version
+                } else {
+                    version
+                }),
+                &|_| Ok(())
+            )
+            .is_some()
+        );
+    }
+    let destination = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let starts = std::cell::Cell::new(0);
+    assert!(
+        steward::held_server_move_due(
+            &m22,
+            &installed,
+            &held,
+            destination,
+            &|program| Ok(if program == destination {
+                (0, 91, 0)
+            } else {
+                (0, 146, 0)
+            }),
+            &|_| {
+                starts.set(starts.get() + 1);
+                Ok(())
+            }
+        )
+        .is_none()
+    );
+    assert_eq!(
+        starts.get(),
+        0,
+        "the stale destination is refused before startup or mutation"
+    );
+    assert!(
+        steward::held_server_move_due(
+            &m22,
+            &installed,
+            &held,
+            Path::new("/installed/aterm"),
+            &|_| Ok((0, 148, 0)),
+            &|_| Ok(())
+        )
+        .is_none()
     );
 
     // A build that names another key for the ALab vault: the store's vault is not one it could
@@ -2814,6 +3056,8 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
 /// pulls the missing records from the surviving peer and merges the union into `paths.records_file()`.
 #[test]
 fn a_member_follows_records_across_failover_when_primary_dies() {
+    // Every server it reads is its own on loopback, which answers or, stopped, refuses at once.
+    let _answering = ServersAnswering::set();
     use crate::membership_log::{Body, Entrant, Evidence, Log, Record, encode_records};
 
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2839,11 +3083,16 @@ fn a_member_follows_records_across_failover_when_primary_dies() {
             .unwrap();
         admin_publish(&admin, &opened, &doc).unwrap();
     }
-    let env_v2 =
-        match transport::fetch(&Source::Url(url1.clone()), None, Duration::from_secs(5)).unwrap() {
-            Fetched::Body(b) => b,
-            other => panic!("expected envelope body, got {other:?}"),
-        };
+    let env_v2 = match transport::fetch(
+        &Source::Url(url1.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    {
+        Fetched::Body(b) => b,
+        other => panic!("expected envelope body, got {other:?}"),
+    };
     transport::publish(&Source::Url(url2.clone()), &env_v2).unwrap();
     let pin = config(&admin).unwrap().unwrap().signer.unwrap();
     let pinned_url1 = format!("{url1}#{}", crate::b64::encode_padded(&pin));
@@ -3216,6 +3465,8 @@ fn a_mac_a_release_behind_a_rotation_roots_the_genesis_the_new_key_signed() {
 
 #[test]
 fn an_unequal_seq_parentless_partition_heals_preserving_lower_seq_entry_and_member() {
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let s2 = start_loopback_server(&root.path().join("s2"));
@@ -3310,11 +3561,16 @@ fn an_unequal_seq_parentless_partition_heals_preserving_lower_seq_entry_and_memb
             "b2 must not adopt unmerged peer fork or overwrite s2, got {out_b2:?}"
         );
     }
-    let s2_before_admin =
-        match transport::fetch(&Source::Url(url2.clone()), None, Duration::from_secs(5)).unwrap() {
-            Fetched::Body(b) => envelope::parse(&b).unwrap(),
-            other => panic!("expected s2 body, got {other:?}"),
-        };
+    let s2_before_admin = match transport::fetch(
+        &Source::Url(url2.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    {
+        Fetched::Body(b) => envelope::parse(&b).unwrap(),
+        other => panic!("expected s2 body, got {other:?}"),
+    };
     assert_eq!(
         s2_before_admin.seq, 4,
         "s2 must still hold island B's seq 4 head before admin merge"

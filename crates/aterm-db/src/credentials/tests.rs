@@ -16,6 +16,103 @@ const B: Actor = [2; 48];
 const C: Actor = [3; 48];
 const DAY_MS: u64 = 86_400_000;
 
+#[test]
+fn peeking_without_local_state_does_not_create_a_ledger_or_table() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let home = root.path().join("unconfigured");
+    let paths = Paths::for_home(&home);
+    for words in [vec!["peek", "--json"], vec!["peek", "--all", "--json"]] {
+        let words: Vec<_> = words.into_iter().map(str::to_owned).collect();
+        let result = cli::run(&paths, &words).unwrap();
+        let result: Value = aterm_json::from_str(&result).unwrap();
+        assert!(result["needs"].as_array().unwrap().is_empty());
+        if result.get("table").is_some() {
+            assert_eq!(result["table"]["available"].as_bool(), Some(false));
+        }
+        assert!(!home.exists(), "inspection must not initialize this Mac");
+    }
+}
+
+#[test]
+fn peeking_reads_remote_requests_beside_writers_without_posting_or_sweeping() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let requester = &lab.paths[1];
+    let raised = need::raise(
+        requester,
+        Want::Mailbox("m19-2".into()),
+        Purpose::HarnessSignIn,
+    )
+    .unwrap();
+    assert_eq!(raised.state, State::Local);
+    let ledger = requester.dir.join(need::LEDGER);
+    let before = std::fs::read(&ledger).unwrap();
+    let words = ["peek", "--all", "--json"].map(str::to_owned);
+    let read =
+        |paths| -> Value { aterm_json::from_str(&cli::run(paths, &words).unwrap()).unwrap() };
+    assert_eq!(read(requester)["table"]["available"].as_bool(), Some(false));
+    assert_eq!(std::fs::read(&ledger).unwrap(), before);
+    assert_eq!(need::peek(requester).unwrap()[0].state, State::Local);
+
+    // Setup deliberately posts and repairs. The inspection that follows must do neither.
+    pass(requester).unwrap();
+    repair_commons(&lab, 3);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+    let catalog_scope = directory.catalog_scope();
+    let catalog = Store::open(
+        &session,
+        &directory.path(catalog_scope).unwrap(),
+        catalog_scope,
+    )
+    .unwrap();
+    let scope = descriptor(&bootstrap).unwrap().scope;
+    let table_path = directory.path(scope).unwrap();
+    let table = Store::open(&session, &table_path, scope).unwrap();
+    let before_table = std::fs::read(table_path.join("table.astream")).unwrap();
+    let before_ledger = std::fs::read(&ledger).unwrap();
+    let result = read(&lab.paths[0]);
+    let requests = result["table"]["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["want"].as_str(), Some("mailbox:m19-2"));
+    assert_eq!(requests[0]["own"].as_bool(), Some(false));
+    assert_eq!(requests[0]["offers"].as_u64(), Some(0));
+    assert_eq!(requests[0]["swept_current"].as_u64(), Some(0));
+    assert_eq!(requests[0]["required_sweeps"].as_u64(), Some(1));
+    assert_eq!(requests[0]["sweeps_complete"].as_bool(), Some(false));
+    assert_eq!(requests[0]["needs_person"].as_bool(), Some(false));
+    assert_eq!(requests[0]["published_seq"], Value::Null);
+    assert_eq!(
+        std::fs::read(table_path.join("table.astream")).unwrap(),
+        before_table
+    );
+    assert_eq!(std::fs::read(&ledger).unwrap(), before_ledger);
+    assert_eq!(catalog.scope(), catalog_scope);
+    assert_eq!(table.scope(), scope);
+    drop((table, catalog, session));
+
+    // Signed but unreadable records must remain visible in the coverage count.
+    with_store(&lab.paths[0], |session, store, _| {
+        let invalid = Command::Write {
+            request: [8; 16],
+            changes: vec![Change {
+                collection: "unknown".into(),
+                key: "unknown".into(),
+                value: Some(Value::Null),
+            }],
+        };
+        store.commit_catalog(session, &invalid.encode()?)
+    })
+    .unwrap();
+    let result = read(&lab.paths[0]);
+    assert_eq!(result["table"]["retained_operations"].as_u64(), Some(2));
+    assert_eq!(result["table"]["interpreted_operations"].as_u64(), Some(1));
+    assert_eq!(result["table"]["requests"].as_array().unwrap().len(), 1);
+}
+
 fn signer() -> [u8; 32] {
     aterm_secrets::envelope::signer_public(&SEED).unwrap()
 }
@@ -84,8 +181,114 @@ fn request_body(actor: &Actor, nonce: u8, want: &str, purpose: &str) -> ([u8; 16
     body.insert("nonce".into(), Value::from(hex::encode_lower(&nonce)));
     body.insert("want".into(), Value::from(want));
     body.insert("purpose".into(), Value::from(purpose));
+    if want == "notary" {
+        body.insert("entry".into(), Value::from("release-notary"));
+    }
     let key = request_key(actor, &nonce);
     (key, Record::new("request", &key, body))
+}
+
+#[test]
+fn a_notary_request_binds_the_release_entry_across_mixed_version_peers() {
+    let (_, record) = request_body(&A, 1, "notary", "release.notary");
+    check(&record).unwrap();
+    let mut legacy = record.clone();
+    legacy.body.remove("entry");
+    check(&legacy).unwrap();
+    let mut wrong = record.clone();
+    wrong.body.insert("entry".into(), Value::from("notary"));
+    check(&wrong).unwrap();
+
+    let mut feed = Feed::new();
+    feed.put(A, legacy);
+    feed.put(A, wrong);
+    let book = feed.book(0);
+    assert!(book.threads.is_empty());
+    assert_eq!(book.inert.len(), 2);
+}
+
+#[test]
+fn a_posted_legacy_notary_request_is_reissued_with_its_entry_binding() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let paths = &lab.paths[1];
+    need::test_alab_policy(paths);
+    let raised = need::raise(paths, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let receipt = with_store(paths, |session, store, _scope| {
+        let mut legacy = request_record(&session.actor(), &raised);
+        legacy.body.remove("entry");
+        let payload = legacy.command()?.encode()?;
+        store.commit_catalog(session, &payload)
+    })
+    .unwrap();
+    need::absorb(paths, &[(raised.id, Absorb::Flushed(receipt.id.to_vec()))]).unwrap();
+    assert_eq!(need::peek(paths).unwrap()[0].state, State::Open);
+    let old_need = need::peek(paths).unwrap()[0].clone();
+    let posted = pass_at(paths, 1_000_000_000).unwrap();
+    assert_eq!(posted.posted, 1);
+    let next = pass_at(paths, 1_000_000_000).unwrap();
+    assert_eq!(next.posted, 0);
+    assert_eq!(next.threads.len(), 1);
+    assert_eq!(next.threads[0].want, Want::Notary);
+    let replacement = need::peek(paths).unwrap()[0].clone();
+    assert_ne!(replacement.id, raised.id);
+
+    let facts = facts(paths, 1_000_000_000).unwrap();
+    with_store(paths, |session, store, scope| {
+        let log = Log::read_with(session, store, scope, decode)?;
+        let ctx = super::context(&facts, session, scope, 1_000_000_000);
+        let current = Book::read(&log, &ctx);
+        let old_key = request_key(&session.actor(), &raised.id);
+        assert!(!current.threads.contains_key(&old_key));
+        let mut old_view = Vec::new();
+        let mut terminal_seq = None;
+        let mut replacement_seq = None;
+        for (operation, command) in log.eligible() {
+            let mut record = record_of(&command)?;
+            if record.kind == "request" && record.body.contains_key("entry") {
+                replacement_seq = Some(operation.header.sequence);
+                continue; // 0.146's closed schema rejects this request.
+            }
+            if record.kind == "retired" && record.key == hex::encode_lower(&old_key) {
+                terminal_seq = Some(operation.header.sequence);
+            }
+            if record.kind == "request" {
+                // Use an unchanged copyable want to exercise the old reader's terminal
+                // reduction without teaching the current reader the legacy notary meaning.
+                record
+                    .body
+                    .insert("want".into(), Value::from("site-deployer-key"));
+            }
+            old_view.push(Entry {
+                actor: operation.header.actor,
+                sequence: operation.header.sequence,
+                id: operation.header.id,
+                received_ms: operation.receipt.received_ms,
+                record,
+            });
+        }
+        assert!(terminal_seq.unwrap() < replacement_seq.unwrap());
+        let old = Book::project(old_view, &ctx);
+        assert_eq!(reason(&old, &old_key), Some(Reason::Superseded));
+        assert!(old.threads.values().all(Thread::ended));
+        Ok(())
+    })
+    .unwrap();
+
+    // A crash before ledger adoption retries the same successor and creates no third request,
+    // without retiring the recovered successor before the ledger adopts its id.
+    need::with_ledger(paths, |rows, _| {
+        rows[0] = old_need;
+        Ok(())
+    })
+    .unwrap();
+    let recovered = pass_at(paths, 1_000_000_000).unwrap();
+    assert_eq!(recovered.posted, 0);
+    assert_eq!(recovered.answered, 0);
+    assert_eq!(need::peek(paths).unwrap()[0].id, replacement.id);
+    let after_recovery = pass_at(paths, 1_000_000_000).unwrap();
+    assert_eq!(after_recovery.threads.len(), 1);
+    assert!(!after_recovery.threads[0].ended());
+    assert_eq!(need::peek(paths).unwrap()[0].state, State::Open);
 }
 
 fn attested(record: Record) -> Record {
@@ -367,10 +570,10 @@ fn a_custodians_decision_counts_only_for_the_request_it_names() {
     }
 }
 
-/// The whole path over a real scratch Commons: m2 lacks `notary`, which the vault holds in
+/// The whole path over a real scratch Commons: m2 lacks `release-notary`, which the vault holds in
 /// m1's own section; m2's pass posts the request, m1's pass sweeps and its custodian pass
-/// copies the entry into `[m2]` alone and publishes, and m2 applies it, which fulfils a need
-/// no consumer checks for itself.
+/// copies the entry into `[m2]` alone and publishes, and m2 applies it. Only the notary
+/// consumer's live success fulfills the need.
 #[test]
 fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -380,7 +583,7 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     let admin = client::admin_open(&lab.paths[0]).unwrap();
     let mut doc = admin.doc.clone();
     let m1 = Audience::Hosts(vec!["m1".into()]);
-    doc.set_entry(&m1, "notary", b"apple").unwrap();
+    doc.set_entry(&m1, "release-notary", b"apple").unwrap();
     doc.set_entry(&m1, "m1-only", b"stays").unwrap();
     client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
     for paths in &lab.paths {
@@ -412,7 +615,7 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     let text = &reopened.doc;
     let m2 = Audience::Hosts(vec!["m2".into()]);
     assert!(
-        text.entry(&m2, "notary")
+        text.entry(&m2, "release-notary")
             .is_some_and(|entry| entry.if_absent)
     );
     assert!(
@@ -426,11 +629,17 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     let published = &need::list(&lab.paths[1]).unwrap()[0];
     assert_eq!(published.state, State::Published, "{}", published.line);
     client::sync(&lab.paths[1], None).unwrap();
-    let done = &need::list(&lab.paths[1]).unwrap()[0];
+    assert_eq!(
+        need::list(&lab.paths[1]).unwrap()[0].state,
+        State::Published
+    );
+    let done = need::satisfied(&lab.paths[1], &Want::Notary, Purpose::ReleaseNotary)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         done.state,
         State::Fulfilled,
-        "the applied version gives this Mac the entry: {}",
+        "the live consumer accepted this Mac's entry: {}",
         done.line
     );
     assert_eq!(
@@ -525,7 +734,7 @@ fn a_mailbox_totp_never_travels_without_its_password() {
     let mut doc = admin.doc.clone();
     let m1 = Audience::Hosts(vec!["m1".into()]);
     doc.set_entry(&m1, "m29_totp", b"seed").unwrap();
-    doc.set_entry(&m1, "notary", b"apple").unwrap();
+    doc.set_entry(&m1, "release-notary", b"apple").unwrap();
     client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
     for paths in &lab.paths {
         client::sync(paths, None).unwrap();
@@ -543,7 +752,7 @@ fn a_mailbox_totp_never_travels_without_its_password() {
     let reopened = client::admin_open(&lab.paths[0]).unwrap();
     let m2 = Audience::Hosts(vec!["m2".into()]);
     assert!(
-        reopened.doc.entry(&m2, "notary").is_some(),
+        reopened.doc.entry(&m2, "release-notary").is_some(),
         "this pass published"
     );
     assert!(
@@ -579,4 +788,31 @@ fn a_request_no_need_stands_for_is_superseded_so_its_successor_is_live() {
     }));
     let open = &need::list(&lab.paths[1]).unwrap()[0];
     assert_eq!(open.state, State::Open, "{}", open.line);
+}
+
+#[test]
+fn custodian_pass_requires_commons_writer_before_publishing_vault() {
+    let lab = Lab::new(&[Role::Reader, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let m1 = Audience::Hosts(vec!["m1".into()]);
+    doc.set_entry(&m1, "release-notary", b"apple").unwrap();
+    let published = client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let now = 1_000_000_000;
+    need::raise(&lab.paths[1], Want::Notary, Purpose::ReleaseNotary).unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().posted, 1);
+    repair_commons(&lab, 3);
+
+    // m1 is a Commons Reader: custodian_pass_at must refuse before copying/publishing the vault.
+    assert!(custodian_pass_at(&lab.paths[0], now).is_err());
+    let reopened = client::admin_open(&lab.paths[0]).unwrap();
+    assert_eq!(reopened.seq(), published.seq);
+    let m2 = Audience::Hosts(vec!["m2".into()]);
+    assert!(reopened.doc.entry(&m2, "release-notary").is_none());
 }

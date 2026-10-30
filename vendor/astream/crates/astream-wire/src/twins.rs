@@ -154,6 +154,28 @@ pub const fn sync_clamp_parent_count(len: u64, cap: u64) -> u64 {
     }
 }
 
+/// `wake_rank_max` as `wake_island.rs` defines it in Clean:
+/// `if cur_rank < cand_rank then cand_rank else cur_rank`.
+#[must_use]
+pub const fn wake_rank_max(cur_rank: u64, cand_rank: u64) -> u64 {
+    if cur_rank < cand_rank {
+        cand_rank
+    } else {
+        cur_rank
+    }
+}
+
+/// `wake_charge_clamp` as `wake_island.rs` defines it in Clean:
+/// `if used < budget then used else budget`.
+#[must_use]
+pub const fn wake_charge_clamp(used: u64, budget: u64) -> u64 {
+    if used < budget {
+        used
+    } else {
+        budget
+    }
+}
+
 #[cfg(test)]
 #[path = "../twin_answers.rs"]
 mod twin_answers;
@@ -251,6 +273,12 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::sync_clamp_parent_count(a, b)), want);
+        let want = "012112222";
+        assert_eq!(answers(|[a, b]| crate::wake::wake_rank_max(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::wake_rank_max(a, b)), want);
+        let want = "000011012";
+        assert_eq!(answers(|[a, b]| crate::wake::wake_charge_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::wake_charge_clamp(a, b)), want);
     }
 
     // Not vacuous: `heal_frontier_monotone` with its branches swapped answers otherwise.

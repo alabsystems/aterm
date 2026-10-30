@@ -389,3 +389,84 @@ fn enrollment_serve_clears_cached_peer_round_before_checking_enrollment() {
     assert!(repair.application().is_none());
     assert_eq!(repair.cursor, Some([9; 32]));
 }
+
+#[test]
+fn roster_denied_member_is_refused_enrollment_and_commons_sync() {
+    use aterm_secrets::swarm_roster::{ROSTER_ENTRY, SwarmMember, SwarmRoster};
+
+    let lab = Lab::new(true);
+    let m2_rec = client::machine_identity(&lab.paths[1])
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let denied_roster = SwarmRoster {
+        members: vec![SwarmMember {
+            recipient: m2_rec.clone(),
+            vault_name: "m2".into(),
+            label: "m2".into(),
+            aliases: Vec::new(),
+            hint: None,
+            admitted_ms: 1,
+            claimed_label: None,
+            claimed_at_ms: None,
+            node_id: Some("aa".repeat(16)),
+            node_key: None,
+        }],
+        deny_nodes: vec!["aa".repeat(16)],
+        deny_labels: vec!["m2".into()],
+    };
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        denied_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+
+    // 1. Enrollment is refused while m2 is denied in aterm-swarm-roster.
+    let pending = lab.pending();
+    let (a, b) = lab.exchange(&pending);
+    assert!(
+        a.is_err() || b.is_err(),
+        "denied member must not enroll: {a:?} {b:?}"
+    );
+
+    // 2. Lift the deny-list so m2 can enroll, then re-deny m2 and verify Commons sync is refused.
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let active_roster = SwarmRoster {
+        deny_nodes: Vec::new(),
+        deny_labels: Vec::new(),
+        ..denied_roster.clone()
+    };
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        active_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+
+    let (a, b) = lab.exchange(&pending);
+    a.unwrap();
+    b.unwrap();
+
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        denied_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+
+    let enrolled = lab.endpoint(1);
+    let (a, b) = lab.exchange(&enrolled);
+    assert!(
+        a.is_err(),
+        "responder must refuse Commons sync from roster-denied peer: {a:?} {b:?}"
+    );
+}

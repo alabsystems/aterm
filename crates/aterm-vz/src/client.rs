@@ -583,6 +583,7 @@ impl Start for Detached {
             .create(true)
             .append(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&log_path)
             .map_err(|e| format!("{}: {e}", log_path.display()))?;
         let err = log
@@ -1003,8 +1004,32 @@ pub fn state(paths: &Paths, span: Duration) -> Result<StateReport, ClientError> 
 
 /// The last lines of the helper's log, for a start that failed.
 fn log_tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
+    const TAIL_BYTES: u64 = 64 * 1024;
+    let (text, sought) = (|| -> Option<(String, bool)> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let sought =
+            meta.len() > TAIL_BYTES && file.seek(SeekFrom::End(-(TAIL_BYTES as i64))).is_ok();
+        let mut buf = Vec::new();
+        file.take(TAIL_BYTES).read_to_end(&mut buf).ok()?;
+        Some((String::from_utf8_lossy(&buf).into_owned(), sought))
+    })()
+    .unwrap_or_default();
+    let all_lines: Vec<&str> = text.lines().collect();
+    let lines = if sought && all_lines.len() > 1 {
+        &all_lines[1..]
+    } else {
+        &all_lines[..]
+    };
     let from = lines.len().saturating_sub(5);
     let tail = lines[from..].join(" / ");
     if tail.is_empty() {

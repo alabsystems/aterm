@@ -160,7 +160,7 @@ fn real_step(s: &State, look: Look) -> (Step, Facts) {
 
 fn dry_word(s: &State, step: &Step, f: &Facts) -> String {
     let act = match step {
-        Step::Wait(why) => return format!("wait:{why}"),
+        Step::Wait(why) | Step::Tell(why) => return format!("wait:{why}"),
         Step::Announce => "would-announce".to_string(),
         Step::Terminate => "would-restart".to_string(),
         Step::Fresh => "would-restart:fresh".to_string(),
@@ -207,7 +207,7 @@ fn lands(step: Step) -> Option<i64> {
         Step::GiveUp => Some(2),
         Step::Terminate | Step::Fresh => Some(3),
         Step::Rearm => Some(0),
-        Step::Wait(_) | Step::Void(_) => None,
+        Step::Wait(_) | Step::Void(_) | Step::Tell(_) => None,
     }
 }
 

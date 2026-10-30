@@ -37,6 +37,9 @@ astream-aead = { path = "crates/astream-aead", version = "0.2.0" }
 # dependencies, its only unsafe confined to two modules, cfg(target_vendor = "apple")
 # and cfg(unix).
 astream-sys = { path = "crates/astream-sys", version = "0.2.0" }
+astream-broker = { path = "crates/astream-broker", version = "0.2.0" }
+astream-term = { path = "crates/astream-term", version = "0.2.0" }
+astream-effects = { path = "crates/astream-effects", version = "0.2.0" }
 # Third-party (crates.io only — no git, no path-to-private):
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

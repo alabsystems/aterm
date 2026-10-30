@@ -1391,7 +1391,11 @@ fn wait_for(
     gate: &Gate<'_>,
     owner: &mut dyn Owner,
 ) -> Result<Held, Ended> {
-    let until = Instant::now() + gate.hang + LOCK_GRACE;
+    let wait_span = gate.hang.saturating_add(LOCK_GRACE);
+    let now = Instant::now();
+    let until = now
+        .checked_add(wait_span)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let mut told = false;
     loop {
         if !told && running(gate.state) {
@@ -1411,7 +1415,7 @@ fn wait_for(
         if Instant::now() >= until {
             return Err(Ended::NotRun(format!(
                 "another sign-in held the lock past {} min",
-                (gate.hang + LOCK_GRACE).as_secs() / 60
+                wait_span.as_secs() / 60
             )));
         }
         std::thread::sleep(POLL);
@@ -1570,6 +1574,8 @@ impl Approver for LadderApprover<'_, '_> {
         if self.ready && !(gate.stopped)() {
             // A stop ends the automatic rung as grok's own end does; it is told apart below.
             let finished = || (handoff.finished)() || (gate.stopped)();
+            let now = Instant::now();
+            let auto_until = now.checked_add(AUTO_WITHIN).unwrap_or(handoff.deadline);
             let within = Handoff {
                 url: handoff.url,
                 code: handoff.code,
@@ -1577,7 +1583,7 @@ impl Approver for LadderApprover<'_, '_> {
                 hosts: handoff.hosts,
                 email: handoff.email,
                 finished: &finished,
-                deadline: handoff.deadline.min(Instant::now() + AUTO_WITHIN),
+                deadline: handoff.deadline.min(auto_until),
             };
             self.ran = true;
             let said = self.auto.approve(&within);

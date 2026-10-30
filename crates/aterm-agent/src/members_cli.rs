@@ -9,6 +9,14 @@
 //! that shows it; `--no-wait` asks and returns, as install.sh's windowless lanes run it, having
 //! joined the ALab vault without waiting and started this Mac's vault subscriber, which asks the
 //! members again while this Mac waits.
+//!
+//! F16's verbs run in this process, on this Mac's own vault files: `list` prints the membership
+//! log's members and the Macs it removed, `remove` takes a member out as this Mac (any member,
+//! no admin), and `undo` lists the "Undo <label>'s removals" rows this Mac shows and where each
+//! quorum stands. It signs nothing: a share of the quorum `Remove` is a person's act (§3.2), a
+//! press of the row on this Mac's Machines view, which a terminal, an agent, `aterm ctl` or a
+//! script over SSH cannot give. On a vault with no membership log yet, `remove` says an admin's
+//! `aterm secrets revoke` is the way.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -25,9 +33,17 @@ use aterm_secrets::phrase::Phrase;
 
 const USAGE: &str = "aterm members: Macs joining ALab and the members that let them in
   requests              the Macs asking that this Mac hears
-  allow <name>          show a phrase for that Mac on this Mac's screen
+  allow [--again] <name>
+                        show a phrase for that Mac on this Mac's screen (--again: a Mac
+                        the vault removed, which the run restores)
   invite                show a phrase for whichever Mac types it next
   ignore <name>         hide that Mac's request on this Mac
+  list                  the members and the Macs the vault removed, as this Mac's log says
+  remove <name> [--stolen]
+                        take that Mac out of ALab as this Mac (--stolen: rotate the fleet
+                        code too, and name what to rotate at the providers)
+  undo [<name>]         the Undo rows this Mac shows for <name>'s removals; a person's
+                        press of the row on the Machines view signs this Mac's share
   join [<phrase>] [--member <name>] [--at <host:port>]... [--no-wait]
                         find ALab, ask every member, and type the phrase one shows
   status                whether this Mac is a member, waiting, or neither";
@@ -59,6 +75,18 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
             aterm_ctl::main_entry(vec!["members".into(), "requests".into()])
         }
         Some("allow" | "ignore") if args.len() == 2 => to_window(&args),
+        Some("allow") if args.len() == 3 && args[1] == "--again" => to_window(&args),
+        Some("list") if args.len() == 1 => in_vault(list_said),
+        Some("remove") => match RemoveArgs::parse(&args[1..]) {
+            Ok(remove) => in_vault(|paths| remove_said(paths, &remove)),
+            Err(why) => {
+                eprintln!("aterm members remove: {why}");
+                ExitCode::from(2)
+            }
+        },
+        Some("undo") if args.len() <= 2 => {
+            in_vault(|paths| undo_said(paths, args.get(1).map(String::as_str)))
+        }
         Some("invite") if args.len() == 1 => to_window(&args),
         Some("join") => match JoinArgs::parse(&args[1..]) {
             Ok(join) => run_join(&join),
@@ -73,6 +101,151 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `remove`'s arguments.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RemoveArgs {
+    who: String,
+    stolen: bool,
+}
+
+impl RemoveArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut out = Self::default();
+        for arg in args {
+            match arg.as_str() {
+                "--stolen" => out.stolen = true,
+                flag if flag.starts_with('-') => return Err(format!("unknown option {flag}")),
+                word if out.who.is_empty() => word.clone_into(&mut out.who),
+                _ => return Err("name one Mac".to_owned()),
+            }
+        }
+        if out.who.is_empty() {
+            return Err("name the Mac to remove: its label, name or join code".to_owned());
+        }
+        Ok(out)
+    }
+}
+
+/// Run one of F16's in-process verbs on this Mac's own vault files: its lines on stdout, or its
+/// refusal on stderr and exit 1.
+fn in_vault(verb: impl FnOnce(&Paths) -> Result<Vec<String>, String>) -> ExitCode {
+    let said = Paths::live()
+        .map_err(|error| error.to_string())
+        .and_then(|paths| verb(&paths));
+    match said {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("aterm members: {why}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `list`'s lines: one per member, then one per Mac the log removed.
+fn list_said(paths: &Paths) -> Result<Vec<String>, String> {
+    let listed = client::member_list(paths)
+        .map_err(|error| error.to_string())?
+        .ok_or("this Mac's vault has no membership log yet")?;
+    Ok(listed
+        .iter()
+        .map(|mac| match &mac.removed {
+            Some(note) => format!(
+                "{} {} code={} removed by={}{}",
+                mac.label,
+                mac.name,
+                mac.code,
+                note.by.join(","),
+                if note.quorum { " quorum" } else { "" }
+            ),
+            None => format!(
+                "{} {} code={}{}",
+                mac.label,
+                mac.name,
+                mac.code,
+                mac.admitted_by
+                    .as_ref()
+                    .map_or(" founder".to_owned(), |by| format!(" admitted by={by}"))
+            ),
+        })
+        .collect())
+}
+
+/// `remove`'s lines: what was removed and rotated, what the Mac could read, and on `--stolen`
+/// the one `NEEDS YOU:` line.
+fn remove_said(paths: &Paths, args: &RemoveArgs) -> Result<Vec<String>, String> {
+    let removal =
+        client::remove_member(paths, &args.who, args.stolen).map_err(|error| error.to_string())?;
+    let mut lines = vec![format!(
+        "removed {}: {} records, new keys for {}",
+        removal.label,
+        removal.signed,
+        removal.rotated.join(", ")
+    )];
+    if !removal.could_read.is_empty() {
+        lines.push(format!(
+            "{} could read: {}",
+            removal.label,
+            removal.could_read.join(", ")
+        ));
+    }
+    if removal.fleet_code_rotated {
+        lines.push("rotated aterm-fleet-code".to_owned());
+    }
+    lines.extend(removal.envelope_notes);
+    lines.extend(removal.needs_you);
+    Ok(lines)
+}
+
+/// `undo [<name>]`'s lines: the Undo rows this Mac shows ([`client::undo_offers`]), `who`'s
+/// alone where it names one. It signs nothing ([`undo_lines`]).
+fn undo_said(paths: &Paths, who: Option<&str>) -> Result<Vec<String>, String> {
+    let offers = client::undo_offers(paths).map_err(|error| error.to_string())?;
+    Ok(undo_lines(&offers, who))
+}
+
+/// One line per Undo row (by its remover's label or join code where `who` names one), each
+/// saying where its quorum stands and that a person's press of the row signs this Mac's share
+/// (§3.2); a line saying so where no row is shown (F16's review: the verb signed a share from any
+/// terminal, agent or SSH session, which the window refuses for a press it did not get).
+fn undo_lines(offers: &[client::UndoOffer], who: Option<&str>) -> Vec<String> {
+    let named = |offer: &&client::UndoOffer| {
+        who.is_none_or(|word| {
+            offer.label.eq_ignore_ascii_case(word) || offer.code.eq_ignore_ascii_case(word)
+        })
+    };
+    let lines: Vec<String> = offers
+        .iter()
+        .filter(named)
+        .map(|offer| {
+            format!(
+                "Undo {}'s removals ({} other Macs out with this one): {}; {} more shares undo \
+                 them",
+                offer.label,
+                offer.others,
+                if offer.signed {
+                    "this Mac signed its share"
+                } else {
+                    "press the row on this Mac's Machines view to sign this Mac's share \
+                     (a person's act, never a terminal's)"
+                },
+                offer.needed
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return vec![match who {
+            Some(word) => format!("no removal by {word} keeps this Mac out with an Undo to sign"),
+            None => "no removal keeps this Mac out with an Undo to sign".to_owned(),
+        }];
+    }
+    lines
 }
 
 /// A member's verb, sent to this Mac's running window, which answers one line. `allow` and
@@ -1174,5 +1347,70 @@ mod tests {
         assert!(parse(&["--no-wait", "maple", "river", "ocean"]).is_err());
         assert!(parse(&["--member"]).is_err());
         assert!(parse(&["--wait"]).is_err());
+    }
+
+    /// `members undo` signs nothing: it lists the Undo rows and says a person's press of one
+    /// signs this Mac's share; on a Mac no removal keeps out it says so rather than refusing as
+    /// a signing verb would (F16's review).
+    ///
+    /// NEGATIVE CONTROL: have `undo_said` call `client::undo_removals(paths, who)` as before:
+    /// the Mac with no vault refuses ("…no membership log…") and the first assert fails.
+    #[test]
+    fn members_undo_lists_the_rows_and_signs_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let (paths, _device) = mac(root.path(), "m9");
+        assert_eq!(
+            undo_said(&paths, Some("m7")),
+            Ok(vec![
+                "no removal by m7 keeps this Mac out with an Undo to sign".to_owned()
+            ])
+        );
+        let offer = |label: &str, signed: bool| client::UndoOffer {
+            remover: [7; 48],
+            label: label.to_owned(),
+            code: format!("{label}-code"),
+            others: 4,
+            signed,
+            needed: 3,
+        };
+        let offers = [offer("m7", false), offer("m12", true)];
+        let lines = undo_lines(&offers, None);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Undo m7's removals (4 other Macs"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("press the row on this Mac's Machines view"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("this Mac signed its share"), "{lines:?}");
+        assert_eq!(undo_lines(&offers, Some("M12-CODE")).len(), 1);
+    }
+
+    /// `members remove` names one Mac, with `--stolen` anywhere; no Mac, two, or another flag
+    /// is refused before anything is read.
+    #[test]
+    fn remove_names_one_mac() {
+        let parse = |args: &[&str]| {
+            RemoveArgs::parse(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["m12"]),
+            Ok(RemoveArgs {
+                who: "m12".into(),
+                stolen: false
+            })
+        );
+        assert_eq!(
+            parse(&["--stolen", "m12"]),
+            Ok(RemoveArgs {
+                who: "m12".into(),
+                stolen: true
+            })
+        );
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["m12", "m13"]).is_err());
+        assert!(parse(&["m12", "--force"]).is_err());
     }
 }

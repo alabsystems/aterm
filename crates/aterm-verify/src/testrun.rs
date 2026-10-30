@@ -439,7 +439,7 @@ pub fn poles(bins: &[Binary], walls: &[Duration], total: Duration) -> String {
 
 /// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time (at least one),
 /// each worker booking its children into the calling stage's memory meter
-/// ([`crate::memory::current`]).
+/// ([`crate::memory::current`]) and handing them its cover marker ([`crate::memory::cover`]).
 pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>
 where
     T: Send,
@@ -448,10 +448,12 @@ where
     let answers: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let meter = crate::memory::current();
+    let cover = crate::memory::cover();
     std::thread::scope(|scope| {
         for _ in 0..jobs.clamp(1, order.len().max(1)) {
             scope.spawn(|| {
                 let _metering = crate::memory::metering(meter.clone());
+                let _covering = crate::memory::covering(cover.clone());
                 while let Some(&i) = order.get(next.fetch_add(1, Ordering::SeqCst)) {
                     let out = run(i);
                     *answers[i]

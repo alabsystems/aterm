@@ -239,17 +239,20 @@ pub(crate) fn event_posted(seen: PostedKey) -> bool {
     NOTED.load(Ordering::Acquire) && with_ledger(|ledger| ledger.take(&seen))
 }
 
-/// One burst: `count` presses `interval_ms` apart, each posted by `post_one`, with the gate read
-/// before every key. Once `front` is set the burst stops with nothing more posted, and its `Err`
-/// says how many were. Each key is counted into `posted` before `post_one` runs. A `post_one`
-/// error ends the burst with that error.
+/// One burst: `count` presses `interval_ms` apart, each posted by `post_one` (told how many this
+/// burst posted before it), with the gates read before every key. Once `front` is set, or
+/// `confirmation_up` answers yes (one of the person's confirmations is on screen,
+/// [`crate::alert_keys::confirmation_up`]), the burst stops with nothing more posted, and its
+/// `Err` says how many were. Each key is counted into `posted` before `post_one` runs. A
+/// `post_one` error ends the burst with that error.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn run_burst(
     count: u32,
     interval_ms: u64,
     front: &AtomicBool,
+    confirmation_up: impl Fn() -> bool,
     posted: &AtomicU64,
-    mut post_one: impl FnMut() -> Result<(), String>,
+    mut post_one: impl FnMut(u32) -> Result<(), String>,
 ) -> Result<u32, String> {
     let mut sent = 0u32;
     for i in 0..count {
@@ -262,11 +265,69 @@ pub(crate) fn run_burst(
                  a tab menu came to the front, and its buttons are the person's\n"
             ));
         }
+        if confirmation_up() {
+            return Err(crate::alert_keys::confirmation_up_stop(sent));
+        }
         posted.fetch_add(1, Ordering::AcqRel);
-        post_one()?;
+        post_one(sent)?;
         sent += 1;
     }
     Ok(sent)
+}
+
+/// Fence the key queue as one of the person's confirmations opens, after its
+/// [`crate::alert_keys::ConfirmationUp`] is held: wait out a key a burst is posting now (each
+/// press is noted and posted under [`POSTING`], which reads [`crate::alert_keys::confirmation_up`]
+/// first), then take every key-down and key-up already queued, so no key posted (or typed) before
+/// the question was on screen can answer it. A key a burst tries after this refuses under the
+/// same lock. Modifier changes stay queued, so the window's own modifier state stays true.
+/// `false` when the queue would not drain (more than 16384 queued keys): the caller then must not
+/// let a key answer the question. `true` at once in a process that launched without a window
+/// ([`crate::platform::Windowed`]), which has no key queue.
+#[cfg(target_os = "macos")]
+pub(crate) fn fence_queued_keys(_mtm: crate::appkit::MainThread) -> bool {
+    use aterm_objc::{Bool, Id, Sel, class, sel};
+
+    use crate::appkit;
+
+    // A process that launched without a window has no AppKit key queue to drain.
+    let Some(_windowed) = crate::platform::Windowed::get() else {
+        return true;
+    };
+    let _order = POSTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: on the main thread (`_mtm`). `+sharedApplication` is `-(id)` and returns the
+    // immortal singleton; `+distantPast` is `-(NSDate *)`, +0 and autoreleased, used within this
+    // frame; `kCFRunLoopDefaultMode` is a CFString constant toll-free bridged to NSString;
+    // `-nextEventMatchingMask:untilDate:inMode:dequeue:` is
+    // `-(NSEvent *)(NSEventMask, NSDate *, NSRunLoopMode, BOOL)`, and a past date makes it return
+    // a queued event or nil at once without running the loop's sources.
+    unsafe {
+        let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+        let past = appkit::send_id(class(c"NSDate").as_id(), sel!(distantPast));
+        if app.is_null() || past.is_null() {
+            return false;
+        }
+        let mode = Id::from_ptr(aterm_objc::cf::kCFRunLoopDefaultMode.cast_mut().cast());
+        let next: unsafe extern "C-unwind" fn(Id, Sel, usize, Id, Id, Bool) -> Id =
+            aterm_objc::checked_msg();
+        for _ in 0..16_384 {
+            if next(
+                app,
+                sel!(nextEventMatchingMask:untilDate:inMode:dequeue:),
+                (1 << NS_EVENT_TYPE_KEY_DOWN) | (1 << NS_EVENT_TYPE_KEY_UP),
+                past,
+                mode,
+                Bool::YES,
+            )
+            .is_null()
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 const NAMED: &[(&str, u16, &str)] = &[
@@ -560,8 +621,9 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         spec.count,
         spec.interval_ms,
         &PERSONS_FRONT,
+        crate::alert_keys::confirmation_up,
         &POSTED,
-        || {
+        |sent| {
             let _posting = crate::askpass::PROMPT_INPUT
                 .posting_permit()
                 .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
@@ -640,6 +702,12 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 let _order = POSTING
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Read again under the lock a confirmation's fence takes (`fence_queued_keys`):
+                // a question that opened since the gate above has drained the queue, and this
+                // key would land behind its fence.
+                if crate::alert_keys::confirmation_up() {
+                    return Err(crate::alert_keys::confirmation_up_stop(sent));
+                }
                 note_posted(&keys)?;
                 // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared
                 // application with a live event; AppKit documents it as safe from any thread, and
@@ -823,14 +891,21 @@ mod tests {
         let front = AtomicBool::new(false);
         let posted = AtomicU64::new(0);
         let mut sent = 0;
-        let out = run_burst(5, 0, &front, &posted, || {
-            sent += 1;
-            if sent == 2 {
-                // The page came to the front: the main thread's word.
-                front.store(true, Ordering::Release);
-            }
-            Ok(())
-        });
+        let out = run_burst(
+            5,
+            0,
+            &front,
+            || false,
+            &posted,
+            |_| {
+                sent += 1;
+                if sent == 2 {
+                    // The page came to the front: the main thread's word.
+                    front.store(true, Ordering::Release);
+                }
+                Ok(())
+            },
+        );
         let refusal = out.expect_err("stopped at the page");
         assert!(refusal.contains("posted=2"), "{refusal}");
         assert_eq!(sent, 2, "nothing posted after it came to the front");
@@ -838,18 +913,78 @@ mod tests {
 
         let quiet = AtomicBool::new(false);
         let mut sent = 0;
-        let all = run_burst(5, 0, &quiet, &posted, || {
-            sent += 1;
-            Ok(())
-        });
+        let all = run_burst(
+            5,
+            0,
+            &quiet,
+            || false,
+            &posted,
+            |_| {
+                sent += 1;
+                Ok(())
+            },
+        );
         assert_eq!(all, Ok(5));
         assert_eq!(posted.load(Ordering::Acquire), 7);
 
         let mut sent = 0;
-        let none = run_burst(5, 0, &front, &posted, || {
-            sent += 1;
-            Ok(())
-        });
+        let none = run_burst(
+            5,
+            0,
+            &front,
+            || false,
+            &posted,
+            |_| {
+                sent += 1;
+                Ok(())
+            },
+        );
+        assert!(none.is_err_and(|e| e.contains("posted=0")));
+        assert_eq!(sent, 0);
+    }
+
+    /// One of the person's confirmations coming up after the second key of five (a posted ⌘W
+    /// whose Close question opened) stops the burst before the third, and the refusal says how
+    /// many it posted; one already up posts none. NEGATIVE CONTROL: with `run_burst`'s
+    /// `confirmation_up` gate removed, all five posted and the burst answered `Ok(5)`.
+    #[test]
+    fn a_running_burst_stops_once_a_confirmation_comes_up() {
+        let front = AtomicBool::new(false);
+        let up = AtomicBool::new(false);
+        let posted = AtomicU64::new(0);
+        let mut told = Vec::new();
+        let out = run_burst(
+            5,
+            0,
+            &front,
+            || up.load(Ordering::Acquire),
+            &posted,
+            |sent| {
+                told.push(sent);
+                if sent == 1 {
+                    up.store(true, Ordering::Release);
+                }
+                Ok(())
+            },
+        );
+        let refusal = out.expect_err("stopped at the question");
+        assert!(refusal.contains("posted=2"), "{refusal}");
+        assert!(refusal.contains("confirmation"), "{refusal}");
+        assert_eq!(told, [0, 1], "each post is told how many came before it");
+        assert_eq!(posted.load(Ordering::Acquire), 2);
+
+        let mut sent = 0;
+        let none = run_burst(
+            5,
+            0,
+            &front,
+            || up.load(Ordering::Acquire),
+            &posted,
+            |_| {
+                sent += 1;
+                Ok(())
+            },
+        );
         assert!(none.is_err_and(|e| e.contains("posted=0")));
         assert_eq!(sent, 0);
     }

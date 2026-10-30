@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-mod table;
+pub(crate) mod table;
 
 const HANG: Duration = Duration::from_secs(60);
 const USAGE: &str = "commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS]";

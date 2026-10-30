@@ -710,7 +710,7 @@ impl Journal {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600);
+            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         match o.open(path) {
             Ok(f) => j.file = Some(f),

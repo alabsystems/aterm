@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v19 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v20 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -204,8 +204,11 @@ reads its output. For a hand-driven agent:
 - Budget timeouts and follow-up counts; escalate when spent or after 2-3 follow-ups without
   progress.
 - Pass on the owner's direction, never invented review gates ("wait for sign-off"); when a
-  worker asks for a decision with no owner gate, tell it to decide. Escalate true human-only
-  decisions on a `NEEDS YOU:` report line or `aterm ctl @s-a meta set attention '<why>'`.
+  worker asks for a decision with no owner gate, tell it to decide. A worker that waits on a
+  go-ahead to build, test, commit or push its own work to main gets it from you, never from a
+  person (owner ruling 2026-10-29; Cruise and Land type the owner's standing go-ahead,
+  `go-ahead@v1`, themselves). Escalate true human-only decisions on a `NEEDS YOU:` report line
+  or `aterm ctl @s-a meta set attention '<why>'`.
 - Respect active keyboard input (`human_ms=` < 120000) and other lease holders; read unknown
   screens (`text`, `image`) before sending keys; stop and re-read if the screen changes
   unexpectedly.

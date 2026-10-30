@@ -72,6 +72,9 @@ fn under_each_host(scenario: impl Fn(ConsoleHostKind)) {
     let _serial = HOST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A bundled host a session starts must answer: a missed 250 ms window would put it on the
+    // inbox host under load and fail `held_running`'s host check.
+    aterm_pty::set_health_window_for_test(MUST_HAPPEN);
     for choice in [
         ConsoleHostChoice::from_config(Some("inbox")),
         ConsoleHostChoice::Auto,

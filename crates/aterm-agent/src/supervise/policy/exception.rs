@@ -13,9 +13,9 @@ use super::super::config::{Autopilot, SupervisorConfig};
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, RULE_LOGIN, RosterWord, SAME_REPLY, TurnEndAction, TurnEndReading,
-    TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced, login_wall_moves,
-    login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
+    Composer, ContextFill, GO_AHEAD_REFUSED, RULE_LOGIN, RosterWord, SAME_REPLY, TurnEndAction,
+    TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced,
+    login_wall_moves, login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
 };
 use crate::harness::acts::{HeldBy, HoldLeg};
 use crate::harness::repo_work::RepoWork;
@@ -46,6 +46,11 @@ pub const REPEATS_LAND_ACTION: &str = "Open the tab and tell it what is still op
 /// THE LOUD HOLD'S TITLE and its short form ([`Exception::repeats_land`]; the band reads `aterm
 /// stopped typing in window 2, tab 3`, the ask's place after it).
 pub const REPEATS_LAND_TITLE: (&str, &str) = ("aterm stopped typing", "Stopped typing");
+
+/// Why the refusal of the standing go-ahead needs a person ([`Exception::refuses_go_ahead`]).
+const REFUSES_GO_AHEAD: &str = "Its agent refuses the standing go-ahead: it still waits on a \
+                                person to build, test or land its own work, so aterm types \
+                                nothing more.";
 
 /// One exception: the digest's item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +212,36 @@ impl Exception {
             title: Some(REPEATS_LAND_TITLE),
             ..Self::repeats(held)
         }
+    }
+
+    /// THE AGENT REFUSES THE STANDING GO-AHEAD (owner, 2026-10-29): it still parks its own
+    /// reversible work on a person after [`super::go_ahead::RULE_GO_AHEAD`] answered that park its
+    /// limit of times or for an hour ([`TurnEndState::go_ahead_spent`]), or with the same no-work
+    /// reply ([`held_repeats`]), so aterm types nothing more. Needed now, with one action: the
+    /// person's own go-ahead in the tab.
+    #[must_use]
+    pub fn refuses_go_ahead() -> Self {
+        Self {
+            kind: ExceptionKind::Stalled,
+            when: Urgency::Now,
+            why: REFUSES_GO_AHEAD.to_string(),
+            action: "Open the tab and tell it to go ahead.".to_string(),
+            clears: "the agent working outside a break of its own background work, a reply that \
+                     no longer waits on a go-ahead, or a person's turn",
+            escalated: false,
+            notice: None,
+            held: None,
+            title: None,
+        }
+    }
+
+    /// Whether the agent working on a busy screen ends this exception, `at_break` a break of its
+    /// own background work: every exception ends so but the refusal of the standing go-ahead
+    /// ([`Self::refuses_go_ahead`]) at such a break, where the refusal is told and nothing is
+    /// typed ([`super::turn_end::GO_AHEAD_REFUSED`]).
+    #[must_use]
+    pub fn ends_at_work(&self, at_break: bool) -> bool {
+        !(at_break && self.why == REFUSES_GO_AHEAD)
     }
 
     /// A read limit that answered its tries the same, held ([`TurnEndState::repeats`]).
@@ -919,16 +954,23 @@ pub fn exception_for(
     {
         return Some(Exception::unread_limit());
     }
-    let held = state.replies().holds() && {
+    let spent = state
+        .go_ahead_owed(reading, now)
+        .is_some_and(|park| state.go_ahead_spent(&park, now));
+    let decided = (state.replies().holds() || spent).then(|| {
         let mut steps = Vec::new();
         let _ = decide_turn_end_traced(state, reading, cfg, now, &mut steps);
-        super::trace::deciding(&steps).is_some_and(|s| s.check == SAME_REPLY)
-    };
+        super::trace::deciding(&steps).map(|s| s.check)
+    });
+    if decided.flatten() == Some(GO_AHEAD_REFUSED) {
+        return Some(Exception::refuses_go_ahead());
+    }
+    let held = state.replies().holds() && decided.flatten() == Some(SAME_REPLY);
     let Some(kind) = reading.wall else {
         // Held at the screen's reply, or at the wall a track still stands for: a limit's, or another's.
         return held.then(|| {
             if state.repeats(reading) || !state.has_limit_track() {
-                held_repeats(state, reading)
+                held_repeats(state, reading, cfg, now)
             } else {
                 Exception::limit_repeats(reading.program, state.waits_on_named_reset())
             }
@@ -1076,9 +1118,23 @@ pub fn exception_for(
 /// an Open-only one, a need's, a managed worker's, Cruise's and a read wall's among them (limit 3
 /// of §14.0). A wall's hold (its tries spent at the newest kept reply, a reply a read wall said)
 /// stays Later once its notice has left the screen too: an error answered the same is no reply
-/// the agent gave twice, and its turn is not the repository's.
-fn held_repeats(state: &TurnEndState, reading: &TurnEndReading) -> Exception {
+/// the agent gave twice, and its turn is not the repository's. A held reply that parks on a
+/// go-ahead owed ([`TurnEndState::go_ahead_owed`], with answers on) is
+/// [`Exception::refuses_go_ahead`]: what its last reply asks is the go-ahead the owner already
+/// gave.
+fn held_repeats(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> Exception {
     let held = state.held_by().unwrap_or(HeldBy::SameReply);
+    if cfg.answer_questions && state.go_ahead_owed(reading, now).is_some() {
+        return Exception {
+            held: Some(held),
+            ..Exception::refuses_go_ahead()
+        };
+    }
     let repo_leg = state
         .land_held()
         .is_some_and(|hold| hold.read && hold.holds(HoldLeg::Repo));

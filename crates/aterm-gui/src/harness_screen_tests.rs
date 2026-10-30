@@ -38,6 +38,210 @@ fn lan_discovery_uses_only_the_resolved_service_endpoint() {
     }
 }
 
+/// A Bonjour browse lists each instance of the service asked for once, however its case, and
+/// drops one the browse saw leave.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_browse_lists_each_instance_once_until_it_leaves() {
+    let browse = |rmv: bool| {
+        let mut lines = vec![
+            "Browsing for _ssh._tcp.local.",
+            "DATE: ---Wed 29 Oct 2026---",
+            "Timestamp     A/R    Flags  if Domain               Service Type         Instance Name",
+            "10:00:00.100  Add        3  14 local.               _ssh._tcp.           m14 MacBook Air",
+            "10:00:00.101  Add        3  14 local.               _ssh._tcp.           M14 macbook air",
+            "10:00:00.102  Add        3  14 local.               _sftp-ssh._tcp.      other",
+            "10:00:00.103  Add        2  14 local.               _ssh._tcp.           guest",
+        ];
+        if rmv {
+            lines.push(
+                "10:00:00.104  Rmv        0  14 local.               _ssh._tcp.           m14 MacBook Air",
+            );
+        }
+        parse_bonjour_service_instances(&lines.join("\n"), "_ssh._tcp.")
+    };
+    assert_eq!(browse(false), ["m14 MacBook Air", "guest"]);
+    assert_eq!(browse(true), ["guest"], "m14 left");
+}
+
+/// A device-info reply's hex bytes decode to its model, comma kept, and its Darwin version,
+/// each length byte a separator.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_device_info_reply_names_its_model_and_darwin_version() {
+    assert_eq!(
+        parse_bonjour_device_txt(
+            "10:00:00.123  Add  2  14  m14._device-info._tcp.local.  TXT  IN  25 bytes: 0D 6D 6F \
+             64 65 6C 3D 4D 61 63 31 34 2C 32 0A 6F 73 78 76 65 72 73 3D 32 35"
+        ),
+        (Some("Mac14,2".into()), Some(25))
+    );
+    assert_eq!(
+        parse_bonjour_device_txt("model=MacBookPro18,3\\osxvers=21"),
+        (Some("MacBookPro18,3".into()), Some(21))
+    );
+    assert_eq!(parse_bonjour_device_txt(""), (None, None));
+}
+
+/// LAN instances sort numbered Macs first by their number, `m` or `M`, then the rest by name
+/// whatever its case.
+#[cfg(target_os = "macos")]
+#[test]
+fn lan_instances_sort_numbered_macs_first_by_number() {
+    let mut names = vec!["m10", "Zulu", "guest", "M2", "m1x"];
+    names.sort_by_key(|n| natural_lan_sort_key(n));
+    assert_eq!(names, ["m1x", "M2", "m10", "guest", "Zulu"]);
+}
+
+/// The local fallback's load is `vm.loadavg`'s three figures in hundredths, rounded, braces
+/// apart or not; two figures are no load.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_local_fallback_reads_vm_loadavgs_three_loads() {
+    assert_eq!(
+        parse_loadavg_gui("{ 0.996 0.50 2.00 }\n"),
+        Some([100, 50, 200])
+    );
+    assert_eq!(parse_loadavg_gui("{1.23 0.50 2.00}"), Some([123, 50, 200]));
+    assert_eq!(parse_loadavg_gui("{ 1.0 2.0 }"), None);
+}
+
+/// The local fallback's uptime starts at `kern.boottime`'s `sec`, past the space `sysctl` writes
+/// after its `=`, and never at its `usec`.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_local_fallback_boots_at_kern_boottimes_sec() {
+    assert_eq!(
+        boot_secs("{ sec = 1792080066, usec = 752372 } Thu Oct 15 09:01:06 2026\n"),
+        Some(1_792_080_066)
+    );
+    assert_eq!(boot_secs("garbage"), None);
+}
+
+/// A Bonjour instance becomes a LAN row only when it is not this Mac, no swarm host by either
+/// name, and no computer listed already by either name or host stem; the local row lists
+/// nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_lan_row_is_only_a_mac_nothing_else_lists() {
+    let custom = std::collections::BTreeMap::from([
+        ("m32".to_owned(), "studio".to_owned()),
+        ("studio2".to_owned(), "m33-MacBook-Air".to_owned()),
+    ]);
+    let known = std::collections::BTreeMap::from([
+        ("m32".to_owned(), "id32".to_owned()),
+        ("m33".to_owned(), "id33".to_owned()),
+    ]);
+    let listed = [
+        TabComputer {
+            id: "cfg/1".into(),
+            name: "m40-Mac-Studio-M2".into(),
+            ..TabComputer::default()
+        },
+        TabComputer {
+            id: "cfg/2".into(),
+            name: "Office iMac".into(),
+            ..TabComputer::default()
+        },
+        TabComputer {
+            id: "__local_meta__".into(),
+            name: "guest".into(),
+            ..TabComputer::default()
+        },
+    ];
+    let lan = [
+        "m19 MacBook Pro",
+        "m32 MacBook Air",
+        "studio2",
+        "m40",
+        "Office iMac",
+        "guest",
+    ];
+    assert_eq!(
+        lan_candidates(
+            lan.map(str::to_owned).to_vec(),
+            &custom,
+            "m19-MacBook-Pro",
+            &known,
+            &listed,
+        ),
+        ["guest"],
+        "this Mac; a swarm host by its own name and by its canonical one; listed by stem and by \
+         its own name"
+    );
+}
+
+/// A host's name reads canonically: `m<N>` kept, model words, chip and sizes spelled, a bare
+/// `Air` a MacBook Air and a chip after `MacBook` a MacBook Pro, `ssh` dropped and `spark`
+/// folded; a `[names]` override applies by the name, its slug or its `m<N>` tag.
+#[test]
+fn a_host_name_reads_canonically_or_as_its_override() {
+    let none = std::collections::BTreeMap::new();
+    for (raw, want) in [
+        ("m1 Air M2 24gb 1tb", "m1-MacBook-Air-M2-24GB-1TB"),
+        (
+            "m14 MacBook Air M5 32gb 4tb prime",
+            "m14-MacBook-Air-M5-32GB-4TB-prime",
+        ),
+        ("m15 MacBook M5 Max", "m15-MacBook-Pro-M5-Max"),
+        (
+            "m3 iMac Intel Core i5 3.2ghz",
+            "m3-iMac-Intel-Core-i5-3.2GHz",
+        ),
+        ("m19 MacBook Pro ssh", "m19-MacBook-Pro"),
+        ("spark 49F7", "spark-49f7"),
+        (" .local", "this-Mac"),
+    ] {
+        assert_eq!(canonical_host_name_gui(raw, &none), want, "{raw}");
+    }
+    let names = std::collections::BTreeMap::from([
+        ("m14".to_owned(), "studio".to_owned()),
+        ("m14 MacBook Air".to_owned(), "air".to_owned()),
+        ("Office-iMac".to_owned(), "office".to_owned()),
+    ]);
+    assert_eq!(
+        canonical_host_name_gui("m14 MacBook Air", &names),
+        "air",
+        "by its name, before its tag"
+    );
+    assert_eq!(
+        canonical_host_name_gui("m14-MacBook-Air.local.", &names),
+        "studio",
+        "by its tag"
+    );
+    assert_eq!(
+        canonical_host_name_gui("Office iMac", &names),
+        "office",
+        "by its slug"
+    );
+}
+
+/// `machines.toml`'s `[names]` keep each string override, and its `[[host]]` rows each with a
+/// uuid, named canonically under those overrides.
+#[test]
+fn machines_toml_names_and_hosts_read_as_written() {
+    let text = "[names]\nm14 = \"studio\"\nbad = 3\n\
+                [[host]]\nuuid = \"U1\"\nname = \"m14-MacBook-Air\"\naddress = \"10.0.0.4\"\n\
+                [[host]]\nname = \"orphan\"\n";
+    let names = custom_host_names_in(text);
+    assert_eq!(
+        names,
+        std::collections::BTreeMap::from([("m14".to_owned(), "studio".to_owned())])
+    );
+    assert_eq!(
+        configured_hosts_in(text, &names),
+        [(
+            "U1".to_owned(),
+            "m14-MacBook-Air".to_owned(),
+            "studio".to_owned(),
+            "10.0.0.4".to_owned()
+        )],
+        "the uuid-less host is none"
+    );
+    assert!(custom_host_names_in("not = [toml").is_empty());
+    assert!(configured_hosts_in("not = [toml", &names).is_empty());
+}
+
 #[test]
 fn durations_and_shares_read_as_the_page_says_them() {
     assert_eq!(duration_words(0), "0m");

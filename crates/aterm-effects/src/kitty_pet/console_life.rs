@@ -1475,6 +1475,37 @@ impl PetBrain {
         world.last_letter_in_span(r, first, end)
     }
 
+    /// Whether the console places and lifts the body itself: its resident, on a presentable
+    /// console ([`Self::console_frame_pass`] takes the frame's lift), where the sink of the
+    /// head law ([`PetBrain::head_target`]) is the console's own map of what the body may cover.
+    #[inline]
+    pub(super) const fn console_places_body(&self) -> bool {
+        self.console.presentable && self.console.resident
+    }
+
+    /// Whether any cell `[a, b)` of `row` holds a glyph (`None` where the map covers none or
+    /// misses one of them): the whole span, no [`INK_PAD`] off its ends.
+    #[inline]
+    pub(super) const fn observed_ink_in_span(&self, row: f32, a: f32, b: f32) -> Option<bool> {
+        if !self.console.presentable
+            || !row.is_finite()
+            || row < 0.0
+            || !a.is_finite()
+            || !b.is_finite()
+            || b <= a
+        {
+            return None;
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return None;
+        };
+        let (first, end) = (a.max(0.0).floor() as usize, b.ceil() as usize);
+        if end <= first || end - first > crate::pet_world::MAX_WORLD_COLS {
+            return None;
+        }
+        world.locomotion_ink_in_span(row.round() as usize, first, end)
+    }
+
     /// Exact locomotion occupancy where the map covers the whole footprint.
     #[inline]
     pub(super) const fn observed_ink_overlaps(
@@ -4411,6 +4442,7 @@ impl PetBrain {
                     scale_x: 1.0,
                     scale_y: 1.0,
                     lift: frame.lift,
+                    from: StretchFrom::Centre,
                 },
                 (sense.cell_w, sense.cell_h),
                 (sense.cols, sense.rows),
@@ -4643,7 +4675,7 @@ impl PetBrain {
             self.console.z = ZHold::default();
             return;
         }
-        let body = body_rect(frame, sense);
+        let body = body_rect(&self.head_drawn(frame), sense);
         if let Some(rect) = body {
             self.console.last_body = Some(rect);
             self.console.last_seat = Some((self.col, self.row));
@@ -4732,6 +4764,7 @@ impl PetBrain {
                         scale_x: d.scale_x,
                         scale_y: d.scale_y,
                         lift: d.lift,
+                        from: d.stretch_from,
                     },
                     (sense.cell_w, sense.cell_h),
                     (sense.cols, sense.rows),

@@ -482,6 +482,173 @@ fn one_sources_flood_of_requests_churns_only_its_own_rows() {
     );
 }
 
+/// A host with many addresses (one per row) fills the desk with fresh requests, pauses, and
+/// floods again. K, which asked in the pause and asked again later as a waiting Mac does, keeps
+/// its row through the second flood: a row that asked again goes only once no row that has not
+/// is left.
+/// NEGATIVE CONTROL: the eviction this desk had (the oldest asking row, once no settled one is
+/// left) drops the flood's first rows and then K's ("K's row stays").
+#[test]
+fn a_flood_from_many_addresses_never_takes_a_row_that_asked_again() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m1 = member(root.path(), "m1");
+    let flood = |from: usize, to: usize| {
+        for n in from..to {
+            let name = format!("f{n}");
+            let (_, device) = mac(root.path(), &name);
+            let at = IpAddr::from([
+                10,
+                0,
+                u8::try_from(n / 200).unwrap(),
+                u8::try_from(n % 200 + 1).unwrap(),
+            ]);
+            assert_eq!(
+                ask(&m1, at, &joining(&device, [8; 32], &name)),
+                Answer::Asking
+            );
+        }
+    };
+    flood(0, desk::MAX_HEARD);
+
+    let (_, device) = mac(root.path(), "k");
+    let k = joining(&device, [7; 32], "k");
+    let request = k.request(&joiner_greeting(&m1)).unwrap();
+    let key = *m1.lock().unwrap().local().key();
+    let signature = ask_signature(&device, &key, [7; 32], "k", "Mac15,3", &request);
+    let asking = desk::Asking {
+        wire: request.bytes(),
+        node: [7; 32],
+        name: "k",
+        model: "Mac15,3",
+        signature: &signature,
+    };
+    let first = Instant::now();
+    for now in [first, first + desk::ASKED_AGAIN_AFTER] {
+        let heard = m1.lock().unwrap().hear(&asking, address(20), now);
+        assert_eq!(heard.unwrap(), Answer::Asking);
+    }
+
+    flood(desk::MAX_HEARD, 2 * desk::MAX_HEARD + 8);
+    let held = m1.lock().unwrap().rows(Instant::now());
+    assert_eq!(held.len(), desk::MAX_HEARD, "the desk stays bounded");
+    assert!(
+        held.iter().any(|row| row.name == "k"),
+        "K's row stays: {held:?}"
+    );
+}
+
+/// `device`'s ask as `name`, which `desk` hears from `from` at `now` (no connection, so a test
+/// sets the clock).
+fn hear_at(desk: &Mutex<Desk>, device: &Device, name: &str, from: IpAddr, now: Instant) -> Answer {
+    let request = joining(device, [7; 32], name)
+        .request(&joiner_greeting(desk))
+        .unwrap();
+    let key = *desk.lock().unwrap().local().key();
+    let signature = ask_signature(device, &key, [7; 32], name, "Mac15,3", &request);
+    let asking = desk::Asking {
+        wire: request.bytes(),
+        node: [7; 32],
+        name,
+        model: "Mac15,3",
+        signature: &signature,
+    };
+    desk.lock().unwrap().hear(&asking, from, now).unwrap()
+}
+
+/// A host with 16 addresses fills the desk (4 rows from each) and asks each of its requests
+/// again, as a waiting Mac does. New Mac K then asks once, and the host sends fresh requests,
+/// each from an address that holds fewer than [`desk::PER_SOURCE`] rows, so each one makes room
+/// on the whole desk. K's row stays: what goes is a row of the addresses that hold the most,
+/// and K's holds one. Before, the newest row that had not asked again went, which was K's
+/// whenever the host sent its next request.
+/// NEGATIVE CONTROLS: choosing among every asking row (no `Desk::crowded`) drops K's row at the
+/// host's first fresh request ("K's row stays: [Row { id: 17, name: \"f16\", …"); so does the
+/// first form of this fix (the newest row that had not asked again, among every asking row),
+/// and the oldest asking row before it does after 63 requests ("K's row stays: [Row { id: 130,
+/// name: \"g64\", …").
+#[test]
+fn a_flood_from_a_few_addresses_never_takes_a_new_macs_row() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m1 = member(root.path(), "m1");
+    let source = |n: usize| IpAddr::from([10, 0, 0, u8::try_from(n % 16 + 1).unwrap()]);
+    let first = Instant::now();
+    let flood: Vec<(String, Device)> = (0..desk::MAX_HEARD)
+        .map(|n| {
+            let name = format!("f{n}");
+            let (_, device) = mac(root.path(), &name);
+            (name, device)
+        })
+        .collect();
+    for now in [first, first + desk::ASKED_AGAIN_AFTER] {
+        for (n, (name, device)) in flood.iter().enumerate() {
+            assert_eq!(hear_at(&m1, device, name, source(n), now), Answer::Asking);
+        }
+    }
+
+    let later = first + desk::ASKED_AGAIN_AFTER + Duration::from_secs(1);
+    let (_, k) = mac(root.path(), "k");
+    assert_eq!(hear_at(&m1, &k, "k", address(20), later), Answer::Asking);
+    for n in 0..2 * desk::MAX_HEARD {
+        let held = m1.lock().unwrap().rows(later);
+        let from = (0..16)
+            .map(source)
+            .find(|at| held.iter().filter(|row| row.from == *at).count() < desk::PER_SOURCE)
+            .unwrap_or_else(|| source(n));
+        let name = format!("g{n}");
+        let (_, device) = mac(root.path(), &name);
+        assert_eq!(hear_at(&m1, &device, &name, from, later), Answer::Asking);
+    }
+    let held = m1.lock().unwrap().rows(later);
+    assert_eq!(held.len(), desk::MAX_HEARD, "the desk stays bounded");
+    assert!(
+        held.iter().any(|row| row.name == "k"),
+        "K's row stays: {held:?}"
+    );
+}
+
+/// A row that asked again and then stopped asking is a waiting Mac's only for
+/// [`desk::STILL_ASKING`]: past it, L (which asked first, asked again, then went quiet) is the
+/// oldest of the rows that may go and goes before any fresh one, rather than holding its place
+/// for the rest of a request's day.
+/// NEGATIVE CONTROL: a row that asked again once counting as a waiting Mac's for good (the first
+/// form of this fix) drops a fresh row instead ("L, which stopped asking, went first").
+#[test]
+fn a_row_that_stopped_asking_holds_no_place_ahead_of_a_fresh_one() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m1 = member(root.path(), "m1");
+    let source = |n: usize| {
+        IpAddr::from([
+            10,
+            0,
+            u8::try_from(n / 200).unwrap(),
+            u8::try_from(n % 200 + 1).unwrap(),
+        ])
+    };
+    let first = Instant::now();
+    let (_, l) = mac(root.path(), "l");
+    assert_eq!(hear_at(&m1, &l, "l", address(20), first), Answer::Asking);
+    for n in 1..desk::MAX_HEARD {
+        let name = format!("f{n}");
+        let (_, device) = mac(root.path(), &name);
+        assert_eq!(
+            hear_at(&m1, &device, &name, source(n), first),
+            Answer::Asking
+        );
+    }
+    let again = first + desk::ASKED_AGAIN_AFTER;
+    assert_eq!(hear_at(&m1, &l, "l", address(20), again), Answer::Asking);
+
+    let quiet = again + desk::STILL_ASKING;
+    let (_, x) = mac(root.path(), "x");
+    assert_eq!(hear_at(&m1, &x, "x", address(21), quiet), Answer::Asking);
+    let held = m1.lock().unwrap().rows(quiet);
+    assert_eq!(held.len(), desk::MAX_HEARD, "the desk stays bounded");
+    assert!(
+        !held.iter().any(|row| row.name == "l"),
+        "L, which stopped asking, went first: {held:?}"
+    );
+}
+
 /// A host that copied a Mac's request from its `ask` cannot show it under another node key,
 /// name or model: an ask is signed by the request's writer key over them, so a phrase a person
 /// allows is bound to the node key the real Mac runs with, under the name it asked for.

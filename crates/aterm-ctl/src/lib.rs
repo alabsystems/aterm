@@ -38,7 +38,7 @@ mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
 mod any_host;
 mod remote;
-pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, RmLifts, lifts_there};
+pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, lifts_there};
 mod survey;
 pub use survey::{
     DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
@@ -1528,6 +1528,25 @@ fn newest(
 
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a discovery probe of one socket ([`probe_lines`]: `ls`, `survey`, `brief`) waits at
+/// most: [`PROBE_DEADLINE`], or what a test of the binary set through the dev seam
+/// [`PROBE_WITHIN_SEAM`] (milliseconds), as every instance its probes dial is an aterm on the same
+/// machine that serves, which a loaded machine can keep from answering within [`PROBE_DEADLINE`].
+fn probe_within() -> std::time::Duration {
+    seamed_within(PROBE_WITHIN_SEAM, PROBE_DEADLINE)
+}
+
+/// The dev seam that sets [`probe_within`] for a test of the binary.
+pub const PROBE_WITHIN_SEAM: &str = "ATERM_DEBUG_CTL_PROBE_WITHIN_MS";
+
+/// The milliseconds the dev seam `seam` names, or `or` where it names none.
+fn seamed_within(seam: &str, or: std::time::Duration) -> std::time::Duration {
+    aterm_types::dev_seam!(seam)
+        .and_then(|ms| ms.to_str()?.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(or, std::time::Duration::from_millis)
+}
+
 #[derive(Clone, Copy)]
 struct ProbeDeadline {
     started: std::time::Instant,
@@ -1722,7 +1741,7 @@ enum Probe {
 }
 
 fn probe_lines(path: &str, verb: &str, pid: u32) -> Probe {
-    probe_lines_with_deadline(path, verb, pid, PROBE_DEADLINE)
+    probe_lines_with_deadline(path, verb, pid, probe_within())
 }
 
 fn probe_read_bounded_line<R: BufRead>(
@@ -2434,6 +2453,15 @@ fn probe_sessions(
     targets: Vec<Target>,
     rendezvous: Option<PathBuf>,
 ) -> impl Iterator<Item = (u32, String, Probe)> {
+    probe_sessions_with(targets, rendezvous, probe_lines)
+}
+
+/// [`probe_sessions`], with `probe` dialing each target that is not foreign.
+fn probe_sessions_with(
+    targets: Vec<Target>,
+    rendezvous: Option<PathBuf>,
+    probe: impl Fn(&str, &str, u32) -> Probe,
+) -> impl Iterator<Item = (u32, String, Probe)> {
     targets
         .into_iter()
         .map(move |Target { pid, sock, written }| {
@@ -2445,7 +2473,7 @@ fn probe_sessions(
                     token,
                     facts: ForeignFacts::read(pid, written),
                 },
-                None => probe_lines(&sock, "sessions", pid),
+                None => probe(&sock, "sessions", pid),
             };
             (pid, sock, probe)
         })
@@ -2806,7 +2834,7 @@ fn probe_cause(pid: u32, probe: &Probe) -> String {
                 )
             }
         }
-        Probe::Timeout => "timed out after 2s".to_string(),
+        Probe::Timeout => format!("timed out after {:?}", probe_within()),
         Probe::Replied(said) => format!("server replied: {said}"),
         Probe::Other(e) => e.to_string(),
     }
@@ -4838,6 +4866,37 @@ fn connect_stream(path: &str, origin: TargetOrigin) -> io::Result<(CtlStream, Op
 
 const ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[cfg(test)]
+thread_local! {
+    static ACCEPT_WITHIN: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long a connect to a server that keeps a token waits for it to accept ([`open_accepted`])
+/// at most, where the caller's deadline is longer: [`ACCEPT_DEADLINE`], or what a test set for a
+/// server that serves, which a loaded machine can keep from accepting within
+/// [`ACCEPT_DEADLINE`]. A unit test sets it on its thread (`with_accept_within`); a test of the
+/// binary sets the dev seam [`ACCEPT_WITHIN_SEAM`] (milliseconds).
+fn accept_within() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(within) = ACCEPT_WITHIN.get() {
+        return within;
+    }
+    seamed_within(ACCEPT_WITHIN_SEAM, ACCEPT_DEADLINE)
+}
+
+/// The dev seam that sets [`accept_within`] for a test of the binary.
+pub const ACCEPT_WITHIN_SEAM: &str = "ATERM_DEBUG_CTL_ACCEPT_WITHIN_MS";
+
+/// `act` with each accept of this thread's connects bounded by `within` ([`accept_within`]).
+#[cfg(all(test, unix))]
+fn with_accept_within<R>(within: std::time::Duration, act: impl FnOnce() -> R) -> R {
+    let before = ACCEPT_WITHIN.replace(Some(within));
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
+    ACCEPT_WITHIN.set(before);
+    done.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 const ACCEPT_PROBE: &[u8] = b"version\n";
 
 enum Acceptance {
@@ -4900,7 +4959,7 @@ fn open_accepted(
         connect_then_read(path, read_token_file_at).map_err(|e| connect_error(path, &e, origin))?;
     let token = token.ok();
     let patience = match token {
-        Some(_) => deadline.map(|d| d.min(ACCEPT_DEADLINE)),
+        Some(_) => deadline.map(|d| d.min(accept_within())),
         None => deadline,
     };
     if let Err(e) = stream
@@ -4935,7 +4994,9 @@ fn open_accepted(
         Ok(0) => return Ok(Acceptance::Dropped),
         Ok(_) => {}
         Err(e) if is_timeout_error(&e) => {
-            return Ok(Acceptance::NotAccepted(patience.unwrap_or(ACCEPT_DEADLINE)));
+            return Ok(Acceptance::NotAccepted(
+                patience.unwrap_or_else(accept_within),
+            ));
         }
         Err(e) if is_peer_drop(&e) => return Ok(Acceptance::Dropped),
         Err(e) => return Err(e),

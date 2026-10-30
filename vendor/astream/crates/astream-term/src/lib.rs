@@ -44,6 +44,7 @@ mod twins;
 
 pub mod events;
 pub mod ops;
+pub mod overlap_echo;
 pub mod perceive;
 pub mod predict;
 pub mod program_predict;
@@ -53,11 +54,16 @@ pub mod screen;
 
 pub use events::{
     classify, event_advance_offset_monotone, event_carry_within_bound, quiesced_at,
-    EventClassifier, Profile, SessionEvent,
+    sync_bytes_clamp, sync_hold_ticks_clamp, sync_within_budget, EventClassifier, Profile,
+    SessionEvent, MAX_SYNC_HOLD_TICKS, MAX_SYNC_OUTPUT_BYTES,
 };
 pub use ops::{
     decode_ops, encode_ops, op_clamp_scroll_top, op_scroll_region_nonempty, OpsWireError, ScreenOp,
     MAX_MODE_PARAMS, MAX_OPS_PER_BATCH, OPS_WIRE_MAGIC, OPS_WIRE_VERSION,
+};
+pub use overlap_echo::{
+    echo_matched_advance, echo_queue_len_clamp, echo_queue_within_cap, AttributedEchoSpan,
+    EchoAttribution, ExpectedEcho, InFlightEchoQueue, MAX_IN_FLIGHT_ECHO_BYTES,
 };
 pub use perceive::{
     blocks, frame, perceive_clamp_take_count, perceive_row_in_bounds, search, text, Block, Hit,
@@ -78,7 +84,8 @@ pub use render::{
 pub use screen::{
     apply_ops, apply_ops_to, cell_width_is_valid, char_display_width, color_clamp_channel,
     combining_cap_clamp, combining_len_within_cap, dec_special_graphic, emit_ops, fold,
-    is_combining_mark, is_wide_char, screen_clamp_dim, screen_coord_in_bounds,
+    is_combining_mark, is_vs16_emoji_capable, is_wide_char, screen_clamp_dim,
+    screen_coord_in_bounds, vs_cursor_advance_clamp, vs_width_clamp, vs_width_valid,
     wide_cell_width_clamp, wide_spacer_col_clamp, Cell, Charset, Color, Folder, Screen,
-    MAX_COMBINING,
+    MAX_COMBINING, MAX_OSC_CWD_BYTES, MAX_OSC_TITLE_BYTES,
 };

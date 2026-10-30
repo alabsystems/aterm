@@ -11,6 +11,7 @@ macro_rules! harness_mark {
 }
 pub(crate) use harness_mark;
 
+pub mod account_catalog;
 pub mod account_progress;
 pub mod account_stats;
 pub mod accounts;

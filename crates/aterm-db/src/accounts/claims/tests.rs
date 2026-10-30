@@ -400,7 +400,8 @@ fn claim_publication_conforms_and_unsafe_replacements_fail() {
 
 /// The code's step for each `DbClaimRing` action: the model's clock runs two ticks a day, its
 /// days are the ring's, its row lapses a day after it is written (the harness's horizon), and its
-/// observers (`lost`, `gone`, `reentered`) read what the code deleted and held.
+/// observers (`lost`, `gone`, `reentered`, `blind`) read what the code deleted, held, wrote into
+/// and read before it wrote.
 pub(crate) fn ring_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -420,18 +421,23 @@ pub(crate) fn ring_transition(
     };
     let mut clock = get("day") * DAY + get("tick") * HALF;
     let retire = |ring: &mut RingState, next: &mut aterm_spec::interp::State, clock: u64| {
+        let window = ring.window(&CLAIMS, clock);
         let doomed = ring.ratchet(&CLAIMS, clock);
-        let floor = ring.floor;
-        ring.held.retain(|day| *day >= floor);
+        ring.held.retain(|day| !doomed.contains(day));
         let row = get("row");
-        if row > 0 && row < *ring.window(&CLAIMS, clock).start() {
-            if doomed.contains(&row) && get("until") * HALF > clock {
+        // The row goes with its table: below the window, or above it and below the floor. A live
+        // row's table deleted below the window is lost; a row above the window at or above the
+        // floor stays, out of sight, until the clock comes back to its table.
+        if row > 0 && row < ring.floor && !window.contains(&row) {
+            if row < *window.start() && get("until") * HALF > clock {
                 next.insert("lost", 1);
             }
             next.insert("row", 0);
             next.insert("until", 0);
         }
-        next.insert("gone", int(get("gone").max(floor)));
+        if let Some(last) = doomed.iter().max() {
+            next.insert("gone", int(get("gone").max(last + 1)));
+        }
     };
     match action {
         "Tick" => {
@@ -439,7 +445,7 @@ pub(crate) fn ring_transition(
             next.insert("tick", int(clock % DAY / HALF));
             next.insert("day", int(clock / DAY));
         }
-        "ClockBack" => {
+        "ClockBack" | "ClockCorrected" => {
             clock -= DAY;
             next.insert("day", int(clock / DAY));
         }
@@ -448,18 +454,21 @@ pub(crate) fn ring_transition(
             retire(&mut ring, &mut next, clock);
             for day in ring.window(&CLAIMS, clock) {
                 ring.hold(&CLAIMS, day, clock).unwrap();
-                if int(day) < next["gone"] {
-                    next.insert("reentered", 1);
-                }
             }
         }
         "Write" => {
             retire(&mut ring, &mut next, clock);
+            // The writer's own latest row, where the window it reads holds it.
+            let window = ring.window(&CLAIMS, clock);
             let own = u64::try_from(next["row"]).unwrap();
+            if own > *window.end() {
+                next.insert("blind", 1);
+            }
+            let own = (own > 0 && window.contains(&own)).then_some(own);
             let until = clock + DAY;
-            let day = target(&ring, clock, (own > 0).then_some(own), until, |_| false).unwrap();
+            let day = target(&ring, clock, own, until, |_| false).unwrap();
             ring.hold(&CLAIMS, day, clock).unwrap();
-            if int(day) < next["gone"] {
+            if day < get("gone") {
                 next.insert("reentered", 1);
             }
             next.insert("row", int(day));
@@ -477,7 +486,10 @@ pub(crate) fn ring_transition(
 
 /// Every `DbClaimRing` step the code takes is a model successor, over every reachable state.
 /// NEGATIVE CONTROL: a hand-built retirement that deletes a live row's table breaks
-/// `NoLiveRowRetired` and is no model successor.
+/// `NoLiveRowRetired` and is no model successor. A projection that drops this Mac's row above the
+/// window, whose table the code keeps (`ring_transition` without `row < ring.floor`), is no
+/// successor either: `Retire from {.., "floor": 3, .., "h4": 1, .., "row": 4, ..} steps to
+/// {.., "row": 0, ..}`.
 #[test]
 fn claim_ring_conforms() {
     let model = aterm_models_db::claim_ring_model();
@@ -652,10 +664,11 @@ fn split_sides_write_the_same_day_tables_and_a_heal_merges_them() {
 }
 
 /// NEGATIVE CONTROL: a window placed by the clock alone (`RingState::current` without its floor)
-/// takes the clock set back for day D again: it no longer finds the row of day D+2 and refuses
-/// the next revision (and `claim_ring_conforms` fails).
+/// lets the clock set back a day place the window from day D again, so day D's table is
+/// permitted (`assertion failed: !directory.permits(session, &Policy::default(), day,
+/// back).unwrap()`, and `claim_ring_conforms` fails).
 #[test]
-fn a_clock_set_back_cannot_reenter_a_retired_epoch() {
+fn a_clock_set_back_a_day_cannot_reenter_a_retired_epoch() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let caps = Caps::default();
@@ -665,13 +678,20 @@ fn a_clock_set_back_cannot_reenter_a_retired_epoch() {
     let ahead = at(D + 2, 60);
     write_at(paths, &row(1, ahead), ahead, caps).unwrap();
     assert_eq!(ring_dirs(paths, D - 2..=D + 4), vec![D + 2]);
-    // The clock set back two days: writes and repair stay at or above the floor.
-    let back = at(D, 120);
+    // The clock set back a day: writes and repair stay at or above the floor, and the row of
+    // day D+2 is still read.
+    let back = at(D + 1, 120);
     write_at(paths, &row(2, back), back, caps).unwrap();
     with_session(paths, true, |session, directory, _| {
         directory
             .ring_subscriptions(session, &Policy::default(), back)
             .unwrap();
+        let day = CLAIMS.scope(directory.trust(), D).unwrap().digest();
+        assert!(
+            !directory
+                .permits(session, &Policy::default(), day, back)
+                .unwrap()
+        );
     });
     assert_eq!(ring_dirs(paths, D - 2..=D), Vec::<u64>::new());
     assert_eq!(ring_claims(paths, D - 2..=D), Vec::<u64>::new());
@@ -679,7 +699,8 @@ fn a_clock_set_back_cannot_reenter_a_retired_epoch() {
 }
 
 /// A retirement that fails after it deleted, before it forgot what it deleted, leaves the floor
-/// raised: the clock set back writes above it, and the next pass forgets the deleted day.
+/// raised: the clock set back, behind it, writes nothing, never into day D's table, and the next
+/// pass on the righted clock forgets the deleted day.
 /// NEGATIVE CONTROL: the floor written only with the forgotten days (`retire`'s first save
 /// removed) stays where it was when the pass fails, and the clock set back enrolls day D again.
 #[test]
@@ -694,22 +715,23 @@ fn a_crash_inside_a_retire_is_finished_by_the_next_pass() {
     assert!(write_at(paths, &row(1, ahead), ahead, caps).is_err());
     assert_eq!(ring_dirs(paths, D..=D), Vec::<u64>::new());
     assert!(ring_state(paths).held.contains(&D));
-    // Day D's row went with its table, so the fresh row starts at counter 1.
+    // Day D's row went with its table, so a fresh row starts at counter 1.
     let back = at(D, 120);
-    write_at(paths, &row(1, back), back, caps).unwrap();
+    let wrote = write_at(paths, &row(1, back), back, caps);
     assert_eq!(ring_dirs(paths, D - 1..=D), Vec::<u64>::new());
     assert_eq!(ring_claims(paths, D - 1..=D), Vec::<u64>::new());
-    write_at(paths, &row(2, ahead), ahead, caps).unwrap();
+    assert!(wrote.is_err(), "the clock set back is behind the floor");
+    write_at(paths, &row(1, ahead), ahead, caps).unwrap();
     let state = ring_state(paths);
     assert!(state.held.iter().all(|day| *day >= state.floor));
 }
 
 /// Mac 0 retires day D two days ahead; repairs beside Mac 1, which still holds day D, never bring
-/// day D back to Mac 0, even with Mac 0's clock set back.
+/// day D back to Mac 0, even with Mac 0's clock set back a day.
 /// NEGATIVE CONTROL: `ring_permits` placing the window by the clock alone admits day D's table
-/// for a repair on Mac 0's clock set back.
+/// for a repair on Mac 0's clock set back a day.
 #[test]
-fn repair_never_resurrects_a_retired_epoch() {
+fn repair_on_a_clock_set_back_a_day_never_resurrects_a_retired_epoch() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     let caps = Caps::default();
     let now = at(D, 60);
@@ -719,7 +741,8 @@ fn repair_never_resurrects_a_retired_epoch() {
     let ahead = at(D + 2, 60);
     write_at(&lab.paths[0], &row(1, ahead), ahead, caps).unwrap();
     repair_commons_at(&lab, 6, &[ahead, now]);
-    repair_commons_at(&lab, 6, &[now, now]);
+    let back = at(D + 1, 60);
+    repair_commons_at(&lab, 6, &[back, now]);
     assert_eq!(ring_dirs(&lab.paths[0], D - 1..=D), Vec::<u64>::new());
     assert_eq!(ring_claims(&lab.paths[0], D - 1..=D), Vec::<u64>::new());
     assert_eq!(ring_dirs(&lab.paths[1], D..=D), vec![D]);
@@ -727,10 +750,151 @@ fn repair_never_resurrects_a_retired_epoch() {
         let id = CLAIMS.scope(directory.trust(), D).unwrap().digest();
         assert!(
             !directory
-                .permits(session, &Policy::default(), id, now)
+                .permits(session, &Policy::default(), id, back)
                 .unwrap()
         );
     });
+}
+
+/// The claims of `machine`'s latest row in `read`.
+fn claims_of(read: &Read, machine: &[u8; 16]) -> Option<Value> {
+    read.rows
+        .iter()
+        .find(|(m, _)| m == machine)
+        .map(|(_, body)| body["claims"].clone())
+}
+
+/// Mac 0's clock runs two days ahead for one write, which deletes its copy of day D's table
+/// holding both Macs' rows, and comes back. Back on day D, Mac 0's window is the clock's: repair
+/// carries day D back to Mac 0 for reading, so it reads Mac 1's row at once, and it writes nothing
+/// while its clock is behind its floor (day D+1), never into day D's table, whose copy at Mac 1
+/// holds its own earlier signed row. On day D+1 it writes on in day D+2's table, which it wrote
+/// while ahead and kept, so its signed history there runs on, and both Macs read its new row.
+/// NEGATIVE CONTROL: a window that never comes below the floor (`RingState::current` as
+/// `clock.max(floor + 1)`) keeps Mac 0 two days ahead, off Mac 1's row (`left: None`,
+/// `right: Some(1)`). `target` refusing only once the floor lies beyond the window (its clock
+/// check as `state.floor > last`) lets Mac 0 write on day D, into day D+1's table (`assertion
+/// failed: read.writable.is_err()`).
+#[test]
+fn a_clock_back_from_running_ahead_reads_its_peers_and_never_forks_its_history() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let caps = Caps::default();
+    let now = at(D, 60);
+    for paths in &lab.paths {
+        write_at(paths, &row(1, now), now, caps).unwrap();
+    }
+    repair_commons_at(&lab, 6, &[now, now]);
+    let me: Vec<_> = (0..2)
+        .map(|n| read_at(&lab.paths[n], now, caps).unwrap().me)
+        .collect();
+    let ahead = at(D + 2, 60);
+    write_at(&lab.paths[0], &row(1, ahead), ahead, caps).unwrap();
+    assert_eq!(ring_dirs(&lab.paths[0], D - 1..=D + 3), vec![D + 2]);
+    let back = at(D, 3600);
+    repair_commons_at(&lab, 10, &[back, back]);
+    let read = read_at(&lab.paths[0], back, caps).unwrap();
+    assert!(read.writable.is_err());
+    assert_eq!(counter(&read, &me[1]), Some(1));
+    let marked = json!({"counter": 2, "until": back + DAY, "claims": ["back@example.invalid"]});
+    assert!(write_at(&lab.paths[0], &marked, back, caps).is_err());
+    let floor = at(D + 1, 60);
+    let next = counter(&read_at(&lab.paths[0], floor, caps).unwrap(), &me[0]).map_or(1, |c| c + 1);
+    assert_eq!(next, 2, "Mac 0 reads its own row of day D+2 on day D+1");
+    let marked = json!({"counter": next, "until": floor + DAY, "claims": ["back@example.invalid"]});
+    write_at(&lab.paths[0], &marked, floor, caps).unwrap();
+    repair_commons_at(&lab, 10, &[floor, floor]);
+    for n in 0..2 {
+        let read = read_at(&lab.paths[n], floor, caps).unwrap();
+        assert_eq!(read.writable, Ok(()), "Mac {n}");
+        assert_eq!(
+            claims_of(&read, &me[0]),
+            Some(json!(["back@example.invalid"])),
+            "Mac {n}"
+        );
+    }
+    let later = floor + 60;
+    write_at(&lab.paths[0], &row(next + 1, later), later, caps).unwrap();
+    write_at(&lab.paths[1], &row(2, later), later, caps).unwrap();
+    assert_eq!(ring_dirs(&lab.paths[0], D - 1..=D + 3), vec![D + 2]);
+}
+
+/// Both Macs write on day D-1 and day D, Mac 1 claiming x on day D; then Mac 0's clock is set
+/// back two days, below its floor (day D-1). Its window, the clock's, leaves out day D, which
+/// holds its own latest row and Mac 1's claim of x, so it records no claim: it never claims x on
+/// a view without Mac 1's claim, in a row its own day-D row outranks on Mac 1. Once its clock
+/// reaches its floor, it reads Mac 1's claim again and writes on.
+/// NEGATIVE CONTROL: `target` refusing only once the floor lies beyond the window (its clock
+/// check as `state.floor > last`) lets Mac 0 write on day D-2, into day D-1's table (`assertion
+/// failed: read.writable.is_err()`).
+#[test]
+fn a_clock_set_back_two_days_claims_nothing_on_a_view_without_its_peers_today() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let caps = Caps::default();
+    let yesterday = at(D - 1, 60);
+    for paths in &lab.paths {
+        write_at(paths, &row(1, yesterday), yesterday, caps).unwrap();
+    }
+    repair_commons_at(&lab, 6, &[yesterday, yesterday]);
+    let now = at(D, 60);
+    for c in [2, 3] {
+        let body = json!({"counter": c, "until": now + DAY, "claims": ["a@example.invalid"]});
+        write_at(&lab.paths[0], &body, now + c, caps).unwrap();
+    }
+    let x = json!({"counter": 2, "until": now + DAY, "claims": ["x@example.invalid"]});
+    write_at(&lab.paths[1], &x, now, caps).unwrap();
+    repair_commons_at(&lab, 10, &[now + 10, now + 10]);
+    let me: Vec<_> = (0..2)
+        .map(|n| read_at(&lab.paths[n], now + 10, caps).unwrap().me)
+        .collect();
+    let back = at(D - 2, 3600);
+    repair_commons_at(&lab, 10, &[back, now + 20]);
+    let read = read_at(&lab.paths[0], back, caps).unwrap();
+    assert!(read.writable.is_err());
+    let mine = json!({"counter": 2, "until": back + DAY, "claims": ["x@example.invalid"]});
+    assert!(write_at(&lab.paths[0], &mine, back, caps).is_err());
+    repair_commons_at(&lab, 10, &[back + 60, now + 60]);
+    let peer = read_at(&lab.paths[1], now + 60, caps).unwrap();
+    assert_eq!(counter(&peer, &me[0]), Some(3));
+    assert_eq!(claims_of(&peer, &me[0]), Some(json!(["a@example.invalid"])));
+    let floor = at(D - 1, 3600);
+    let read = read_at(&lab.paths[0], floor, caps).unwrap();
+    assert_eq!(read.writable, Ok(()));
+    assert_eq!(claims_of(&read, &me[1]), Some(json!(["x@example.invalid"])));
+    write_at(&lab.paths[0], &row(4, floor), floor, caps).unwrap();
+}
+
+/// Mac 0's clock is set back five days, then righted. Set back, it writes nothing (its clock is
+/// behind its floor) and its retirement keeps day D's table, which holds its row and lies above
+/// its window but not below its floor; righted, it writes on in that table, so its signed history
+/// there runs on, and both Macs read its new row.
+/// NEGATIVE CONTROL: deleting every held period outside the window (`RingState::outdated` without
+/// `*epoch < floor`) deletes Mac 0's day D table while it is set back (`left: []`,
+/// `right: [20000]`); without that assertion, its righted write starts a fresh day D table and
+/// forks its own history at Mac 1's copy: `left: Err("local proposal writer has withheld,
+/// unavailable or refused history; recovery required")`, `Mac 0`.
+#[test]
+fn a_clock_set_back_days_then_righted_writes_on_in_its_own_tables() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let caps = Caps::default();
+    let now = at(D, 60);
+    for paths in &lab.paths {
+        write_at(paths, &row(1, now), now, caps).unwrap();
+    }
+    repair_commons_at(&lab, 6, &[now, now]);
+    let me = read_at(&lab.paths[0], now, caps).unwrap().me;
+    let back = at(D - 5, 60);
+    assert!(write_at(&lab.paths[0], &row(2, back), back, caps).is_err());
+    repair_commons_at(&lab, 6, &[back, now]);
+    assert_eq!(ring_dirs(&lab.paths[0], D..=D), vec![D]);
+    let right = at(D, 120);
+    let next = counter(&read_at(&lab.paths[0], right, caps).unwrap(), &me).map_or(1, |c| c + 1);
+    write_at(&lab.paths[0], &row(next, right), right, caps).unwrap();
+    repair_commons_at(&lab, 10, &[right, right]);
+    for n in 0..2 {
+        let read = read_at(&lab.paths[n], right, caps).unwrap();
+        assert_eq!(read.writable, Ok(()), "Mac {n}");
+        assert_eq!(counter(&read, &me), Some(next), "Mac {n}");
+    }
 }
 
 /// NEGATIVE CONTROL: checking `writable` on the target table alone accepts the write a day later,
@@ -974,6 +1138,43 @@ fn an_interrupted_day_table_enrollment_costs_nothing_and_resumes() {
     }
 }
 
+/// Mac 0 writes on day D, and on day D+2, which deletes day D's table; its state is then damaged
+/// while its clock is set back a day. The rebuilt floor is the one it lost, from the floor's
+/// second copy, so day D stays refused: neither a peer's offer nor a write takes it up again,
+/// and the write lands in day D+2's table.
+/// NEGATIVE CONTROL: a rebuild that reads no copy (`rebuilt_floor` bounded by the tables held
+/// alone, day D+2 - 2) places the set-back window from day D again:
+/// `assertion failed: ring_state(paths).floor > D`.
+#[test]
+fn a_damaged_ring_state_keeps_its_floor_on_a_clock_set_back() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let caps = Caps::default();
+    let first = at(D, 60);
+    write_at(paths, &row(1, first), first, caps).unwrap();
+    let ahead = at(D + 2, 60);
+    write_at(paths, &row(1, ahead), ahead, caps).unwrap();
+    assert_eq!(ring_dirs(paths, D - 2..=D + 4), vec![D + 2]);
+    damage_ring_state(paths, b"ATRS1-not-a-state");
+    let back = at(D + 1, 60);
+    write_at(paths, &row(2, back), back, caps).unwrap();
+    assert!(ring_state(paths).floor > D);
+    with_session(paths, true, |session, directory, _| {
+        let day = CLAIMS.scope(directory.trust(), D).unwrap().digest();
+        directory
+            .adopt_ring_tables(session, &Policy::default(), back, &[day].into())
+            .unwrap();
+        assert!(
+            !directory
+                .permits(session, &Policy::default(), day, back)
+                .unwrap()
+        );
+    });
+    assert_eq!(ring_dirs(paths, D - 2..=D + 4), vec![D + 2]);
+    let read = read_at(paths, back, caps).unwrap();
+    assert_eq!(counter(&read, &read.me), Some(2));
+}
+
 /// Put `bytes` where `paths`'s claims ring state goes, as damage, a partial restore or a later
 /// build's format after a downgrade would.
 fn damage_ring_state(paths: &Paths, bytes: &[u8]) {
@@ -1037,29 +1238,49 @@ fn a_damaged_ring_state_is_rebuilt_and_repair_goes_on() {
     assert_eq!((state.floor, state.held), (D + 1, [D + 2].into()));
 }
 
-/// A ring state that can be neither read nor rewritten (a directory where its file goes) stops
-/// that Mac's claim writes, which fail safe, and nothing else: repair still carries the catalog
-/// and Mac 1's application table to it, and it still reads the rows it holds.
+/// A ring state that can be neither read nor renamed over (a directory where its file goes) is
+/// moved aside, never deleted, by the writer pass a repair round asks for: repair carries the
+/// catalog, Mac 1's application table and Mac 1's claim row of the day table both Macs hold to
+/// Mac 0, Mac 0 still reads its own row, and its next write lands and reaches Mac 1.
 /// NEGATIVE CONTROL: a reader's view of the ring that fails on the damage (`ring_view` returning
 /// the `ring_state` error) fails every exchange at the window of the tables a peer offers, so
-/// neither the catalog record nor the application row reaches Mac 0.
+/// neither the catalog record nor the application row reaches Mac 0; without the move aside
+/// (`save_ring_state` writing over the directory), the rebuilt state cannot be written, so the
+/// ring tables drop out of Mac 0's repair and Mac 1's row never reaches it (`left: None`,
+/// `right: Some(1)`), and every claim write there fails.
 #[test]
-fn an_unrewritable_ring_state_stops_only_that_macs_claim_writes() {
+fn an_unrewritable_ring_state_is_moved_aside_and_claims_go_on() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     let caps = Caps::default();
     let now = at(D, 60);
     write_at(&lab.paths[0], &row(1, now), now, caps).unwrap();
-    with_session(&lab.paths[0], true, |session, _, _| {
+    let state = with_session(&lab.paths[0], true, |session, _, _| {
         let state = claim_dir(session).unwrap().join(CLAIMS.state_name());
         std::fs::remove_file(&state).unwrap();
         std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("kept"), b"a person's file").unwrap();
+        state
     });
     let app = declare_with_record(&lab.paths[1]);
     write_at(&lab.paths[1], &row(1, now), now, caps).unwrap();
     repair_commons_at(&lab, 10, &[now, now]);
     assert_eq!(catalog_records(&lab.paths[0]), 1);
     assert_eq!(table_records(&lab.paths[0], app), 1);
+    let peer = read_at(&lab.paths[1], now, caps).unwrap().me;
     let read = read_at(&lab.paths[0], now, caps).unwrap();
     assert_eq!(counter(&read, &read.me), Some(1));
-    assert!(write_at(&lab.paths[0], &row(2, now), now, caps).is_err());
+    assert_eq!(counter(&read, &peer), Some(1));
+    write_at(&lab.paths[0], &row(2, now), now, caps).unwrap();
+    repair_commons_at(&lab, 6, &[now, now]);
+    assert_eq!(
+        counter(&read_at(&lab.paths[1], now, caps).unwrap(), &read.me),
+        Some(2)
+    );
+    // The damage is kept for a person to look at, beside the state written in its place.
+    let aside = state.with_file_name(format!("{}.damaged-1", CLAIMS.state_name()));
+    assert_eq!(
+        std::fs::read(aside.join("kept")).unwrap(),
+        b"a person's file"
+    );
+    assert!(std::fs::symlink_metadata(&state).unwrap().is_file());
 }

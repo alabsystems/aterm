@@ -64,6 +64,7 @@ struct Bound {
 }
 
 struct OutputBook {
+    version: u32,
     pending: OutputInfo,
     done: Option<OutputInfo>,
 }
@@ -175,6 +176,10 @@ impl OutputBook {
                 return self.done.clone();
             }
         }
+        if self.version < 2 {
+            self.done = Some(self.pending.clone());
+            return self.done.clone();
+        }
         None
     }
 }
@@ -270,6 +275,7 @@ fn bind_one(registry: &Registry, global: &Global, sink: &Sink<OutputInfo>) -> Re
         .bind(global, &wl_output::INTERFACE, version)
         .ok_or(Error::NoObject)?;
     let output_book = Arc::new(Mutex::new(OutputBook {
+        version,
         pending: OutputInfo {
             global: global.name,
             scale: 1,
@@ -306,7 +312,7 @@ impl Outputs {
         let globals: Vec<Global> = registry
             .globals()
             .into_iter()
-            .filter(|g| g.interface.as_c_str() == c"wl_output")
+            .filter(|g| g.interface.as_c_str() == c"wl_output" && g.version > 0)
             .collect();
         let before = self.bound.len();
         self.bound
@@ -374,5 +380,51 @@ impl Drop for Bound {
             }
         }
         drop(self.listener.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_output_publishes_state_without_done_while_v2_waits_for_done() {
+        let mode = Mode {
+            flags: wl_output::mode::CURRENT,
+            width: 1920,
+            height: 1080,
+            refresh: 60_000,
+        };
+        let mut v1 = OutputBook {
+            version: 1,
+            pending: OutputInfo {
+                global: 7,
+                scale: 1,
+                ..OutputInfo::default()
+            },
+            done: None,
+        };
+        let heard = v1
+            .hear(Reported::Mode(mode))
+            .expect("v1 commits immediately");
+        assert_eq!(heard.current_mode(), Some(mode));
+        assert_eq!(
+            v1.done.as_ref().and_then(OutputInfo::current_mode),
+            Some(mode)
+        );
+
+        let mut v2 = OutputBook {
+            version: 2,
+            pending: OutputInfo {
+                global: 8,
+                scale: 1,
+                ..OutputInfo::default()
+            },
+            done: None,
+        };
+        assert!(v2.hear(Reported::Mode(mode)).is_none());
+        assert!(v2.done.is_none());
+        let heard = v2.hear(Reported::Done).expect("v2 commits on done");
+        assert_eq!(heard.current_mode(), Some(mode));
     }
 }

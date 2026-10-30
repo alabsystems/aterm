@@ -12,6 +12,7 @@ pub mod claude_settings;
 pub mod cruise_carry;
 pub mod exception;
 pub mod git_config;
+pub mod go_ahead;
 pub mod guard;
 pub mod login;
 pub mod needs;

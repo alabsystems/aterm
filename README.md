@@ -518,6 +518,25 @@ into any more. The `.ubd` folder keeps those builds, and aterm's test scratch, o
 of macOS's file-change service (fseventsd), which drops the file events of what
 is made under it.
 
+Package builders can opt a newly created Rust target into automatic whole-generation
+compaction. The native `pkg __build_cache_package` protocol binds that disposable
+target to its package guardian and actual compiler registrar. Existing targets keep
+their previous behavior. A settled target above its soft 64 GiB allocated budget, or
+on a volume with less than 20 GiB free, can retire through the registered-cache
+transaction even while its source still exists. The first successful build of a
+fresh generation learns a budget of at least twice its allocated footprint; later
+failed or warm builds cannot increase it. Compaction preserves the guardian lock,
+Cargo locks, running programs and mapped readers, and resumes interrupted retirement
+before allowing another generation. A crashed build remains unsettled until its
+exact guardian birth and complete worker group are gone and the same use checks
+clear. The package frontend must call settlement only after its source session and
+every child group have finished.
+Only one compiler-keyed policy target can remain materialized in a package cache.
+A compiler change requests retirement of the settled old target and defers that
+poll; after the outside compactor finishes, the next poll creates the new target.
+Alternating compilers can therefore require cold builds. Each compiler key retains
+its learned budget, and a blocked pending retirement never creates a fallback tree.
+
 On macOS, builds and tests can stall while macOS checks each new program aterm
 starts before its first run. `aterm doctor`'s `devtools:` row says whether that
 happens: adding aterm under System Settings ▸ Privacy & Security ▸ Developer

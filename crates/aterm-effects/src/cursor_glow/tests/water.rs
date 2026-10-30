@@ -664,6 +664,7 @@ fn a_light_water_drop_is_clear_blue() {
             hue: 0.8,
             cov_scale: 1.0,
             born: at,
+            latch: ParticleLatch::FRESH,
             edge_cut: false,
         });
         let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
@@ -738,6 +739,7 @@ fn a_drop_the_edge_cut_stays_out_for_its_life() {
             hue: 0.8,
             cov_scale: 1.0,
             born: at,
+            latch: ParticleLatch::FRESH,
             edge_cut: false,
         });
         (0..=60_u64)

@@ -9372,6 +9372,26 @@ impl Ribbon {
         self.glass_drew == Some(now)
     }
 
+    /// The instant of the last frame whose plan drew by the bed's glass ([`Self::glass_drew_at`]):
+    /// `None` on every frame whose bed draws by main's table, for the host's dark pin. Debug and
+    /// test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn glass_drew(&self) -> Option<Instant> {
+        self.glass_drew
+    }
+
+    /// How many light pages' palettes the ribbon holds, solved or solving
+    /// ([`crate::rainbow_kitty::prism_glass::PaletteCache`]): none while no light page lit a
+    /// frame, for the host's dark pin. Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub fn palettes_held(&self) -> usize {
+        self.palettes.len() + usize::from(self.palettes.pending().is_some())
+    }
+
     /// The glass's height in pixels a `ch` the last plan gave the ribbon (§15.2 1.7): zero on
     /// every frame whose bed draws by main's table, for the host's dark pin. Debug and test
     /// builds only.

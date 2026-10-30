@@ -370,6 +370,10 @@ pub struct Coat {
     /// glyph) the body covers, and the cells they lie in `(row, col, px)`.
     pub ink_px: usize,
     pub cells: Vec<(usize, usize, usize)>,
+    /// The cells holding a glyph that the pet's drawn box meets by a pixel or more, `(row,
+    /// col)`: the box read as `aterm-lab trail-companion` reads a gallery frame's (its
+    /// `on_letters`), whatever of the box the body's art fills.
+    pub box_cells: Vec<(usize, usize)>,
     /// The caret cell's pixels the body covers.
     pub caret_px: usize,
     /// The word icons on glass, frame px, and the pixels of the pet's box that meet them.
@@ -664,6 +668,15 @@ impl Replay {
                             continue;
                         }
                         let (x0, y0) = (place.pad + col * cw, place.grid_top + row * ch);
+                        if glyph
+                            && !c.ch.is_whitespace()
+                            && (x0 as i32) < qx1
+                            && (x0 + cw) as i32 > qx0
+                            && (y0 as i32) < qy1
+                            && (y0 + ch) as i32 > qy0
+                        {
+                            coat.box_cells.push((row, col));
+                        }
                         let mut n = 0usize;
                         for y in y0..(y0 + ch).min(h) {
                             for x in x0..(x0 + cw).min(w) {
@@ -887,6 +900,11 @@ impl Replay {
                     // A window's Enter: the console's submit (the trail's
                     // return flare and the companion's) and the keystroke.
                     self.fx.note_console_input(PetInputKind::Submit);
+                    self.fx.note_keystroke();
+                }
+                (0, Ev::Key('\u{7f}', _)) => {
+                    // A window's Backspace: the console's delete and the keystroke.
+                    self.fx.note_console_input(PetInputKind::Delete);
                     self.fx.note_keystroke();
                 }
                 (0, Ev::Key(c, _)) => {
@@ -2511,4 +2529,61 @@ fn the_letter_under_the_caret_reads() {
             l.judged()
         );
     }
+}
+
+/// The worst reading over the replay of a letter on row 5 of the gallery's `context`-like page
+/// on dark: the prompt on row 4, row 5 on a filled ground (`#073642`) holding `accented` nine
+/// times from column 7, then [`TYPING_TEXT`] typed under the rainbow kitty pet; the frame's
+/// combining marks unread when `unread` (`EffectsPipeline::set_frame_marks_unread`). Returns
+/// the worst judged reading of a row-5 letter and how many letter-frames fall under [`BAR`].
+fn accented_row_under_the_foot(accented: &str, unread: bool) -> (f64, usize) {
+    let mut r = Replay::new("rainbow kitty pet", DARK, TrailColor::Automatic);
+    r.fx.set_frame_marks_unread(unread);
+    let mut row = " ".repeat(7);
+    for _ in 0..9 {
+        row.push_str(accented);
+    }
+    row.push_str(&" ".repeat(usize::from(COLS) - 16));
+    let page = format!("\x1b[2J\x1b[6;1H\x1b[48;2;7;54;66m{row}\x1b[0m\x1b[5;1H$ ");
+    let mut ev = vec![(200, Ev::Out(page.into_bytes()))];
+    ev.extend(typed(TYPING_TEXT, 1_000, 60));
+    let judged = r.run(&ev, 600);
+    let mut worst = f64::INFINITY;
+    let mut under = 0;
+    for l in judged
+        .iter()
+        .flat_map(|j| j.letters.iter())
+        .filter(|l| l.row == 5)
+    {
+        worst = worst.min(l.judged());
+        under += usize::from(l.judged() < BAR);
+    }
+    (worst, under)
+}
+
+/// looks9's review: A DECOMPOSED ACCENT UNDER THE FOOT READS. The effects read a cell's short
+/// glyph off its base letter alone, so a decomposed `e` + U+0301 (a macOS filename's NFD)
+/// counted as a short `e`; the rainbow kitty's foot rail dipped into the cell's top, onto the
+/// accent, and the letter read 2.56:1 (90 letter-frames under the bar). On the gallery's
+/// `context`-like page, a row of decomposed `é` under the typed line keeps every letter at the
+/// bar, as the precomposed `é` does. Negative control (`set_frame_marks_unread`, the marks
+/// unread): the decomposed row falls under it.
+#[test]
+fn a_decomposed_accent_under_the_foot_reads() {
+    let (worst, under) = accented_row_under_the_foot("e\u{301}", false);
+    assert!(worst.is_finite(), "fixture: the row's letters are judged");
+    assert_eq!(
+        under, 0,
+        "{under} letter-frames of the decomposed row under {BAR}:1 (worst {worst:.2}:1)"
+    );
+    let (composed, composed_under) = accented_row_under_the_foot("\u{e9}", false);
+    assert_eq!(
+        composed_under, 0,
+        "fixture: the precomposed row reads at the bar (worst {composed:.2}:1)"
+    );
+    let (old, old_under) = accented_row_under_the_foot("e\u{301}", true);
+    assert!(
+        old_under > 0,
+        "control: the marks unread, the decomposed row still reads {old:.2}:1"
+    );
 }

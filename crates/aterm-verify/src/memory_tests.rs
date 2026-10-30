@@ -33,7 +33,7 @@ fn packages(names: &[&str]) -> Scope {
     Scope::packages(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
 }
 
-/// The key `spec` keeps its record under, run over `scope` ([`Key::of`]).
+/// The key `spec` keeps its record under, run over `scope` ([`StageKey::of`]).
 fn over(spec: &StageSpec, scope: &Scope) -> Key {
     Key::of(spec.id, scope)
 }
@@ -210,8 +210,91 @@ fn a_wider_selections_most_peak_bounds_a_narrower_one() {
     );
 }
 
+/// A stage with no record in its checkout, a new worktree's first run, claims by what its stage
+/// and selection kept in another checkout: the most any other checkout keeps (15 GiB of /vmem's
+/// 15 and 10, beside /other's 12), and a fifth more. A record in its own checkout, its own or a
+/// wider selection's, wins over another checkout's; another checkout's record of a wider
+/// selection, another stage or another variant (30 GiB each) is not read. NEGATIVE CONTROL: read
+/// in its own checkout alone, as before, the new worktree's compile claimed the cold 12 GiB.
+#[test]
+fn a_new_checkout_claims_what_another_checkout_kept() {
+    let at = |checkout: &str, scope: &Scope| Key {
+        checkout: checkout.to_owned(),
+        ..over(&compile(), scope)
+    };
+    let wider = packages(&["aterm-gui", "aterm-grid"]);
+    let mut r = Records::default();
+    r.push(at("/vmem", &gui()), 15 * GIB, 1);
+    r.push(at("/vmem", &gui()), 10 * GIB, 2);
+    r.push(at("/other", &gui()), 12 * GIB, 3);
+    r.push(at("/far", &wider), 30 * GIB, 4);
+    r.push(
+        Key {
+            variant: Some("jobs 4".to_owned()),
+            ..at("/far", &gui())
+        },
+        30 * GIB,
+        5,
+    );
+    r.push(
+        Key {
+            checkout: "/far".to_owned(),
+            ..Key::of(StageId::Tippy, &gui())
+        },
+        30 * GIB,
+        6,
+    );
+    let n = need(&r, &compile(), &at("/new", &gui()), Some(24 * GIB));
+    assert_eq!(
+        (n.bytes, &n.how),
+        (
+            aterm_capacity::peak_claim(15 * GIB),
+            &How::Elsewhere(Learned {
+                peak: 15 * GIB,
+                runs: 2,
+                wider: Some(at("/vmem", &gui())),
+            })
+        ),
+        "{n}"
+    );
+    assert!(
+        n.to_string()
+            .contains("the most a run of it in /vmem used (15 GiB)"),
+        "{n}"
+    );
+    let mut wide = r.clone();
+    wide.push(at("/new", &wider), 8 * GIB, 7);
+    let n = need(&wide, &compile(), &at("/new", &gui()), Some(24 * GIB));
+    assert_eq!(
+        (n.bytes, n.how),
+        (
+            aterm_capacity::peak_claim(8 * GIB),
+            How::Learned(Learned {
+                peak: 8 * GIB,
+                runs: 1,
+                wider: Some(at("/new", &wider)),
+            })
+        ),
+        "a wider selection's in its own checkout"
+    );
+    r.push(at("/new", &gui()), 5 * GIB, 8);
+    let n = need(&r, &compile(), &at("/new", &gui()), Some(24 * GIB));
+    assert_eq!(
+        (n.bytes, n.how),
+        (
+            aterm_capacity::peak_claim(5 * GIB),
+            How::Learned(Learned {
+                peak: 5 * GIB,
+                runs: 1,
+                wider: None,
+            })
+        ),
+        "its own"
+    );
+}
+
 /// A run keys each stage's record by its checkout, its selection where the stage reads it, and
-/// its variant ([`Key::of_run`]): the test compile over `-p aterm-gui` in `/ck` by that crate
+/// its variant ([`StageKey::of_run`]): the test compile over `-p aterm-gui` in `/ck` by that crate
 /// in `/ck`; the export, whose work is the same whatever is selected, by the workspace; the test
 /// run by the test binaries it runs at once; the cells asked for by their sorted names, and
 /// cells a selection pulled by its crates. NEGATIVE CONTROL: the same stages in another checkout

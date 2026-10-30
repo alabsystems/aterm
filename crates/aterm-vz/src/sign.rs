@@ -116,7 +116,9 @@ pub fn place(
     }
     std::fs::create_dir_all(host)
         .map_err(|e| format!("could not make {} ({e})", host.display()))?;
-    let partial = host.join(format!(".partial-{sha256}-{}", std::process::id()));
+    static PARTIAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PARTIAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial = host.join(format!(".partial-{sha256}-{seq}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&partial);
     let written = (|| -> Result<bool, String> {
         let io = |what: &str, p: &Path, e: std::io::Error| {
@@ -188,8 +190,16 @@ pub fn helper_sha256(exe: &Path) -> Result<String, String> {
 /// The lab is about to start a helper from `exe`: its copy must now prove it ran before it
 /// is removed. Nothing is written for a helper outside a content-addressed directory.
 pub fn mark_started(exe: &Path) {
-    if let Some((dir, _)) = content_dir(exe) {
-        let _ = std::fs::write(dir.join(STARTED), format!("{}\n", std::process::id()));
+    if let Some((dir, _)) = content_dir(exe)
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir.join(STARTED))
+    {
+        let _ = writeln!(file, "{}", std::process::id());
     }
 }
 
@@ -219,7 +229,7 @@ pub fn mark_ran(exe: &Path) -> Option<InUse> {
         .write(true)
         .truncate(false)
         .mode(0o644)
-        .custom_flags(libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir.join(RAN))
         .ok()?;
     #[expect(

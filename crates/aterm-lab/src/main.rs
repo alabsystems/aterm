@@ -60,6 +60,8 @@ mod codex_proof;
 #[cfg(target_os = "macos")]
 mod codex_rig;
 #[cfg(target_os = "macos")]
+mod commons_lan;
+#[cfg(target_os = "macos")]
 mod commons_startup;
 #[cfg(target_os = "macos")]
 mod crash;
@@ -520,6 +522,9 @@ Outside any lab (no jail, no stub):
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
+  commons-lan prepare-recipient|prepare-source|join|run|follow|stop|declare|write|read …
+                                 prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
+                                 ordinary executable startup, exact generic table readback, no installed state changes
   commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS]
                                  start an ordinary window and node host on private custody and loopback Commons;
                                  require enrollment, fresh signed table data in both directions and recovery after restart
@@ -586,7 +591,7 @@ Outside any lab (no jail, no stub):
   trail-hue <path>... [--min-px N] [--max N] [--list all|hits]
                                  the hue rulings: Fire's pixels never green, Sparkle's in the gold family, each gallery
                                  frame read against its clean twin (`--help` for details)
-  trail-diff [--base REF|merge-base] [--control same|plant] [--keep] [--jobs N] [SCRIPT.trail|DIR]...
+  trail-diff [--base REF|merge-base] [--control same|plant|dark-arm] [--keep] [--jobs N] [SCRIPT.trail|DIR]...
                                  Prism Glass's dark proof: build aterm-gui's trail_dump here and in a worktree of the base
                                  (HEAD~1), run both on the scripts and compare main's state and streams (`--help` for details)
   aos-repair [--aterm PATH] [--control | --publish PLAN_HEX] [--keep] [--out DIR]
@@ -812,6 +817,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "agy-relaunch" => relaunch_agy::cmd_agy_relaunch(args),
         "fleet-sim" => fleet_sim::cmd(args),
         "fleet-menu" => fleet_menu::cmd(args),
+        "commons-lan" => commons_lan::cmd(args),
         "commons-startup" => commons_startup::cmd(args),
         "swarm" => swarm::cmd_swarm(args),
         "mode" => verbs::cmd_mode(args),

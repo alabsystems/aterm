@@ -77,6 +77,10 @@ pub struct CometConfig {
     pub theme_bg: u32,
     /// [`Self::color`] is a PINNED cursor colour.
     pub pinned: bool,
+    /// [`Self::color`] is one the user chose (a pinned cursor colour, or the trail colour):
+    /// paper darkens the nucleus in its own hue and saturation, never saturates it
+    /// ([`crate::color_math::light_caret_fill`]).
+    pub chosen: bool,
 }
 
 /// The least WCAG contrast the comet's nucleus keeps against a LIGHT page at rest.
@@ -113,7 +117,7 @@ pub struct CursorComet {
     /// Cached `(color, theme_fg, theme_bg)` ink for the light-page coma.
     light_ink_memo: Option<((u32, u32, u32), u32)>,
     /// Cached `(color, theme_bg, e.to_bits())` fill for the light-page nucleus.
-    light_fill_memo: Option<((u32, u32, u32), u32)>,
+    light_fill_memo: Option<((u32, u32, u32, bool), u32)>,
     /// Test-only: the coma's rim twinkles four `+` glints, as it did until
     /// looks10 L9 (its negative control).
     #[cfg(test)]
@@ -211,6 +215,7 @@ impl CursorComet {
                 cfg.color & 0x00FF_FFFF,
                 cfg.theme_bg & 0x00FF_FFFF,
                 e.to_bits(),
+                cfg.chosen,
             );
             if let Some((prev_key, fill)) = self.light_fill_memo
                 && prev_key == key
@@ -218,7 +223,7 @@ impl CursorComet {
                 fill
             } else {
                 let fill = crate::color_math::floor_contrast_keeping_hue(
-                    crate::color_math::light_body_fill(cfg.color, e),
+                    crate::color_math::light_caret_fill(cfg.color, e, cfg.chosen),
                     cfg.theme_bg & 0x00FF_FFFF,
                     LIGHT_NUCLEUS_CONTRAST,
                 );
@@ -632,6 +637,7 @@ mod tests {
             theme_fg: 0x00C8_C8D2,
             theme_bg: 0x0010_1016,
             pinned: false,
+            chosen: false,
         }
     }
 

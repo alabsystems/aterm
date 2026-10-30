@@ -239,9 +239,9 @@ pub(crate) fn write_probe_spacer_object(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many spacers"))?;
 
     let mut names = Vec::with_capacity(total_syms);
-    let mut strtab = Vec::with_capacity(total_syms * 16 + 4);
+    let mut strtab = Vec::with_capacity(total_syms.saturating_mul(16).saturating_add(4));
     strtab.push(0);
-    let mut sym_records = Vec::with_capacity(total_syms * 16);
+    let mut sym_records = Vec::with_capacity(total_syms.saturating_mul(16));
 
     let mut push_sym = |name: String, sect: u8, addr: u64| -> std::io::Result<()> {
         let strx = u32::try_from(strtab.len()).map_err(|_| {
@@ -269,7 +269,10 @@ pub(crate) fn write_probe_spacer_object(
         )?;
     }
 
-    let stroff = symoff.saturating_add(nsyms.saturating_mul(16));
+    let stroff = nsyms
+        .checked_mul(16)
+        .and_then(|len| symoff.checked_add(len))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "stroff overflow"))?;
     let strsize = u32::try_from(strtab.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "strsize overflow"))?;
     let const_fileoff = u32::try_from(data_fileoff + text_size).map_err(|_| {
@@ -464,10 +467,16 @@ pub(crate) fn extract_executable_faulted_symbols(
             && let Some(nsects) = read_u32_le(bytes, cmd_off + 64)
         {
             for s in 0..nsects as usize {
-                let Some(sect_off) = (cmd_off + 72).checked_add(s.saturating_mul(80)) else {
+                let Some(sect_off) = s
+                    .checked_mul(80)
+                    .and_then(|off| (cmd_off + 72).checked_add(off))
+                else {
                     break;
                 };
-                let Some(sect_hdr) = bytes.get(sect_off..sect_off.saturating_add(80)) else {
+                let Some(sect_end) = sect_off.checked_add(80).filter(|&e| e <= cmd_end) else {
+                    break;
+                };
+                let Some(sect_hdr) = bytes.get(sect_off..sect_end) else {
                     break;
                 };
                 if next_sect_idx < text_sects.len() {
@@ -555,7 +564,7 @@ pub(crate) fn extract_executable_faulted_symbols(
         if !should_order_symbol_name(name) {
             continue;
         }
-        let sect_end = text_sects[sect as usize].map_or(start + 4, |(_, end)| end);
+        let sect_end = text_sects[sect as usize].map_or(start.saturating_add(4), |(_, end)| end);
         let mut end = sect_end;
         for next in &sect_syms[i + 1..] {
             if next.0 != sect {
@@ -570,14 +579,17 @@ pub(crate) fn extract_executable_faulted_symbols(
             .min(start.saturating_add(262_144))
             .max(start.saturating_add(1));
         let first_page = start & ARM64_PAGE_MASK;
-        let last_page = (end - 1) & ARM64_PAGE_MASK;
+        let last_page = end.saturating_sub(1) & ARM64_PAGE_MASK;
         let mut p = first_page;
         while p <= last_page {
             if faulted_pages.contains(&p) {
                 hits.insert(name.clone());
                 break;
             }
-            p = p.saturating_add(ARM64_PAGE_BYTES);
+            let Some(next_p) = p.checked_add(ARM64_PAGE_BYTES) else {
+                break;
+            };
+            p = next_p;
         }
     }
 
@@ -632,7 +644,7 @@ fn extract_container_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSym
 
 fn extract_archive_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSym>) {
     let mut pos = 8usize;
-    while let Some(hdr) = bytes.get(pos..pos.saturating_add(60)) {
+    while let Some(hdr) = pos.checked_add(60).and_then(|end| bytes.get(pos..end)) {
         if hdr.get(58..60) != Some(b"`\n") {
             break;
         }
@@ -657,7 +669,10 @@ fn extract_archive_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSym>)
             body = trimmed;
         }
         extract_macho_or_fat_symbols(body, file_order, out);
-        pos = body_end + (body_end & 1);
+        let Some(next_pos) = body_end.checked_add(body_end & 1) else {
+            break;
+        };
+        pos = next_pos;
     }
 }
 
@@ -744,10 +759,16 @@ fn extract_thin_macho_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSy
             && let Some(nsects) = read_u32_le(bytes, cmd_off + 64)
         {
             for s in 0..nsects as usize {
-                let Some(sect_off) = (cmd_off + 72).checked_add(s.saturating_mul(80)) else {
+                let Some(sect_off) = s
+                    .checked_mul(80)
+                    .and_then(|off| (cmd_off + 72).checked_add(off))
+                else {
                     break;
                 };
-                let Some(sect_hdr) = bytes.get(sect_off..sect_off.saturating_add(80)) else {
+                let Some(sect_end) = sect_off.checked_add(80).filter(|&e| e <= cmd_end) else {
+                    break;
+                };
+                let Some(sect_hdr) = bytes.get(sect_off..sect_end) else {
                     break;
                 };
                 if next_sect_idx < orderable_sect.len() {
@@ -1371,6 +1392,19 @@ mod tests {
                 "_cold_neighbor",
                 "_cold_page2",
             ]
+        );
+
+        let top_exec = build_minimal_macho64(
+            MH_EXECUTE,
+            u64::MAX - 64,
+            64,
+            &[("_top_page", 1, u64::MAX - 2)],
+        );
+        let top_pages: HashSet<u64> = [0x1000_0000].into_iter().collect();
+        assert!(extract_executable_faulted_symbols(&top_exec, &top_pages).is_empty());
+        let hit_top_pages: HashSet<u64> = [ARM64_PAGE_MASK].into_iter().collect();
+        assert!(
+            extract_executable_faulted_symbols(&top_exec, &hit_top_pages).contains("_top_page")
         );
     }
 

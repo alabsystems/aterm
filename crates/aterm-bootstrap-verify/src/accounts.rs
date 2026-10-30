@@ -56,28 +56,62 @@ pub struct Accounts {
     pub groups: Vec<Group>,
 }
 
-fn sources<'a>(nsswitch: &'a str, database: &str) -> Option<Vec<&'a str>> {
-    nsswitch.lines().find_map(|line| {
+fn sources<'a>(nsswitch: &'a str, database: &str) -> Result<Option<Vec<&'a str>>, ()> {
+    let mut matched = None;
+    for line in nsswitch.lines() {
         let line = line.split('#').next().unwrap_or_default().trim();
-        let (name, rest) = line.split_once(':')?;
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim() != database {
-            return None;
+            continue;
+        }
+        if matched.is_some() {
+            return Err(());
         }
         let mut words = Vec::new();
-        let mut action = false;
-        for word in rest.split_whitespace() {
-            if word.starts_with('[') {
-                action = true;
-            }
-            if !action {
-                words.push(word);
-            }
-            if word.ends_with(']') {
-                action = false;
+        let mut in_action = false;
+        let mut token_start: Option<usize> = None;
+        for (idx, ch) in rest.char_indices() {
+            if in_action {
+                match ch {
+                    '[' => return Err(()),
+                    ']' => in_action = false,
+                    _ => {}
+                }
+            } else {
+                match ch {
+                    '[' => {
+                        if let Some(start) = token_start.take() {
+                            words.push(&rest[start..idx]);
+                        } else if words.is_empty() {
+                            return Err(());
+                        }
+                        in_action = true;
+                    }
+                    ']' => return Err(()),
+                    c if c.is_whitespace() => {
+                        if let Some(start) = token_start.take() {
+                            words.push(&rest[start..idx]);
+                        }
+                    }
+                    _ => {
+                        if token_start.is_none() {
+                            token_start = Some(idx);
+                        }
+                    }
+                }
             }
         }
-        Some(words)
-    })
+        if in_action {
+            return Err(());
+        }
+        if let Some(start) = token_start {
+            words.push(&rest[start..]);
+        }
+        matched = Some(words);
+    }
+    Ok(matched)
 }
 
 impl Accounts {
@@ -87,8 +121,15 @@ impl Accounts {
     pub fn files_answer(nsswitch: Option<&str>) -> Option<bool> {
         let mut systemd = false;
         for database in ["passwd", "group"] {
-            let listed = nsswitch.and_then(|text| sources(text, database));
-            for source in listed.unwrap_or_else(|| vec!["files"]) {
+            let listed = match nsswitch {
+                Some(text) => sources(text, database).ok()?,
+                None => None,
+            };
+            let listed = listed.unwrap_or_else(|| vec!["files"]);
+            if !listed.contains(&"files") {
+                return None;
+            }
+            for source in listed {
                 match source {
                     "files" => {}
                     "systemd" => systemd = true,
@@ -188,13 +229,22 @@ impl Accounts {
     /// [`user_private_group`] of `gid` for `uid` over these accounts.
     #[must_use]
     pub fn private_group(&self, uid: u32, gid: u32) -> bool {
-        user_private_group(
-            uid,
-            gid,
-            self.account(uid),
-            self.group(gid),
-            &self.primary_members(gid),
-        )
+        let primaries = self.primary_members(gid);
+        let mut saw_account = false;
+        for account in self.passwd.iter().filter(|account| account.uid == uid) {
+            saw_account = true;
+            let mut saw_group = false;
+            for group in self.groups.iter().filter(|group| group.gid == gid) {
+                saw_group = true;
+                if !user_private_group(uid, gid, Some(account), Some(group), &primaries) {
+                    return false;
+                }
+            }
+            if !saw_group {
+                return false;
+            }
+        }
+        saw_account
     }
 }
 
@@ -237,10 +287,20 @@ mod tests {
         assert_eq!(Accounts::files_answer(Some(plain)), Some(false));
         let ubuntu = "# comment\npasswd:         files systemd\ngroup:          files [SUCCESS=merge] systemd\n";
         assert_eq!(Accounts::files_answer(Some(ubuntu)), Some(true));
+        let multi_criteria =
+            "passwd: files[NOTFOUND=continue UNAVAIL=return] systemd\ngroup: files\n";
+        assert_eq!(Accounts::files_answer(Some(multi_criteria)), Some(true));
         for elsewhere in [
             "passwd: files sss\ngroup: files\n",
             "passwd: files\ngroup: files ldap\n",
             "passwd: compat\n",
+            "passwd: files [NOTFOUND=continue]ldap\ngroup: files\n",
+            "passwd: files [NOTFOUND=continue sss\ngroup: files\n",
+            "passwd: [NOTFOUND=return] files\ngroup: files\n",
+            "passwd: files]\ngroup: files\n",
+            "passwd:\ngroup: files\n",
+            "passwd: systemd\ngroup: files\n",
+            "passwd: files\npasswd: files ldap\ngroup: files\n",
         ] {
             assert_eq!(Accounts::files_answer(Some(elsewhere)), None, "{elsewhere}");
         }
@@ -263,6 +323,25 @@ mod tests {
         assert!(
             !accounts.private_group(0, 0),
             "root's group is no one's private one"
+        );
+        let duplicate_gid = Accounts {
+            passwd: Accounts::parse_passwd(passwd).expect("parses"),
+            groups: Accounts::parse_group(b"ann:x:1000:\nbuilders:x:1000:bob\n").expect("parses"),
+        };
+        assert!(
+            !duplicate_gid.private_group(1000, 1000),
+            "a second group line sharing gid 1000 grants supplementary membership"
+        );
+        let duplicate_uid = Accounts {
+            passwd: Accounts::parse_passwd(
+                b"ann:x:1000:1000::/home/ann:/bin/bash\nalias:x:1000:1000::/home/ann:/bin/bash\n",
+            )
+            .expect("parses"),
+            groups: Accounts::parse_group(b"ann:x:1000:\n").expect("parses"),
+        };
+        assert!(
+            !duplicate_uid.private_group(1000, 1000),
+            "divergent passwd entries for uid 1000 are not unambiguous"
         );
         assert_eq!(accounts.primary_members(1000), [1000]);
         assert_eq!(Accounts::parse_passwd(b"+@netgroup::::::\n"), None);

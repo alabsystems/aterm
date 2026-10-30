@@ -228,6 +228,7 @@ mod tests {
             host: host.to_string(),
             code: mc.code.clone(),
             at: None,
+            lan: false,
             allowed: None,
             proof: None,
         };

@@ -988,7 +988,8 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
                     continue;
                 }
                 use std::io::Read as _;
-                let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+                // Every connection writes as it connects: its read waits the hang detector.
+                let _ = conn.set_read_timeout(Some(REACHED));
                 let mut head = [0u8; 8];
                 let n = (&conn).read(&mut head).unwrap_or(0);
                 if n == 0 {
@@ -1022,7 +1023,10 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
             &request,
             &Redial::new(Follow::Path(path.clone()))
                 .with_bound(bound)
-                .with_started(started_later),
+                .with_started(started_later)
+                // The successor answers `version`: a probe after a cut ask waits the hang
+                // detector.
+                .with_probe(REACHED),
         );
         stop(&sock);
         successor.join().unwrap();
@@ -2105,7 +2109,8 @@ fn only_a_server_that_answers_counts_as_serving() {
         false,
         tx,
     );
-    assert_eq!(serving_pid(&path), Some(std::process::id()));
+    // It serves: the probe that must find it waits the hang detector, not the 2 s cap.
+    assert_eq!(serving_pid_within(&path, REACHED), Some(std::process::id()));
     stop(&sock);
     server.join().unwrap();
 }
@@ -2130,7 +2135,10 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
     let own = std::process::id();
     let gone = gone_pid();
     let follow = Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_millis(300));
-    let served = Redial::new(Follow::Path(path.clone())).with_bound(REACHED);
+    // It serves, so the probe that must find it waits the hang detector, not the 2 s cap.
+    let served = Redial::new(Follow::Path(path.clone()))
+        .with_bound(REACHED)
+        .with_probe(REACHED);
 
     assert_eq!(
         follow.after_hangup(&path, None, None, None),
@@ -2451,7 +2459,10 @@ fn a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate() {
         &path,
         Some(std::process::id()),
         request,
-        &Redial::new(Follow::Path(path.clone())).with_bound(FAR),
+        // The probe that must find it still serving waits the hang detector, not the 2 s cap.
+        &Redial::new(Follow::Path(path.clone()))
+            .with_bound(FAR)
+            .with_probe(REACHED),
     );
     assert_eq!(code, ExitCode::SUCCESS);
     assert!(started.elapsed() < REACHED, "{:?}", started.elapsed());
@@ -2470,7 +2481,10 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
     let path = sock.to_str().unwrap().to_string();
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     let redial = Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_millis(300));
-    let served = Redial::new(Follow::Path(path.clone())).with_bound(REACHED);
+    // It serves, so the probe that must find it waits the hang detector, not the 2 s cap.
+    let served = Redial::new(Follow::Path(path.clone()))
+        .with_bound(REACHED)
+        .with_probe(REACHED);
     let gone = gone_pid();
 
     let code = super::super::replaced_before_reply(
@@ -2556,10 +2570,10 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
     let short = Duration::from_millis(200);
     let until = Instant::now() + short;
     let ends = |w: Wait| (w.deadline, w.by_deadline, w.started);
-    let (end, by_deadline, _) = ends(Wait::from_now(FAR, Some(until)));
+    let (end, by_deadline, _) = ends(Wait::from_now(FAR, PROBE_TIMEOUT, Some(until)));
     assert_eq!((end, by_deadline), (until, true));
     for later in [Some(until + FAR), None] {
-        let (end, by_deadline, started) = ends(Wait::from_now(short, later));
+        let (end, by_deadline, started) = ends(Wait::from_now(short, PROBE_TIMEOUT, later));
         assert_eq!((end, by_deadline), (started + short, false), "{later:?}");
     }
     let (_refusing_dir, refusing) = scratch_sock("rd-passed");

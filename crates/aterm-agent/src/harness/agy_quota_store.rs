@@ -251,11 +251,14 @@ impl Store {
         std::fs::create_dir_all(&self.dir).ok()?;
         let path = self.lock_path();
         let take = || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .ok()
+            let mut open = std::fs::OpenOptions::new();
+            open.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            open.open(&path).ok()
         };
         if take().is_none() {
             let stale = std::fs::symlink_metadata(&path)

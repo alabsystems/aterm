@@ -219,6 +219,677 @@ fn a_search_cut_short_keeps_what_it_found_and_says_so() {
 }
 
 #[test]
+fn automatic_discovery_pages_reach_every_target_and_wrap_within_the_same_bounds() {
+    let tmp = Tmp::new("discover-pages");
+    let home = mkdirs(&tmp.path().join("home"));
+    let targets: BTreeSet<_> = ["a", "b", "c", "d", "e"]
+        .map(|name| canon(&lay_target(&home.join(name).join("target"))))
+        .into_iter()
+        .collect();
+    let roots = roots_at(&tmp);
+    let budget = Budget {
+        found: 2,
+        ..Budget::SHIPPED
+    };
+    let mut cursor = Cursor::new();
+    let mut seen = BTreeSet::new();
+    for _ in 0..3 {
+        let page = discover_page(&roots, budget, &mut cursor);
+        assert_eq!(page.found.len(), 2, "{page:?}");
+        assert!(page.cut.is_some(), "selection overflow is partial coverage");
+        assert!(page.notes.iter().any(|note| note.contains("later pass")));
+        seen.extend(page.found.into_iter().map(|found| found.path));
+    }
+    assert_eq!(seen, targets);
+    let mut ids: Vec<_> = targets.iter().map(|path| identity(path).unwrap()).collect();
+    ids.sort();
+    let mut cursor = Cursor {
+        after: ids.last().copied(),
+        ..Cursor::new()
+    };
+    let wrapped = discover_page(&roots, budget, &mut cursor);
+    let got: Vec<_> = wrapped
+        .found
+        .iter()
+        .map(|found| identity(&found.path).unwrap())
+        .collect();
+    assert_eq!(got, ids[..2]);
+    assert_eq!(cursor.after, Some(ids[1]));
+    let empty = discover_page(&roots, Budget { found: 0, ..budget }, &mut cursor);
+    assert!(empty.found.is_empty() && empty.cut.is_some());
+    assert_eq!(
+        cursor.after,
+        Some(ids[1]),
+        "an empty pass cannot reset progress"
+    );
+    for hard in [
+        Budget {
+            entries: 0,
+            ..budget
+        },
+        Budget {
+            wall: Duration::ZERO,
+            ..budget
+        },
+    ] {
+        let page = discover_page(&roots, hard, &mut cursor);
+        assert!(page.cut.is_some());
+        assert!(
+            !cursor.finish_page(true),
+            "a hard traversal cut never completes a cycle"
+        );
+    }
+}
+
+#[test]
+fn paged_selection_merges_aliases_after_eviction_without_readmitting_discarded_identities() {
+    let mut page = Selection {
+        cursor: Cursor::new(),
+        limit: 2,
+        found: BTreeMap::new(),
+        overflow: false,
+        end: None,
+    };
+    let found = |n, origin| Found {
+        path: PathBuf::from(format!("/target-{n}")),
+        origin,
+    };
+    let owner = || Origin::BuildCache {
+        workspace: PathBuf::from("/gone"),
+        mirror: PathBuf::from("/mirror"),
+    };
+    page.add((1, 9), found(9, owner()));
+    page.add((1, 1), found(1, owner()));
+    page.add((1, 5), found(5, owner()));
+    page.add(
+        (1, 9),
+        found(
+            9,
+            Origin::Linked {
+                from: PathBuf::from("/alias"),
+            },
+        ),
+    );
+    page.add(
+        (1, 5),
+        found(
+            5,
+            Origin::Linked {
+                from: PathBuf::from("/alias"),
+            },
+        ),
+    );
+    page.add((1, 1), found(1, Origin::AgentTargetDir));
+    assert!(page.overflow);
+    let (found, next) = page.finish();
+    assert_eq!(next, Some((1, 5)));
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].path, Path::new("/target-1"));
+    assert_eq!(found[1].path, Path::new("/target-5"));
+    assert!(
+        found.iter().all(|found| !found.origin.ownable()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_directory_entry_cap_is_reported_without_stopping_the_bounded_prefix() {
+    let tmp = Tmp::new("discover-directory-cap");
+    let home = mkdirs(&tmp.path().join("home"));
+    for n in 0..=MAX_CHILDREN {
+        std::fs::write(home.join(format!("entry-{n:04}")), b"").unwrap();
+    }
+    let mut cursor = Cursor::new();
+    let page = discover_page(&roots_at(&tmp), Budget::SHIPPED, &mut cursor);
+    assert!(page.found.is_empty());
+    assert!(
+        page.cut.is_some(),
+        "a bounded directory read is partial coverage"
+    );
+    assert!(!page.notes.is_empty());
+    assert!(
+        !cursor.finish_page(true),
+        "a per-directory cut never completes a cycle"
+    );
+}
+
+#[test]
+fn consecutive_automatic_disk_passes_reach_an_eligible_cache_beyond_the_static_page() {
+    use crate::harness::cli::{DiskLook, DiskTick, disk_tick, disk_tick_paged};
+    let tmp = Tmp::new("discover-auto-pages");
+    let home = mkdirs(&tmp.path().join("home"));
+    let state = mkdirs(&tmp.path().join("state"));
+    let now = now_after_write(4);
+    // More than two pages ensures at least one target is outside both the legacy traversal's
+    // first page and the physical selection's first page, without assuming inode allocation.
+    let targets: Vec<_> = (0..2 * MAX_FOUND + 1)
+        .map(|n| {
+            let target = canon(&lay_target(
+                &home.join(format!("source-{n:03}")).join("target"),
+            ));
+            last_used(&target.join("debug"), now);
+            target
+        })
+        .collect();
+    let roots = roots_at(&tmp);
+    let static_page = discover(&roots, Budget::SHIPPED);
+    let first_page = discover_page(&roots, Budget::SHIPPED, &mut Cursor::new());
+    let late = targets
+        .iter()
+        .find(|target| {
+            !static_page
+                .found
+                .iter()
+                .chain(&first_page.found)
+                .any(|found| found.path == **target)
+        })
+        .expect("a target beyond both first pages");
+    last_used(&late.join("debug"), now - 2 * DAY);
+    let table = aterm_sysprobe::volumes::table();
+    let look = DiskLook {
+        state: &state,
+        volume: &home,
+        free: Some(GIB),
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: None,
+        now,
+        room: None,
+        table: Some(&table),
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    let config = Config {
+        dead_build_dirs: false,
+        idle_build_dirs: false,
+        ..Config::default()
+    };
+    let mut remove = real_with(now, |_, _| Ok(PathScan::default()));
+    for _ in 0..3 {
+        let legacy = disk_tick(&look, config, &mut remove, &mut || Some(GIB));
+        assert!(matches!(legacy, DiskTick::Reclaimed(ref done, _) if done.removed.is_empty()));
+    }
+    assert!(
+        late.join("debug/incremental").is_dir(),
+        "the original repeated first page never reached this eligible cache"
+    );
+    let mut cursor = Cursor::new();
+    let before = cursor;
+    let first = disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor);
+    assert!(matches!(first, DiskTick::Reclaimed(ref done, _) if done.removed.is_empty()));
+    let advanced = cursor != before;
+    assert!(late.join("debug/incremental").is_dir());
+    let mut removed = Vec::new();
+    for _ in 0..2 {
+        let DiskTick::Reclaimed(done, _) =
+            disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
+        else {
+            panic!("below the floor, an automatic pass applies");
+        };
+        removed.extend(done.removed);
+    }
+    assert!(
+        !late.join("debug/incremental").exists(),
+        "later automatic pages must reach the eligible cache"
+    );
+    assert!(advanced, "the product pass must retain its next selection");
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(&removed[0].0.path, late);
+    assert!(!late.join("debug/incremental").exists());
+    assert!(late.join("debug/deps/liblay.rlib").is_file());
+    assert!(
+        targets
+            .iter()
+            .filter(|target| *target != late)
+            .all(|target| target.join("debug/incremental").is_dir())
+    );
+}
+
+#[test]
+fn a_stable_unreclaimable_selection_cycle_can_handoff_to_one_disk_worker() {
+    use crate::harness::cli::{DiskLook, DiskTick, disk_tick_paged};
+    use crate::harness::disk::{Level, ask};
+    let tmp = Tmp::new("discover-cycle-worker");
+    let home = mkdirs(&tmp.path().join("home"));
+    let state = mkdirs(&tmp.path().join("state"));
+    let now = now_after_write(4);
+    let mut targets = Vec::new();
+    for n in 0..=MAX_FOUND {
+        let target = lay_target(&home.join(format!("source-{n:03}")).join("target"));
+        last_used(&target.join("debug"), now);
+        targets.push(target);
+    }
+    let roots = roots_at(&tmp);
+    let table = aterm_sysprobe::volumes::table();
+    let look = DiskLook {
+        state: &state,
+        volume: &home,
+        free: Some(GIB),
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: None,
+        now,
+        room: None,
+        table: Some(&table),
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    let config = Config {
+        dead_build_dirs: false,
+        idle_build_dirs: false,
+        ..Config::default()
+    };
+    let named = scan(
+        &SurveyRoots {
+            volume: Some(home.clone()),
+            targets,
+            ..Default::default()
+        },
+        now,
+        Trigger::Tick,
+        config,
+        Some(GIB),
+    );
+    assert!(
+        named.target_input_cut && !report(&named, config).assessment_complete,
+        "a real explicit input batch beyond 128 cannot claim complete assessment"
+    );
+    let mut remove =
+        |row: &Row| panic!("fresh target unexpectedly granted: {}", row.path.display());
+    let mut cursor = Cursor::new();
+    let host = ask::HostId {
+        pid: NO_PID,
+        start: "controlled-host-start".into(),
+    };
+    let alive = |_: &ask::HostId| true;
+    let at = |done, now_ms| ask::Look {
+        now_ms,
+        host: &host,
+        key: "test:cycle-volume",
+        level: Level::Short,
+        free: GIB,
+        floor: config.auto_free_gib * GIB,
+        files_free: None,
+        files_floor: crate::harness::disk::EMERGENCY_FILES_FREE,
+        done: if done { Some(ask::Done::Spent) } else { None },
+        seats: &[],
+        supervised: &[],
+        barred: &[],
+        live: &[],
+        held: &[],
+        reclaimed: &[],
+        passing: false,
+        alive: &alive,
+        ahead: ask::Ahead {
+            worker_ok: true,
+            ..Default::default()
+        },
+    };
+    let mut lease = ask::Lease::default();
+    let DiskTick::Reclaimed(first, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
+    else {
+        panic!("the short volume admits an automatic pass");
+    };
+    assert!(
+        !first.ran_out(),
+        "one page cannot exhaust the larger inventory"
+    );
+    let early = at(first.ran_out(), now * 1000);
+    let _ = ask::step(&mut lease, &early);
+    assert_eq!(ask::worker_step(&mut lease, &early), None);
+
+    let DiskTick::Reclaimed(last, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
+    else {
+        panic!("the short volume still admits the next pass");
+    };
+    assert!(
+        last.ran_out(),
+        "every target in this stable, fully traversed cycle was inspected without a granted removal"
+    );
+    let opened = at(last.ran_out(), now * 1000 + 1);
+    assert!(matches!(
+        ask::step(&mut lease, &opened),
+        ask::Said::Opened { .. }
+    ));
+    assert_eq!(ask::worker_step(&mut lease, &opened), None);
+    let nominated = at(last.ran_out(), opened.now_ms + ask::NOMINATE_MS);
+    let _ = ask::step(&mut lease, &nominated);
+    assert_eq!(
+        ask::worker_step(&mut lease, &nominated),
+        Some(ask::WorkerSaid::Claimed)
+    );
+    let repeated = at(last.ran_out(), nominated.now_ms + 1);
+    let _ = ask::step(&mut lease, &repeated);
+    assert_eq!(
+        ask::worker_step(&mut lease, &repeated),
+        None,
+        "one worker per episode"
+    );
+}
+
+#[test]
+fn discovery_cycle_conforms_to_committed_bounded_coverage_with_negative_controls() {
+    use aterm_models_harness::disk_discovery_cycle_model;
+    use aterm_spec::derive::Model;
+    fn drive(model: &Model, trace: &[&str]) -> Result<(), String> {
+        let tmp = Tmp::new("discover-cycle-model");
+        let home = mkdirs(&tmp.path().join("home"));
+        for name in ["a", "b", "c"] {
+            lay_target(&home.join(name).join("target"));
+        }
+        let mut roots = roots_at(&tmp);
+        let budget = Budget {
+            found: 2,
+            ..Budget::SHIPPED
+        };
+        let mut cursor = Cursor::new();
+        let mut state = aterm_spec::walk::walk(model, &[]);
+        for (n, action) in trace.iter().enumerate() {
+            let ready = match *action {
+                "Observe" => {
+                    let _ = discover_page(&roots, budget, &mut cursor);
+                    false
+                }
+                "ChangedInventory" | "KeepChangedInventory" => {
+                    roots.claude_unread = Some(format!("changed input {n}"));
+                    let _ = discover_page(&roots, budget, &mut cursor);
+                    false
+                }
+                "HardLimit" => {
+                    let page = discover_page(
+                        &roots,
+                        Budget {
+                            wall: Duration::ZERO,
+                            ..budget
+                        },
+                        &mut cursor,
+                    );
+                    assert!(page.cut.is_some());
+                    false
+                }
+                "Commit" | "Cut" | "CompleteEarly" | "CompleteCut" => cursor.finish_page(true),
+                "Stop" | "CompleteStopped" => cursor.finish_page(false),
+                "Clear" => {
+                    cursor.reset_cycle();
+                    false
+                }
+                "Abandon" | "CountAbandoned" => false,
+                _ => return Err(format!("unknown action {action}")),
+            };
+            if !model.fire(action, &mut state) {
+                return Err(format!("model refused {action}: {state:?}"));
+            }
+            if ready != (state["ready"] == 1) {
+                return Err(format!(
+                    "completion disagrees after {action}: native={ready}, model={state:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+    let model = disk_discovery_cycle_model();
+    for trace in [
+        vec!["Observe", "Commit", "Observe", "Commit"],
+        vec![
+            "Observe",
+            "Commit",
+            "ChangedInventory",
+            "Commit",
+            "Observe",
+            "Commit",
+        ],
+        vec![
+            "Observe",
+            "Commit",
+            "Observe",
+            "HardLimit",
+            "Cut",
+            "Observe",
+            "Commit",
+            "Observe",
+            "Commit",
+        ],
+        vec![
+            "Observe", "Commit", "Observe", "Stop", "Observe", "Commit", "Observe", "Commit",
+        ],
+        vec![
+            "Observe", "Commit", "Clear", "Observe", "Commit", "Observe", "Commit",
+        ],
+        vec![
+            "Observe", "Commit", "Observe", "Abandon", "Observe", "Commit", "Observe", "Commit",
+        ],
+    ] {
+        drive(&model, &trace).unwrap();
+    }
+    for (dial, trace) in [
+        (1, vec!["Observe", "CompleteEarly"]),
+        (
+            2,
+            vec!["Observe", "Commit", "KeepChangedInventory", "Commit"],
+        ),
+        (3, vec!["Observe", "HardLimit", "CompleteCut"]),
+        (4, vec!["Observe", "CompleteStopped"]),
+        (5, vec!["Observe", "CountAbandoned", "Observe", "Commit"]),
+    ] {
+        let wrong = aterm_spec::interp::with_buggy(&model, dial);
+        assert!(
+            drive(&wrong, &trace).is_err(),
+            "negative control {dial} must disagree with real cursor behavior"
+        );
+    }
+}
+
+#[test]
+fn a_clear_or_stopped_product_pass_resets_cycle_progress_before_repressure() {
+    use crate::harness::cli::{DiskLook, DiskTick, disk_tick_paged};
+    let tmp = Tmp::new("discover-cycle-reset");
+    let home = mkdirs(&tmp.path().join("home"));
+    let state = mkdirs(&tmp.path().join("state"));
+    let now = now_after_write(4);
+    for n in 0..=MAX_FOUND {
+        let target = lay_target(&home.join(format!("source-{n:03}")).join("target"));
+        last_used(&target.join("debug"), now);
+    }
+    let roots = roots_at(&tmp);
+    let table = aterm_sysprobe::volumes::table();
+    let look = DiskLook {
+        state: &state,
+        volume: &home,
+        free: Some(GIB),
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: None,
+        now,
+        room: None,
+        table: Some(&table),
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    let config = Config {
+        dead_build_dirs: false,
+        idle_build_dirs: false,
+        ..Config::default()
+    };
+    let mut remove = real_with(now, |_, _| Ok(PathScan::default()));
+    let mut cursor = Cursor::new();
+    let DiskTick::Reclaimed(first, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
+    else {
+        panic!("short");
+    };
+    assert!(!first.ran_out());
+    let position = cursor.after;
+    let plenty = DiskLook {
+        free: Some(config.warn_free_gib * GIB),
+        ..look
+    };
+    assert_eq!(
+        disk_tick_paged(&plenty, config, &mut remove, &mut || Some(GIB), &mut cursor),
+        DiskTick::Plenty
+    );
+    assert_eq!(cursor.after, position);
+    let DiskTick::Reclaimed(repressured, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
+    else {
+        panic!("short again");
+    };
+    assert!(
+        !repressured.ran_out(),
+        "the previous episode's page is not current coverage"
+    );
+
+    let mut changed = Cursor::new();
+    let _ = disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut changed);
+    let changed_config = Config {
+        target_stale_days: config.target_stale_days + 1,
+        ..config
+    };
+    let DiskTick::Reclaimed(reconfigured, _) = disk_tick_paged(
+        &look,
+        changed_config,
+        &mut remove,
+        &mut || Some(GIB),
+        &mut changed,
+    ) else {
+        panic!("short");
+    };
+    assert!(
+        !reconfigured.ran_out(),
+        "a changed grant configuration starts fresh coverage"
+    );
+
+    let mut cursor = Cursor::new();
+    let preview = discover_page(&roots, Budget::SHIPPED, &mut Cursor::new());
+    let eligible = &preview.found[0].path;
+    last_used(&eligible.join("debug"), now - 2 * DAY);
+    let DiskTick::Reclaimed(stopped, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || None, &mut cursor)
+    else {
+        panic!("short");
+    };
+    assert!(!stopped.stops.is_empty() && !stopped.ran_out());
+    last_used(&eligible.join("debug"), now);
+    let DiskTick::Reclaimed(again, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
+    else {
+        panic!("short");
+    };
+    assert!(
+        !again.ran_out(),
+        "a stopped page cannot contribute coverage"
+    );
+}
+
+#[test]
+fn target_walk_and_recent_plan_limits_remain_unfinished_in_product_passes() {
+    use crate::harness::cli::{DiskLook, DiskTick, disk_tick_paged};
+    let tmp = Tmp::new("discover-cycle-assessment-cuts");
+    let home = mkdirs(&tmp.path().join("home"));
+    let state = mkdirs(&tmp.path().join("state"));
+    let now = now_after_write(4);
+    let mut targets = Vec::new();
+    for n in 0..=crate::harness::disk::MAX_ROWS_PER_CLASS {
+        let target = lay_target(&home.join(format!("source-{n:03}")).join("target"));
+        last_used(&target.join("debug"), now - 2 * 3_600);
+        targets.push(target);
+    }
+    let roots = roots_at(&tmp);
+    let table = aterm_sysprobe::volumes::table();
+    let look = DiskLook {
+        state: &state,
+        volume: &home,
+        free: Some(GIB),
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: None,
+        now,
+        room: None,
+        table: Some(&table),
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    let config = Config {
+        dead_build_dirs: false,
+        idle_build_dirs: false,
+        ..Config::default()
+    };
+    let mut remove = real_with(now, |_, _| Ok(PathScan::default()));
+    let DiskTick::Reclaimed(capped, _) = disk_tick_paged(
+        &look,
+        config,
+        &mut remove,
+        &mut || Some(GIB),
+        &mut Cursor::new(),
+    ) else {
+        panic!("short");
+    };
+    assert_eq!(
+        capped.removed.len(),
+        crate::harness::disk::MAX_ROWS_PER_CLASS
+    );
+    assert!(
+        !capped.ran_out(),
+        "the 65th eligible profile was not in this plan"
+    );
+
+    let target = &targets[0];
+    let mut deep = target.join("unvisited");
+    for _ in 0..=crate::harness::disk::target::MAX_PROFILE_DEPTH {
+        deep.push("nested");
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    let DiskTick::Reclaimed(cut, _) = disk_tick_paged(
+        &look,
+        config,
+        &mut remove,
+        &mut || Some(GIB),
+        &mut Cursor::new(),
+    ) else {
+        panic!("short");
+    };
+    assert!(
+        !cut.ran_out(),
+        "a profile walk that omitted a subtree is not exhausted"
+    );
+    let mut surveyed = scan(
+        &SurveyRoots {
+            volume: Some(home),
+            targets: vec![target.clone()],
+            ..Default::default()
+        },
+        now,
+        Trigger::Tick,
+        config,
+        Some(GIB),
+    );
+    assert!(surveyed.targets[0].walk_cut_short.is_some());
+    assert!(!report(&surveyed, config).assessment_complete);
+    surveyed.targets[0].walk_cut_short = None;
+    surveyed.targets[0].total = Some((0, true));
+    for profile in &mut surveyed.targets[0].profiles {
+        profile.bytes_partial = true;
+    }
+    assert!(
+        report(&surveyed, config).assessment_complete,
+        "partial byte sizing alone does not hide profiles or grants"
+    );
+}
+
+#[test]
 fn an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot() {
     let tmp = Tmp::new("discover-xpy");
     let home = mkdirs(&tmp.path().join("home"));
@@ -1517,18 +2188,29 @@ fn a_link_out_of_an_ended_sessions_scratchpad_never_gives_it_what_the_link_names
     symlink(deep.join("target"), wt.join("target")).expect("link out");
     mkdirs(&home.join(".claude/sessions"));
 
-    let d = discover(&roots_at(&tmp), Budget::SHIPPED);
-    let f = d
-        .found
-        .iter()
-        .find(|f| f.path == noindex)
-        .expect("found through the link");
-    assert_eq!(
-        f.origin,
-        Origin::Linked {
-            from: wt.join("target")
-        }
-    );
+    for d in [
+        discover(&roots_at(&tmp), Budget::SHIPPED),
+        discover_page(
+            &roots_at(&tmp),
+            Budget {
+                found: 1,
+                ..Budget::SHIPPED
+            },
+            &mut Cursor::new(),
+        ),
+    ] {
+        let f = d
+            .found
+            .iter()
+            .find(|f| f.path == noindex)
+            .expect("found through the link");
+        assert_eq!(
+            f.origin,
+            Origin::Linked {
+                from: wt.join("target")
+            }
+        );
+    }
     let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, GIB, cfg(true));
     assert!(whole_row(&rep).is_none(), "{:#?}", rep.rows);
     let hog = rep.hogs.iter().find(|h| h.path == noindex).expect("a hog");
@@ -1584,10 +2266,21 @@ fn a_build_directory_a_checkout_also_names_is_the_checkouts() {
     symlink(&shared, live.join("target")).expect("checkout link into the scratchpad");
     mkdirs(&home.join(".claude/sessions"));
 
-    let d = discover(&roots_at(&tmp), Budget::SHIPPED);
-    let at: Vec<&Found> = d.found.iter().filter(|f| f.path == shared).collect();
-    assert_eq!(at.len(), 1, "{:#?}", d.found);
-    assert_eq!(at[0].origin, Origin::Checkout { root: canon(&live) });
+    for d in [
+        discover(&roots_at(&tmp), Budget::SHIPPED),
+        discover_page(
+            &roots_at(&tmp),
+            Budget {
+                found: 1,
+                ..Budget::SHIPPED
+            },
+            &mut Cursor::new(),
+        ),
+    ] {
+        let at: Vec<&Found> = d.found.iter().filter(|f| f.path == shared).collect();
+        assert_eq!(at.len(), 1, "{:#?}", d.found);
+        assert_eq!(at[0].origin, Origin::Checkout { root: canon(&live) });
+    }
     let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, GIB, cfg(true));
     assert!(whole_row(&rep).is_none(), "{:#?}", rep.rows);
     apply_auto(&rep, None, &mut real(now), &mut || Some(GIB), &mut |_| true).expect("applied");
@@ -1611,6 +2304,24 @@ fn a_build_directory_a_checkout_also_names_is_the_checkouts() {
             from: PathBuf::from("/claude-tmp/-proj/other")
         }
     );
+
+    // With the checkout alias gone, the first session initially supplies an owning origin.
+    // The later session's real link must still remove that authority after a one-target page fills.
+    std::fs::remove_file(live.join("target")).expect("remove checkout alias");
+    let later = session_folder(&claude, &home, LIVE);
+    let alias = mkdirs(&later.join("scratchpad/wt")).join("target");
+    symlink(&shared, &alias).expect("later session's link to the first one's build");
+    let page = discover_page(
+        &roots_at(&tmp),
+        Budget {
+            found: 1,
+            ..Budget::SHIPPED
+        },
+        &mut Cursor::new(),
+    );
+    assert_eq!(page.found.len(), 1, "{page:?}");
+    assert_eq!(page.found[0].path, shared);
+    assert_eq!(page.found[0].origin, Origin::Linked { from: alias });
 }
 
 fn until_err(mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
@@ -1807,6 +2518,8 @@ fn the_privacy_guarded_folders_are_never_walked_from_home() {
     }
     let d = discover(&roots_at(&tmp), Budget::SHIPPED);
     assert!(d.found.is_empty(), "{:#?}", d.found);
+    let paged = discover_page(&roots_at(&tmp), Budget::SHIPPED, &mut Cursor::new());
+    assert!(paged.found.is_empty(), "{:#?}", paged.found);
     let from_agent = Roots {
         cwds: vec![home.join("Documents/proj")],
         ..roots_at(&tmp)

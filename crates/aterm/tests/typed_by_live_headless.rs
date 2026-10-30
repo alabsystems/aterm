@@ -77,11 +77,14 @@ fn a_write_names_who_typed_it_and_a_refused_one_names_nobody() {
     assert!(outside.contains(" (pid "), "{outside}");
 
     let aterm = launch_isolation::aterm_executable();
+    // The instance serves: the send's accept waits the hang detector, not the 10 s cap.
     type_line(
         &inst,
         &manager,
         &format!(
-            "'{}' ctl --sock '{}' @{worker} send 'echo two'",
+            "{}={} '{}' ctl --sock '{}' @{worker} send 'echo two'",
+            aterm_ctl::ACCEPT_WITHIN_SEAM,
+            MUST_HAPPEN.as_millis(),
             aterm.display(),
             inst.sock
         ),

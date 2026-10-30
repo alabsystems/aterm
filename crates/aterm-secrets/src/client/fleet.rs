@@ -52,6 +52,14 @@ pub fn alab_fleet(paths: &Paths) -> crate::Result<Option<AlabFleet>> {
     reserved_fleet(paths, &expected)
 }
 
+/// Read an applied fixture's default fleet without requiring the compiled ALab key.
+/// Production always uses [`alab_fleet`]; this seam is absent from release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn test_alab_fleet(paths: &Paths) -> crate::Result<Option<AlabFleet>> {
+    let expected = config(paths)?.ok_or_else(|| Error::new("no fixture vault configured"))?;
+    reserved_fleet(paths, &expected)
+}
+
 /// Read the current signed ALab fleet code after the local apply completed.
 /// Open-admitted ALab members qualify under the owner's 2026-10-26 default
 /// full-membership policy. Other vaults never supply the default fleet.
@@ -69,6 +77,9 @@ pub fn alab_fleet_code(paths: &Paths) -> crate::Result<Option<SecretBytes>> {
 /// [`alab_fleet`]'s read of `expected`'s applied copy, any vault's: an apply
 /// that has not finished is an error naming it, never read as no code.
 pub(super) fn reserved_fleet(paths: &Paths, expected: &Config) -> crate::Result<Option<AlabFleet>> {
+    if steward::local_recipient_denied_in_roster(paths) {
+        return Ok(None);
+    }
     if let Some((entry, admin)) =
         entry::read_reserved_entry_and_admin(paths, expected, FLEET_CODE_ENTRY)?
     {
@@ -193,29 +204,65 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
         let text = std::str::from_utf8(bytes.as_slice())
             .map_err(|_| Error::new(format!("{SWARM_ROSTER_ENTRY} is not UTF-8")))?;
         let mut denied = parse_denied_nodes_toml(text)?;
-        if let Ok(Some(log)) = log_entries::trusted_local_log(paths, &expected) {
-            if let Ok(roster) = crate::swarm_roster::SwarmRoster::from_toml(text) {
-                for member in roster.members {
-                    if Recipient::parse(&member.recipient).is_ok_and(|rec| {
+        let mut parsed_roster = crate::swarm_roster::SwarmRoster::from_toml(text).ok();
+        let local_log = log_entries::trusted_local_log(paths, &expected)
+            .ok()
+            .flatten();
+        // A Mac the log let back in (Allow again, a quorum Undo): the deny rows its removal wrote
+        // no longer hold for it (`roster::restored_by_log`).
+        if let Some(log) = &local_log {
+            let (_, mut nodes) = super::roster::restored_by_log(log);
+            if let Some(roster) = parsed_roster.as_mut() {
+                let _ = super::roster::lift_restored_from_roster(log, roster);
+                let remaining_deny_nodes: BTreeSet<String> = roster
+                    .deny_nodes
+                    .iter()
+                    .map(|n| n.trim().to_ascii_lowercase())
+                    .collect();
+                denied.retain(|node| {
+                    remaining_deny_nodes.contains(&node.trim().to_ascii_lowercase())
+                });
+            } else {
+                denied.retain(|node| !nodes.contains(&node.trim().to_ascii_lowercase()));
+            }
+            for m in parsed_roster.iter().flat_map(|r| &r.members) {
+                if !steward::member_is_denied_in_roster(parsed_roster.as_ref().expect("some"), m) {
+                    if let Some(node_id) = &m.node_id {
+                        nodes.insert(node_id.trim().to_ascii_lowercase());
+                    }
+                    if let Some(node_key) = &m.node_key {
+                        nodes.insert(node_key.trim().to_ascii_lowercase());
+                    }
+                }
+            }
+            denied.retain(|node| !nodes.contains(&node.trim().to_ascii_lowercase()));
+        }
+        if let Some(roster) = &parsed_roster {
+            for member in &roster.members {
+                let removed_in_log = local_log.as_ref().is_some_and(|log| {
+                    Recipient::parse(&member.recipient).is_ok_and(|rec| {
                         log.recipient_is_removed(&rec)
                             || log.audience_left_out_recipient(
                                 &crate::membership_log::EpochAudience::Everyone,
                                 &rec,
                             )
-                    }) {
-                        for raw in [member.node_id, member.node_key].into_iter().flatten() {
-                            let trimmed = raw.trim_ascii().to_ascii_lowercase();
-                            if !trimmed.is_empty() {
-                                denied.push(trimmed);
-                            }
+                    })
+                });
+                if removed_in_log || steward::member_is_denied_in_roster(roster, member) {
+                    for raw in [&member.node_id, &member.node_key].into_iter().flatten() {
+                        let trimmed = raw.trim_ascii().to_ascii_lowercase();
+                        if !trimmed.is_empty() {
+                            denied.push(trimmed);
                         }
                     }
                 }
             }
-            extend_denied_nodes_from_log(&log, &mut denied);
-            denied.sort();
-            denied.dedup();
         }
+        if let Some(log) = &local_log {
+            extend_denied_nodes_from_log(log, parsed_roster.as_ref(), &mut denied);
+        }
+        denied.sort();
+        denied.dedup();
         return Ok(Some(denied));
     }
     let busy = StateLock::observe(paths)?.is_none()
@@ -251,7 +298,7 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
             }
             let mut denied = Vec::new();
             if let Some(log) = &local_log {
-                extend_denied_nodes_from_log(log, &mut denied);
+                extend_denied_nodes_from_log(log, None, &mut denied);
                 denied.sort();
                 denied.dedup();
             }
@@ -260,7 +307,11 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
     }
 }
 
-fn extend_denied_nodes_from_log(log: &crate::membership_log::Log, denied: &mut Vec<String>) {
+fn extend_denied_nodes_from_log(
+    log: &crate::membership_log::Log,
+    roster: Option<&crate::swarm_roster::SwarmRoster>,
+    denied: &mut Vec<String>,
+) {
     let membership = log.membership();
     for (nk, standing) in membership.nodes() {
         if matches!(standing, crate::membership_log::NodeStanding::Removed(_)) && *nk != [0; 32] {
@@ -268,8 +319,22 @@ fn extend_denied_nodes_from_log(log: &crate::membership_log::Log, denied: &mut V
         }
     }
     for (actor, member) in membership.members() {
-        if log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+        let roster_denied = roster.is_some_and(|r| log_entries::member_denied_by_roster(r, member));
+        if (log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+            || roster_denied)
             && let Some(nk) = member.node_key.filter(|k| *k != [0; 32])
+        {
+            denied.push(aterm_codec::hex::encode_lower(&nk));
+        }
+    }
+    for founder in membership.unproved() {
+        let roster_denied = roster
+            .is_some_and(|r| r.is_label_denied(&founder.label) || r.is_label_denied(&founder.name));
+        if (log.audience_left_out_recipient(
+            &crate::membership_log::EpochAudience::Everyone,
+            &founder.recipient,
+        ) || roster_denied)
+            && let Some(nk) = founder.node_key.filter(|k| *k != [0; 32])
         {
             denied.push(aterm_codec::hex::encode_lower(&nk));
         }
@@ -307,17 +372,27 @@ mod tests {
 
         let opened = admin_open(&admin_paths).expect("admin open");
         let mut doc = opened.doc.clone();
+        let m9_recipient = Identity::from_secret_bytes([0x99; 32])
+            .recipient()
+            .to_bech32();
+        let roster_toml = format!(
+            "deny_labels = [\"m9\"]\ndeny_nodes = [\"aa11bb22cc33dd44\", \"ff00\"]\n\n[[member]]\nrecipient = \"{m9_recipient}\"\nvault_name = \"m9\"\nlabel = \"m9\"\nadmitted_ms = 1\nnode_id = \"1122334455667788\"\n"
+        );
         doc.set_entry(
             &Audience::Everyone,
             SWARM_ROSTER_ENTRY,
-            b"deny_nodes = [\"aa11bb22cc33dd44\", \"ff00\"]\n",
+            roster_toml.as_bytes(),
         )
         .expect("set roster");
         admin_publish(&admin_paths, &opened, &doc).expect("publish");
         sync(&admin_paths, None).expect("sync");
         assert_eq!(
             swarm_denied_nodes(&admin_paths).unwrap(),
-            Some(vec!["aa11bb22cc33dd44".to_string(), "ff00".to_string()])
+            Some(vec![
+                "1122334455667788".to_string(),
+                "aa11bb22cc33dd44".to_string(),
+                "ff00".to_string()
+            ])
         );
 
         let _lock = StateLock::take(&admin_paths).expect("hold state lock");

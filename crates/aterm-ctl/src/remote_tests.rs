@@ -282,12 +282,13 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     let off = run("lab-mini", &words("hold s-a1 off"), None, &local)
         .expect_err("no fleet")
         .to_string();
-    assert_eq!(
-        off,
-        "this machine is in no fleet; if this machine took s-a1 on lab-mini, that Mac lifts the \
-         hold when its person takes the tab (Take Over) or lowers `aterm fleet allow` there (to \
-         content or facts), and `aterm ctl --host lab-mini hold s-a1 off` from here works once \
-         this machine is in that fleet again (a fleet it issued went with its leave)"
+    assert!(
+        off.starts_with("this machine is in no fleet; if this machine took s-a1 on lab-mini, ")
+            && off.ends_with(
+                "`aterm ctl --host lab-mini hold s-a1 off` from here works once this machine is \
+                 in that fleet again (a fleet it issued went with its leave)"
+            ),
+        "{off}"
     );
     assert!(!off.contains("stands until"), "{off}");
     let at = run("lab-mini", &words("hold @s-a1 off"), None, &local)
@@ -313,12 +314,15 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     let off = run("lab-mnii", &words("hold s-a1 off"), None, &local)
         .expect_err("no such Mac in the book")
         .to_string();
-    assert_eq!(
-        off,
-        "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on \
-         lab-mnii, that Mac lifts the hold when its person takes the tab (Take Over) or lowers \
-         `aterm fleet allow` there (to content or facts), and `aterm ctl --host lab-mnii hold \
-         s-a1 off` from here works once this machine's book records that Mac again"
+    assert!(
+        off.starts_with(
+            "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on \
+             lab-mnii, "
+        ) && off.ends_with(
+            "`aterm ctl --host lab-mnii hold s-a1 off` from here works once this machine's book \
+             records that Mac again"
+        ),
+        "{off}"
     );
     let on = run("lab-mnii", &words("hold s-a1 on"), None, &local)
         .expect_err("no such Mac in the book")
@@ -336,7 +340,11 @@ fn an_exchange_is_framed_as_on_one_mac() {
             _ => "OK 2\nrow one\nrow two\n".to_owned(),
         }
     }
-    let ran = |line: &str, verb: &str| exchange(link(answer, &SEEN), line, verb, OWN).unwrap();
+    let ran = |line: &str, verb: &str| match exchange(link(answer, &SEEN), line, verb, OWN).unwrap()
+    {
+        Exchange::Completed(code) => code,
+        Exchange::Busy => panic!("the fixture is not busy"),
+    };
     assert_eq!(ran("@s-a1 close\n", "close"), ExitCode::FAILURE);
     assert_eq!(
         ran("@s-a1 turn timeout=20000 go\n", "turn"),
@@ -347,6 +355,143 @@ fn an_exchange_is_framed_as_on_one_mac() {
         *SEEN.lock().unwrap(),
         ["@s-a1 close", "@s-a1 turn timeout=20000 go", "@s-a1 text"]
     );
+}
+
+#[test]
+fn a_busy_fleet_handoff_retries_under_one_deadline() {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn busy(_: &str) -> String {
+        aterm_types::control_verbs::CONTROL_BUSY_LINE.to_owned()
+    }
+    fn ready(_: &str) -> String {
+        "OK delivered=1\n".to_owned()
+    }
+    SEEN.lock().unwrap().clear();
+    let budget = Duration::from_secs(60);
+    let mut attempts = Vec::new();
+    let code = exchange_with_retry(
+        "@s-a1 post key=k kind=note -- once\n",
+        "post",
+        Within::Drive(budget),
+        |remaining| {
+            attempts.push(remaining);
+            Ok(link(if attempts.len() == 1 { busy } else { ready }, &SEEN))
+        },
+    )
+    .unwrap();
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], budget);
+    assert!(
+        attempts[1] < attempts[0],
+        "the redial keeps the original deadline"
+    );
+    assert_eq!(
+        *SEEN.lock().unwrap(),
+        [
+            "@s-a1 post key=k kind=note -- once",
+            "@s-a1 post key=k kind=note -- once"
+        ]
+    );
+}
+
+#[test]
+fn a_fleet_retry_requires_the_exact_complete_predispatch_busy_reply() {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn denied(_: &str) -> String {
+        "ERR denied\n".into()
+    }
+    fn other_busy(_: &str) -> String {
+        "ERR control server busy; retry later\n".into()
+    }
+    fn truncated(_: &str) -> String {
+        aterm_types::control_verbs::CONTROL_BUSY_REPLY.into()
+    }
+    fn surplus(_: &str) -> String {
+        format!(
+            "{}unexpected body\n",
+            aterm_types::control_verbs::CONTROL_BUSY_LINE
+        )
+    }
+    fn eof(_: &str) -> String {
+        String::new()
+    }
+    for answer in [
+        denied as fn(&str) -> String,
+        other_busy,
+        truncated,
+        surplus,
+        eof,
+    ] {
+        SEEN.lock().unwrap().clear();
+        let mut calls = 0;
+        let result =
+            exchange_with_retry("@s-a1 post key=k kind=note -- once\n", "post", OWN, |_| {
+                calls += 1;
+                Ok(link(answer, &SEEN))
+            });
+        assert_eq!(
+            calls, 1,
+            "only a full exact Busy refusal may repeat the request"
+        );
+        assert!(!matches!(result, Ok(code) if code == ExitCode::SUCCESS));
+    }
+}
+
+#[test]
+fn busy_does_not_extend_an_expired_fleet_deadline() {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn busy(_: &str) -> String {
+        aterm_types::control_verbs::CONTROL_BUSY_LINE.into()
+    }
+    let mut calls = 0;
+    let error = exchange_with_retry(
+        "@s-a1 inbox\n",
+        "inbox",
+        Within::Drive(Duration::ZERO),
+        |_| {
+            calls += 1;
+            Ok(link(busy, &SEEN))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("request was not dispatched"));
+}
+
+#[test]
+fn a_partial_fleet_send_is_never_repeated() {
+    struct PartialSend(bool);
+    impl Write for PartialSend {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            if std::mem::replace(&mut self.0, false) {
+                Ok(1)
+            } else {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Read for PartialSend {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("a failed send reaches no reply")
+        }
+    }
+    let mut calls = 0;
+    assert!(
+        exchange_with_retry("@s-a1 send once\n", "send", OWN, |_| {
+            calls += 1;
+            Ok(DriveLink {
+                stream: Box::new(PartialSend(true)),
+                label: "lab-mini".into(),
+            })
+        })
+        .is_err()
+    );
+    assert_eq!(calls, 1);
 }
 
 #[test]

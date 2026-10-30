@@ -1035,6 +1035,9 @@ pub enum Absorb {
     Flushed(Vec<u8>),
     /// A request awaiting a person is in the table too ([`Act::Post`]).
     Posted(Vec<u8>),
+    /// A terminal record retired an obsolete wire request, and its bound successor was
+    /// durably posted. The local ledger adopts the successor's nonce and receipt together.
+    Reissued { nonce: [u8; 16], record: Vec<u8> },
     /// The lab decided it.
     Decided(Decision),
 }

@@ -16,6 +16,7 @@ fn grain(x: f32, y: f32, hue: f32, born: Instant) -> Particle {
         hue,
         cov_scale: 1.0,
         born,
+        latch: ParticleLatch::FRESH,
         edge_cut: false,
     }
 }
@@ -1571,6 +1572,7 @@ fn a_drop_the_edge_cut_stays_out_through_a_scroll() {
                 hue: 0.8,
                 cov_scale: 1.0,
                 born: at,
+                latch: ParticleLatch::FRESH,
                 edge_cut: false,
             });
             (0..=60_u64)
@@ -1628,6 +1630,7 @@ fn a_sibling_the_edge_cuts_holds_out_only_itself() {
             hue,
             cov_scale: 1.0,
             born: at,
+            latch: ParticleLatch::FRESH,
             edge_cut: false,
         };
         let mut glow = CursorGlow::default();

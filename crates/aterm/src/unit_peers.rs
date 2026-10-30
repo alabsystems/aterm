@@ -16,7 +16,21 @@ pub(crate) fn fleet() -> atpkg::peers::Fleet {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return atpkg::peers::Fleet::default();
     };
-    let members = aterm_net::fleet_member::member_addrs(&state);
+    let isolated = cfg!(test)
+        || std::env::var_os("ATERM_STATE_HOME").is_some()
+        || std::env::var_os("CI").is_some();
+    let paths = (!isolated)
+        .then(|| aterm_secrets::client::Paths::live().ok())
+        .flatten();
+    let denied = paths
+        .as_ref()
+        .and_then(|p| aterm_secrets::client::swarm_denied_nodes(p).ok().flatten())
+        .unwrap_or_default();
+    let log = paths
+        .as_ref()
+        .and_then(|p| aterm_agent::fleet_log::LocalLog::of(p).keys());
+    let members =
+        aterm_net::fleet_member::member_addrs_with_denied(&state, &denied, log.as_deref());
     #[cfg(target_os = "macos")]
     {
         use aterm_cli::macos_doctor::LocalNetworkHeard;

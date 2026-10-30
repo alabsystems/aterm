@@ -37,6 +37,7 @@ struct Host {
     store: accounts::Store,
     now: i64,
     replacement: Vec<u8>,
+    missing: bool,
     legacy: bool,
     homes: RefCell<Vec<PathBuf>>,
     before: RefCell<Option<Option<accounts::Binding>>>,
@@ -100,7 +101,18 @@ impl AccountsHost for Host {
         } else {
             ".claude.json"
         });
-        std::fs::write(path, &self.replacement).unwrap();
+        std::fs::write(&path, &self.replacement).unwrap();
+        if self.missing {
+            std::fs::rename(&path, Path::new(home).with_extension("retained-profile")).unwrap();
+            if self.legacy {
+                std::fs::rename(
+                    Path::new(home).join(".claude.json"),
+                    Path::new(home).with_extension("retained-plain-profile"),
+                )
+                .unwrap();
+            }
+            std::fs::create_dir(Path::new(home).join(".renewal-check-interrupted")).unwrap();
+        }
         Ok(status)
     }
 
@@ -203,7 +215,8 @@ fn renewal_identity_case(
     let host = Host {
         store: store.clone(),
         now: env.now + 1,
-        replacement: profile_bytes(kind),
+        replacement: profile_bytes(if kind == 6 { 1 } else { kind }),
+        missing: kind == 6,
         legacy: variant & 2 != 0,
         homes: RefCell::new(Vec::new()),
         before: RefCell::new(None),
@@ -240,8 +253,8 @@ fn renewal_identity_case(
     assert_eq!(host.checks.get(), 1, "{}", String::from_utf8_lossy(&err));
     assert_eq!(
         host.observations.get(),
-        1,
-        "one current profile observation"
+        usize::from(!host.missing),
+        "a missing footprint is refused before the current profile observation"
     );
     let after = store.load_logins(host.now).unwrap().0;
     if code != ExitCode::SUCCESS {
@@ -258,11 +271,15 @@ fn renewal_identity_case(
         );
     }
     let home = host.homes.borrow()[0].clone();
-    let profile = home.join(if host.legacy {
-        ".config.json"
+    let profile = if host.missing {
+        home.with_extension("retained-profile")
     } else {
-        ".claude.json"
-    });
+        home.join(if host.legacy {
+            ".config.json"
+        } else {
+            ".claude.json"
+        })
+    };
     let attempt = after.shared.latest(source());
     [
         ("published", i64::from(code == ExitCode::SUCCESS)),
@@ -347,8 +364,8 @@ pub(crate) fn renewal_identity_transition(
 #[test]
 fn explicit_renewal_identity_conforms_and_preserves_consumed_grants() {
     let model = aterm_models_harness::renewal_identity_model();
-    assert_eq!(model.mutant_dials(), (1..=12).collect::<Vec<_>>());
-    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 84);
+    assert_eq!(model.mutant_dials(), (1..=13).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 98);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -378,5 +395,30 @@ fn explicit_renewal_identity_conforms_and_preserves_consumed_grants() {
         let mut bad = refused.clone();
         bad.insert(field, value);
         assert!(!model.check_invariant(law, &bad), "{law}");
+    }
+}
+
+#[test]
+fn explicit_renewal_cannot_recreate_missing_vendor_files_with_a_checkpoint() {
+    for mode in 0..=2 {
+        for prior in [false, true] {
+            for variant in 0..4 {
+                let result = renewal_identity_case(mode, 6, prior, variant, mode == 2);
+                assert_eq!(
+                    result,
+                    [
+                        ("published", 0),
+                        ("bound", 0),
+                        ("unchanged", 1),
+                        ("preserved", 1),
+                        ("checkpoint", 0),
+                        ("spent", i64::from(mode == 2)),
+                        ("unknown", i64::from(mode == 2)),
+                        ("calls", 1),
+                    ],
+                    "mode={mode}, prior={prior}, variant={variant}",
+                );
+            }
+        }
     }
 }

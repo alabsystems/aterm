@@ -13,8 +13,8 @@ use aterm_uds::CtlStream;
 
 use super::control_lanes::{Census, LaneLimits, LaneReader, LaneService, Lanes, Outbox, Unread};
 use super::{
-    AUTH_READ_TIMEOUT, ActiveHandle, MAX_REQUEST_LINE, Request, Scope, ServeDisposition,
-    authenticate_connection, control_denials, read_request_line,
+    ActiveHandle, MAX_REQUEST_LINE, Request, Scope, ServeDisposition, authenticate_connection,
+    control_denials, read_request_line,
 };
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -356,7 +356,7 @@ fn an_over_long_line_is_answered_why_then_closed() {
             let denials = control_denials::AuthDenials::new();
             let mut unread = Unread::default();
             let mut reader = LaneReader::new(&server, &mut unread);
-            let deadline = Instant::now() + AUTH_READ_TIMEOUT;
+            let deadline = Instant::now() + HANG;
             authenticate_connection(&server, &mut reader, TOKEN, &active, &denials, deadline)
                 .is_some()
         });

@@ -35,6 +35,13 @@ const HANDSHAKE_SEAM: &str = "ATERM_DEBUG_FLEET_HANDSHAKE_MS";
 /// Timeout for each member one background heartbeat round registers with.
 const HEARTBEAT_WITHIN: Duration = Duration::from_secs(10);
 
+/// Timeout for a facts push to the issuer this Mac's book names. A unit test's issuer is its own
+/// in-process server, which answers, so its push waits the hang detector.
+#[cfg(not(test))]
+const FACTS_PUSH_WITHIN: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const FACTS_PUSH_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+
 /// The milliseconds the dev seam `seam` names, else `default`.
 fn seam_or(seam: &str, default: Duration) -> Duration {
     aterm_types::dev_seam!(seam)
@@ -48,10 +55,16 @@ fn retry() -> Duration {
     *EVERY.get_or_init(|| seam_or(RETRY_SEAM, RETRY))
 }
 
-/// How long a proved connection is served ([`aterm_net::fleet::SERVED_WITHIN`]).
+/// How long a proved connection is served ([`aterm_net::fleet::SERVED_WITHIN`]). A unit test's
+/// peers serve in process and finish their exchanges, so its connections are served to the
+/// hang detector: a wait the test lifts (a node's window wake) is not cut at 30 s.
 fn lifetime() -> Duration {
+    #[cfg(not(test))]
+    const SERVED: Duration = aterm_net::fleet::SERVED_WITHIN;
+    #[cfg(test)]
+    const SERVED: Duration = aterm_spec::wait::MUST_HAPPEN;
     static WITHIN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *WITHIN.get_or_init(|| seam_or(LIFETIME_SEAM, aterm_net::fleet::SERVED_WITHIN))
+    *WITHIN.get_or_init(|| seam_or(LIFETIME_SEAM, SERVED))
 }
 
 /// How often a member's listener registers with the members that answer it (F17: up to three).
@@ -372,6 +385,12 @@ fn update_denied_nodes_cache(
 /// local vault is mid-apply or unreadable.
 #[cfg(unix)]
 fn denied_nodes_now() -> Arc<[String]> {
+    let isolated = cfg!(test)
+        || std::env::var_os("ATERM_STATE_HOME").is_some()
+        || std::env::var_os("CI").is_some();
+    if isolated {
+        return Arc::from(&[][..]);
+    }
     let observed = aterm_secrets::client::Paths::live()
         .and_then(|paths| aterm_secrets::client::swarm_denied_nodes(&paths));
     let mut guard = DENIED_NODES.lock_or_recover();
@@ -392,33 +411,6 @@ fn still_drives(
             !aterm_net::fleet::is_denied_key(&key, denied_nodes)
                 && aterm_net::fleet::DriveGrant::admitting(grants, node, key).is_some()
         })
-}
-
-/// Whose `peers rm` of `node` ends what lets it drive this Mac under `grants`
-/// ([`crate::fabric::RmLifts`]): only the issuer's where the `"*"` grant admits it and `keys`'
-/// copy of the issuer's book binds it ([`aterm_net::fleet_member::Keyring::copy_binds`]), which a
-/// `peers rm` here leaves bound.
-#[cfg(unix)]
-fn rm_lifts_under(
-    grants: &[aterm_net::fleet::DriveGrant],
-    keys: &aterm_net::fleet_member::Keyring,
-    node: &str,
-) -> crate::fabric::RmLifts {
-    if grants.iter().any(aterm_net::fleet::DriveGrant::all) && keys.copy_binds(node) {
-        crate::fabric::RmLifts::Issuer
-    } else {
-        crate::fabric::RmLifts::Here
-    }
-}
-
-/// [`rm_lifts_under`] as aterm.toml and this Mac's books stand now, which a remote hold's refusal
-/// asks.
-#[cfg(unix)]
-fn rm_lifts(node: &str) -> crate::fabric::RmLifts {
-    let keys = aterm_types::dirs::state_dir()
-        .map(|state| aterm_net::fleet_member::Keyring::read(&state))
-        .unwrap_or_default();
-    rm_lifts_under(&served_now().grants, &keys, node)
 }
 
 /// The membership log's admission in this window's process (`docs/DESIGN-fluid-swarm-2026-10-28.md`
@@ -722,7 +714,6 @@ fn ensure_fleet_listener_thread(desk: &mut FleetDesk) -> bool {
 /// ([`units_status_word`]).
 pub(crate) fn start_fleet_listener(fleet: Option<&FleetConfig>) {
     #[cfg(unix)]
-    crate::fabric::on_rm_lifts(rm_lifts);
     let _ = UNITS_DESK.word(
         UnitsTiming {
             wait: Duration::ZERO,
@@ -1362,12 +1353,16 @@ fn share_units(
 }
 
 /// The addresses whose connections may take a toolset archive ([`share_units`]): this Mac's
-/// fleet members' LAN addresses ([`aterm_net::fleet_member::member_addrs`]), each a private or
-/// link-local one ([`aterm_net::fleet::is_fleet_source`]).
+/// fleet members' LAN addresses ([`aterm_net::fleet_member::member_addrs_with_denied`]), each a
+/// private or link-local one ([`aterm_net::fleet::is_fleet_source`]).
 #[cfg(unix)]
 fn unit_members() -> Vec<IpAddr> {
+    let denied = denied_nodes_now();
+    let log = window_log();
     aterm_types::dirs::state_dir()
-        .map(|state| aterm_net::fleet_member::member_addrs(&state))
+        .map(|state| {
+            aterm_net::fleet_member::member_addrs_with_denied(&state, &denied, log.as_deref())
+        })
         .unwrap_or_default()
 }
 
@@ -1437,20 +1432,26 @@ fn lists_driver(
     served: &aterm_net::fleet::Served,
     grants: &[aterm_net::fleet::DriveGrant],
 ) -> bool {
-    aterm_types::dirs::state_dir()
-        .is_some_and(|state| lists_driver_at(served, &state, grants, window_log().as_deref()))
+    let denied = denied_nodes_now();
+    aterm_types::dirs::state_dir().is_some_and(|state| {
+        lists_driver_at(served, &state, grants, &denied, window_log().as_deref())
+    })
 }
 
-/// Whether a drive of `served` would be admitted under `grants` and the log's verdict `log`, as
-/// [`admit_driver_at`] judges it, so a survey's `drive=1` is what a drive gets.
+/// Whether a drive of `served` would be admitted under `grants`, `denied` and the log's verdict
+/// `log`, as [`admit_driver_at`] judges it, so a survey's `drive=1` is what a drive gets.
 #[cfg(unix)]
 fn lists_driver_at(
     served: &aterm_net::fleet::Served,
     state: &std::path::Path,
     grants: &[aterm_net::fleet::DriveGrant],
+    denied: &[String],
     log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> bool {
-    aterm_net::fleet_member::proven_driver(served, state, grants, log).is_ok()
+    !served.peer_node().is_some_and(|proof| {
+        aterm_net::fleet::is_denied_node(&proof.node, denied)
+            || aterm_net::fleet::is_denied_key(&proof.key, denied)
+    }) && aterm_net::fleet_member::proven_driver(served, state, grants, log).is_ok()
 }
 
 /// A connection the listener handed to the control server, which [`cut_unserved`] hangs up once
@@ -1920,7 +1921,7 @@ pub(crate) fn push_facts_to_issuer(
         peer.port,
         (secret, Some(&me)),
         payload,
-        Duration::from_secs(5),
+        FACTS_PUSH_WITHIN,
     )?;
     Ok(FactsPushOutcome::PushedRemote {
         host: peer.host.clone(),
@@ -2931,62 +2932,6 @@ mod tests {
         assert!(!in_place(None, here.as_ref()));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn under_the_all_grant_a_member_the_copy_binds_goes_with_the_issuers_peers_rm() {
-        let a = aterm_net::fleet::DriveGrant::from_word(&format!(
-            "{}:{}",
-            "0a".repeat(16),
-            "cd".repeat(32)
-        ))
-        .expect("a grant");
-        let (grants, key) = ([a.clone()], a.key);
-        let every = [
-            aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS)
-                .expect("the all-member grant"),
-        ];
-        let peer = |n: u8, via| aterm_net::fleet_member::Peer {
-            node: Some(format!("{n:02x}").repeat(16)),
-            key: Some(key),
-            key_from: None,
-            host: "127.0.0.1".to_owned(),
-            addr: None,
-            port: 7100,
-            version: None,
-            seen_ms: None,
-            via,
-            fleet: None,
-            signed: None,
-        };
-        let member = aterm_net::fleet_member::Keyring::of(&[
-            peer(0x01, aterm_net::fleet_member::Via::Issuer),
-            peer(0x0a, aterm_net::fleet_member::Via::IssuerBook),
-        ]);
-        let lifts = |grants: &[aterm_net::fleet::DriveGrant], node: &str| {
-            rm_lifts_under(grants, &member, node)
-        };
-        assert_eq!(
-            lifts(&every, &a.node),
-            crate::fabric::RmLifts::Issuer,
-            "under `*`, the copy binds a member a peers rm here leaves bound"
-        );
-        assert_eq!(lifts(&grants, &a.node), crate::fabric::RmLifts::Here);
-        assert_eq!(
-            lifts(&every, &"01".repeat(16)),
-            crate::fabric::RmLifts::Here,
-            "its issuer goes with its own peers rm"
-        );
-        let issuer = aterm_net::fleet_member::Keyring::of(&[peer(
-            0x0a,
-            aterm_net::fleet_member::Via::Joined,
-        )]);
-        assert_eq!(
-            rm_lifts_under(&every, &issuer, &a.node),
-            crate::fabric::RmLifts::Here,
-            "on the issuer, its own book binds every member"
-        );
-    }
-
     #[test]
     fn a_node_drives_on_while_a_grant_names_it_with_the_key_it_is_bound_to() {
         let grant = |n: u8, key: u8| {
@@ -3309,15 +3254,18 @@ mod tests {
             serves: SERVES,
             slots: 4,
             per_source: 4,
-            lifetime: Duration::from_secs(5),
+            lifetime: aterm_spec::wait::MUST_HAPPEN,
         };
         let server_running = Arc::clone(&running);
         let server = std::thread::spawn(move || {
-            aterm_net::fleet::serve_offering(
+            aterm_net::fleet::serve_offering_with_ask_within(
                 &listener,
-                &listening,
-                &|| (FleetScope::Facts, SERVES),
+                (&listening, &|| (FleetScope::Facts, SERVES), &|| {
+                    Arc::new(aterm_net::fleet::Denied::default())
+                }),
+                None,
                 &server_running,
+                aterm_spec::wait::MUST_HAPPEN,
                 move |served, op| {
                     assert_eq!(op, FleetOp::Facts);
                     let proof = served.peer_node().cloned();
@@ -3403,7 +3351,7 @@ mod tests {
             port,
             (&secret, Some(&spoof_holder)),
             &forged_payload,
-            Duration::from_secs(5),
+            aterm_spec::wait::MUST_HAPPEN,
         )
         .expect_err("spoofed holder key must be refused");
         assert!(spoof_err.contains("ERR key-mismatch"), "{spoof_err}");

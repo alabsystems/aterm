@@ -97,7 +97,10 @@ impl Runner for LiveRunner {
             ),
             None => aterm_uds::spawnfd::Stdio::null(),
         };
-        match aterm_uds::deadline::output_until_from(&mut cmd, feed, Instant::now() + job.budget) {
+        let deadline = Instant::now()
+            .checked_add(job.budget)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
+        match aterm_uds::deadline::output_until_from(&mut cmd, feed, deadline) {
             Ok(out) => Ok(Ran {
                 exit: out.status.code(),
                 stdout: tail(&out.stdout),

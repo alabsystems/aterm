@@ -33,8 +33,8 @@ use std::time::Duration;
 /// The desired state's revision: a pass is due on the same build once it moves, as when an item
 /// joins or leaves the pass (3: `sync.identity`; 4: the ALab steward's fleet item; 5:
 /// `sync.steward.revoke`; 6: `sync.node`; 7: `sync.steward.lease` and
-/// `sync.steward.server.standby`; 8: the steward's fleet item retired).
-pub const SPEC: u32 = 8;
+/// `sync.steward.server.standby`; 8: the steward's fleet item retired; 9: automatic signing).
+pub const SPEC: u32 = 9;
 
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
@@ -84,6 +84,8 @@ pub const SHARED_DATA: &str = "sync.shared-data";
 pub const REQUESTS: &str = "sync.requests";
 /// `sync.accounts`: the AI accounts roster.
 pub const ACCOUNTS: &str = "sync.accounts";
+/// `sync.release`: automatic private keychain setup and a real signing proof.
+pub const RELEASE: &str = "sync.release";
 /// `sync.fabric`: the message bus (fabric), on by default, and its broker renewed on a new build.
 pub const FABRIC: &str = "sync.fabric";
 
@@ -457,6 +459,17 @@ pub enum AccountsRead {
     Due(String),
 }
 
+/// Value-free readiness of the shared Developer ID material on this member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseRead {
+    /// This platform or vault does not participate.
+    NotApplicable(String),
+    /// A real signing proof covers the current material and local keychain.
+    Current(String),
+    /// Automatic credential delivery or keychain repair remains due.
+    Due(String),
+}
+
 /// What the message bus reads as (`sync.fabric`): on by default, as `aterm fabric on` turns it on,
 /// where the person never turned it off.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,6 +542,15 @@ pub trait Ports: Sync {
     /// Whether this process is the installed release aterm.app's (not a build, a renamed or held
     /// copy): only it re-lays the base layer.
     fn installed_release(&self) -> bool;
+    /// Move an unpinned managed vault subscriber onto this installed release when due.
+    /// Called only by an apply pass, after its account/lock checks, with swarm enabled.
+    /// `Some` describes a completed move; `None` means no move was needed.
+    ///
+    /// # Errors
+    /// The job could not be safely read or moved.
+    fn refresh_vault_subscriber(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// Whether an aterm window runs for this login now: its upkeep then keeps the AI accounts
     /// roster, so the subscriber's pass leaves it alone.
     fn window_runs(&self) -> bool;
@@ -672,6 +694,16 @@ pub trait Ports: Sync {
     /// # Errors
     /// The resync failed.
     fn resync_accounts(&self) -> Result<String, String>;
+    /// Read the current automatic signing proof without changing local state.
+    fn release(&self) -> Result<ReleaseRead, String> {
+        Ok(ReleaseRead::NotApplicable(
+            "release signing is unavailable".into(),
+        ))
+    }
+    /// Prepare the delivered signing pair and prove an unattended signature.
+    fn sync_release(&self) -> Result<String, String> {
+        Ok("release signing is unavailable".into())
+    }
     /// `sync.fabric`'s read.
     ///
     /// # Errors
@@ -740,6 +772,7 @@ enum Kind {
     SharedData,
     Requests,
     Accounts,
+    Release,
     Fabric,
 }
 
@@ -868,6 +901,7 @@ impl Item for Synced<'_> {
             Kind::SharedData => SHARED_DATA,
             Kind::Requests => REQUESTS,
             Kind::Accounts => ACCOUNTS,
+            Kind::Release => RELEASE,
             Kind::Fabric => FABRIC,
         }
         .to_owned()
@@ -890,6 +924,7 @@ impl Item for Synced<'_> {
             | Kind::StewardServerStandby
             | Kind::Node
             | Kind::Requests
+            | Kind::Release
             | Kind::Fabric => Class::Relay,
             Kind::Peers | Kind::Fleet | Kind::SharedData | Kind::Accounts => Class::Install,
         }
@@ -908,6 +943,7 @@ impl Item for Synced<'_> {
             Kind::SharedData => "shared data (ALab Commons)",
             Kind::Requests => "this Mac's credential requests",
             Kind::Accounts => "the AI accounts roster",
+            Kind::Release => "shared release signing",
             Kind::Fabric => "the message bus (fabric)",
         }
         .to_owned()
@@ -1048,6 +1084,14 @@ impl Item for Synced<'_> {
                     to: "synced from its sources, with no sign-in".to_owned(),
                 },
             }),
+            Kind::Release => read(self.ports.release(), |release| match release {
+                ReleaseRead::NotApplicable(why) => not_applicable(why),
+                ReleaseRead::Current(now) => Probe::Ok { now },
+                ReleaseRead::Due(from) => Probe::Change {
+                    from,
+                    to: "private keychain prepared and unattended signature proved".into(),
+                },
+            }),
             Kind::Fabric => read(self.ports.fabric(), |fabric| match fabric {
                 FabricRead::NotApplicable(why) => not_applicable(why),
                 FabricRead::Current(now) => Probe::Ok { now },
@@ -1117,6 +1161,10 @@ impl Item for Synced<'_> {
                 .found_commons()
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
             Kind::Accounts => self.ports.resync_accounts()?,
+            Kind::Release => self
+                .ports
+                .sync_release()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
             // Read again: the probe planned one of the two, and only it changes the fabric.
             Kind::Fabric => match self.ports.fabric()? {
                 FabricRead::Due(_) => self.ports.renew_broker()?,
@@ -1157,6 +1205,7 @@ impl Item for Synced<'_> {
             Kind::Accounts => Remedy::Init {
                 only: "base.ai.accounts".to_owned(),
             },
+            Kind::Release => Remedy::None,
             Kind::Fabric => Remedy::Command("aterm fabric on".to_owned()),
         };
         Explain { why, remedy }
@@ -1359,6 +1408,7 @@ fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'
         Kind::SharedData,
         Kind::Requests,
         Kind::Accounts,
+        Kind::Release,
         Kind::Fabric,
     ]
     .into_iter()
@@ -1472,6 +1522,13 @@ fn run_pass(
     } else {
         record.as_ref().and_then(|record| record.base.clone())
     };
+    if mode == Mode::Apply
+        && ports.installed_release()
+        && ports.swarm_enabled().unwrap_or(false)
+        && let Some(line) = ports.refresh_vault_subscriber().map_err(Stop::Refused)?
+    {
+        ports.log(&format!("converge vault subscriber: {line}"));
+    }
     let items = sync_items(ports, trigger, mode);
     rows.extend(aterm_converge::run_scoped(&items, mode, scope, journal, on_row).map_err(refused)?);
     if mode == Mode::Plan {

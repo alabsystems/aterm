@@ -1651,7 +1651,7 @@ fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600);
+        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = open.open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {

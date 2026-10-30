@@ -1348,11 +1348,15 @@ impl Sweep {
 #[derive(Default)]
 struct Findings {
     faults: Vec<(Rule, String)>,
+    /// Each rule a frame broke, with the first frame that broke it.
+    firsts: Vec<(Rule, usize)>,
     exceptions: Vec<String>,
     /// Each frame a reach of its own key draws another list for, and how many were held to one.
     unlike: Vec<String>,
     compared: usize,
     frames: usize,
+    /// The last frame's first stop and list room.
+    ended: Option<(Option<usize>, f32)>,
 }
 
 fn view_state(
@@ -1557,6 +1561,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
             .map_or(start, |(last, step)| last.drawn.after(step));
         let frame = draw(&mut runtime, instance, view, drawn);
         found.frames += 1;
+        found.ended = Some((frame.top, frame.room));
         let walked_state = state(&runtime, view);
         let reveal = walked_state.page_reveal.clone();
         let reach_of = ReachOf {
@@ -1585,6 +1590,9 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
         };
         let mut fault = |rule: Rule, said: String| {
             found.faults.push((rule, format!("{}: {said}", at_frame())));
+            if !found.firsts.iter().any(|(seen, _)| *seen == rule) {
+                found.firsts.push((rule, at));
+            }
         };
         // The reaches this frame's rules read, in its chrome, each with its key.
         let judged = std::cell::RefCell::new(Vec::<(ReachOf, Arc<Reach>)>::new());
@@ -1649,6 +1657,38 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                     ),
                 ),
             }
+        }
+        // R2: a chrome chosen anew cuts the keyboard's control only where every other rung does.
+        let giving = frame.chrome.bar_room_given;
+        if let (Some(key), Some(_)) = (control.as_deref(), owed.as_ref())
+            && let Kept::Part(part) = frame.kept(key)
+            && part > 0.5
+            && (step.is_none() || persons)
+            && last.as_ref().is_none_or(|last| last.chrome != frame.chrome)
+            && let Some((rung, scroll)) = rungs(drawn)
+                .into_iter()
+                .flat_map(|rung| [Some(rung), giving.then(|| rung.giving_bar_room())])
+                .flatten()
+                .filter(|rung| *rung != frame.chrome)
+                .find_map(|rung| {
+                    sweep
+                        .reach(&ReachOf {
+                            chrome: Some(Chrome(rung)),
+                            ..kept_reach_of.clone()
+                        })
+                        .covering(Kept::Whole)
+                        .map(|scroll| (rung, scroll))
+                })
+        {
+            fault(
+                Rule::R2,
+                format!(
+                    "{key} {} in {:?}, chosen anew, though in {rung:?}, a rung of its ladder, the \
+                     screen at scroll {scroll} shows it whole",
+                    frame.kept(key),
+                    frame.chrome
+                ),
+            );
         }
         // R2: the keyboard's listed control, painted at all, is whole across in a list as wide.
         if let Some(key) = control.as_deref()
@@ -4645,11 +4685,112 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((262, 505)),
             ],
         ),
+        // A list laid in a framed panel tells no seat in a panel whose frame gave way (R2).
+        (solarized, statused((252, 152), 1), vec![Warning, Text]),
+        (
+            solarized,
+            at((299, 142), 1),
+            vec![Text, Again, Window((299, 143)), Status, Warning],
+        ),
+        (
+            filter,
+            warned((2_977, 1_169), 1),
+            vec![
+                Text,
+                Warning,
+                Status,
+                Up,
+                Press(MOCHA),
+                Press(PALETTE_FIRST),
+                Again,
+                Focus,
+                Erase,
+                Wheel(-20),
+                Wheel(1),
+                Again,
+                Window((2_977, 1_170)),
+                Again,
+                Warning,
+                Window((2_976, 1_170)),
+                Status,
+                Wheel(3),
+                Again,
+                Window((2_975, 1_170)),
+                Window((376, 129)),
+            ],
+        ),
+        // A chrome chosen anew for the person shows the control whole where a rung does (R2).
+        (field, at((2_851, 134), 2), vec![]),
+        (
+            drawn,
+            at((2_751, 1_379), 2),
+            vec![
+                Type,
+                Wheel(5),
+                Wheel(-1),
+                Text,
+                Status,
+                Wheel(-8),
+                Again,
+                Status,
+                Window((2_752, 1_379)),
+                Window((2_751, 1_379)),
+                Press(BACKGROUND_WELL),
+                Wheel(8),
+                Tick,
+                Status,
+                Focus,
+                Again,
+                Window((2_751, 1_380)),
+                Erase,
+                Erase,
+                Warning,
+                Window((2_360, 278)),
+                Wheel(-3),
+                Again,
+                Status,
+                Status,
+                Status,
+                Wheel(-2),
+                Status,
+                Down,
+            ],
+        ),
     ]
 }
 
-/// Walks that break a keeping rule on main (c5ef831d7f) as here: walked and printed, failing none.
-fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
+/// Each rule a known walk breaks and its first frame; `BreaksUnlike`: a reach draws another list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Known {
+    Breaks(&'static [(Rule, usize)]),
+    BreaksUnlike(&'static [(Rule, usize)]),
+}
+
+impl Known {
+    /// Whether a walk that broke each of `firsts` first where it names, `unlike` or not, does this.
+    fn names(self, firsts: &[(Rule, usize)], unlike: bool) -> bool {
+        let (named, named_unlike) = match self {
+            Self::Breaks(named) => (named, false),
+            Self::BreaksUnlike(named) => (named, true),
+        };
+        named_unlike == unlike
+            && named.len() == firsts.len()
+            && named.iter().all(|first| firsts.contains(first))
+    }
+}
+
+/// A known walk's entry names every rule it breaks: one naming only the first is told apart.
+#[test]
+fn a_known_walk_is_held_to_every_rule_it_breaks() {
+    let does = [(Rule::R3, 1), (Rule::R2, 4)];
+    assert!(!Known::Breaks(&[(Rule::R3, 1)]).names(&does, false));
+    assert!(Known::Breaks(&[(Rule::R2, 4), (Rule::R3, 1)]).names(&does, false));
+    assert!(!Known::Breaks(&[(Rule::R3, 1), (Rule::R2, 5)]).names(&does, false));
+    assert!(!Known::BreaksUnlike(&[(Rule::R3, 1), (Rule::R2, 4)]).names(&does, false));
+}
+
+/// Walks that break a keeping rule on main (c5ef831d7f) as here, each doing what its entry names.
+fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
     use Step::{Down, Erase, Press, Status, Text, Type, Up, Warning, Wheel, Window};
     let on = |keyboard, theme| Scenario {
         keyboard,
@@ -4675,44 +4816,105 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
     let one_dark = on(Keyboard::Row("One Dark"), "GitHub Light");
     let foreground = on(Keyboard::Sheet(FOREGROUND), "Dracula");
     let latte = on(Keyboard::Row("Catppuccin Latte"), "GitHub Light");
+    use Known::{Breaks, BreaksUnlike};
+    use Rule::{R2, R3, R4, R5};
     [
         // R3 before the first event: the give-way finds no rung where the judge finds one.
-        (mocha, "470x487@1+warning+status", vec![]),
-        (mocha, "1847x363@2+warning+status", vec![Window((376, 901))]),
-        (row_default, "229x509@1+warning+status", vec![]),
-        (row_default, "381x486@1+warning", vec![Status]),
-        (row_default, "514x702@1+status", vec![Text]),
-        (import_light, "385x485@1+warning+status", vec![]),
-        (import_light, "537x917@2+warning+status", vec![]),
+        (
+            mocha,
+            "470x487@1+warning+status",
+            vec![],
+            Breaks(&[(R3, 0)]),
+        ),
+        (
+            mocha,
+            "1847x363@2+warning+status",
+            vec![Window((376, 901))],
+            Breaks(&[(R3, 1)]),
+        ),
+        (
+            row_default,
+            "229x509@1+warning+status",
+            vec![],
+            Breaks(&[(R3, 0)]),
+        ),
+        (
+            row_default,
+            "381x486@1+warning",
+            vec![Status],
+            Breaks(&[(R3, 1)]),
+        ),
+        (
+            row_default,
+            "514x702@1+status",
+            vec![Text],
+            Breaks(&[(R3, 1)]),
+        ),
+        (
+            import_light,
+            "385x485@1+warning+status",
+            vec![],
+            Breaks(&[(R3, 0)]),
+        ),
+        (
+            import_light,
+            "537x917@2+warning+status",
+            vec![],
+            Breaks(&[(R3, 0)]),
+        ),
         (
             import_light,
             "1719x860@2+warning+status",
             vec![Warning, Warning, Window((850, 893))],
+            Breaks(&[(R3, 3)]),
         ),
         (
             one_dark,
             "2601x543@2+warning+status",
             vec![Window((462, 877))],
+            Breaks(&[(R3, 1)]),
         ),
         (
             one_dark,
             "2422x423@1+warning",
             vec![Warning, Status, Warning, Window((504, 881)), Text],
+            Breaks(&[(R3, 5)]),
         ),
         (
             nord(Keyboard::Row("Solarized Dark")),
             "1120x749@2+warning+status",
             vec![Window((416, 875))],
+            Breaks(&[(R3, 1)]),
         ),
         // R3 on round 8k's rules seeds, shortest walks; main c5ef831d7f breaks it on each too.
-        (row_default, "2565x201@2", vec![Window((398, 720)), Status]),
-        (latte, "349x758@2+status", vec![]),
-        (following, "502x724@2", vec![Status]),
-        (mocha, "472x702@2+status", vec![]),
+        (
+            row_default,
+            "2565x201@2",
+            vec![Window((398, 720)), Status],
+            Breaks(&[(R3, 2)]),
+        ),
+        (latte, "349x758@2+status", vec![], Breaks(&[(R3, 0)])),
+        (following, "502x724@2", vec![Status], Breaks(&[(R3, 1)])),
+        (mocha, "472x702@2+status", vec![], Breaks(&[(R3, 0)])),
         // R5 after typing.
-        (background, "1552x137@2+warning+status", vec![Warning, Type]),
-        (foreground, "2763x175@2+status", vec![Type]),
-        (foreground, "1842x156@2+status", vec![Type]),
+        (
+            background,
+            "1552x137@2+warning+status",
+            vec![Warning, Type],
+            Breaks(&[(R5, 2)]),
+        ),
+        (
+            foreground,
+            "2763x175@2+status",
+            vec![Type],
+            Breaks(&[(R5, 1)]),
+        ),
+        (
+            foreground,
+            "1842x156@2+status",
+            vec![Type],
+            Breaks(&[(R5, 1)]),
+        ),
         (
             on(
                 Keyboard::Sheet("settings/control/selection_foreground"),
@@ -4720,30 +4922,50 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             ),
             "2845x189@2+status",
             vec![Type],
+            Breaks(&[(R5, 1)]),
         ),
         (
             nord(Keyboard::Sheet("settings/control/background")),
             "2606x142@1+status",
             vec![Type],
+            Breaks(&[(R5, 1)]),
         ),
         (
             nord(Keyboard::Pack),
             "1002x180@1",
             vec![Press(CUSTOMIZE), Window((2_860, 155)), Down, Status, Type],
+            Breaks(&[(R5, 5)]),
         ),
         // R2: main's chrome cuts the keyboard's control on these walks too (round 8k seeds).
         (
             on(Keyboard::SheetFirst, "Dracula"),
             "1268x165@2+warning",
             vec![Window((444, 240)), Wheel(8), Press(PALETTE_SLOT)],
+            Breaks(&[(R2, 3)]),
         ),
-        (palette, "417x156@2", vec![Text, Press(PALETTE_SLOT)]),
-        (palette, "435x209@2+status", vec![Press(PALETTE_SLOT)]),
-        (well, "204x770@2+status", vec![Press(SAVE_AS), Down, Down]),
+        (
+            palette,
+            "417x156@2",
+            vec![Text, Press(PALETTE_SLOT)],
+            Breaks(&[(R2, 2)]),
+        ),
+        (
+            palette,
+            "435x209@2+status",
+            vec![Press(PALETTE_SLOT)],
+            Breaks(&[(R2, 1)]),
+        ),
+        (
+            well,
+            "204x770@2+status",
+            vec![Press(SAVE_AS), Down, Down],
+            Breaks(&[(R2, 3)]),
+        ),
         (
             well,
             "476x975@1+status",
             vec![Text, Press(SAVE_AS), Window((210, 818)), Erase, Down],
+            Breaks(&[(R2, 5)]),
         ),
         (
             background,
@@ -4754,11 +4976,13 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Wheel(-2),
                 Press(PALETTE_SLOT),
             ],
+            Breaks(&[(R2, 4)]),
         ),
         (
             cursor,
             "1855x1182@2+warning",
             vec![Press(SAVE_AS), Erase, Window((179, 156)), Down],
+            Breaks(&[(R2, 4)]),
         ),
         // Rules seeds 997001-3, 997777, 998001-3 and 998777 at 400, shrunk; main breaks each too.
         // R2 across: Cancel cut at a side by Save beside it in a narrow sheet.
@@ -4769,6 +4993,7 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             ),
             "1499x1376@1+warning+status",
             vec![Press(SAVE_AS), Text, Erase, Window((211, 593)), Down],
+            Breaks(&[(R2, 5)]),
         ),
         // R2: the theme's name field owed what a frame left, through 1pt resizes and bars.
         (
@@ -4783,14 +5008,16 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((2_995, 140)),
                 Window((2_996, 140)),
             ],
+            Breaks(&[(R2, 7)]),
         ),
         // R3 before the first event, the keyboard on Nord over Dracula.
         (
             on(Keyboard::Row("Nord"), "Dracula"),
             "1197x238@1+status",
             vec![Window((428, 154)), Text, Status],
+            Breaks(&[(R3, 3)]),
         ),
-        // R4: a wheel's place moved by a warning leaving and a resize.
+        // R4: a wheel's place moved by a warning leaving and a resize, judged by another list too.
         (
             latte,
             "2273x902@2+warning",
@@ -4810,6 +5037,7 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
                 Window((417, 746)),
             ],
+            BreaksUnlike(&[(R4, 14)]),
         ),
         // R5: the dark and light segment's filter change cuts its first result.
         (
@@ -4820,24 +5048,25 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             },
             "215x401@2+status",
             vec![Text, Up, Type],
+            Breaks(&[(R5, 3)]),
         ),
-        // Panics: a chrome told to cut the control cuts it short; a seat leaves over what was told.
+        // R3 where the frame gives way at 184x406, its seat once told from a framed list's rows.
         (
-            nord(Keyboard::Row("Solarized Dark")),
-            "252x152@1+status",
-            vec![Warning, Text],
+            latte,
+            "2568x529@1+warning+status",
+            vec![Window((184, 406))],
+            Breaks(&[(R3, 1)]),
         ),
-        (latte, "2568x529@1+warning+status", vec![Window((184, 406))]),
     ]
     .into_iter()
-    .map(|(scenario, start, steps)| (scenario, drawn_of(start), steps))
+    .map(|(scenario, start, steps, known)| (scenario, drawn_of(start), steps, known))
     .collect()
 }
 
 /// The workers each scenario's walks share, so Pack's longest list is not the run's long pole.
 const KEEPING_WORKERS: usize = 12;
 
-/// `scenario`'s frames held to the rules ([`walk_from`], [`reviewed`]); [`known_faults`] printed.
+/// `scenario`'s frames held to the rules, and each of [`known_faults`] doing what its entry names.
 fn sweep(scenario: Scenario, taken: Walks) {
     let started = std::time::Instant::now();
     let sweep = Sweep::new(scenario);
@@ -4864,13 +5093,18 @@ fn sweep(scenario: Scenario, taken: Walks) {
     );
     let known = known_faults()
         .into_iter()
-        .filter(|(seen, _, _)| *seen == scenario)
-        .map(|(_, start, steps)| (start, steps))
+        .filter(|(seen, _, _, _)| *seen == scenario)
+        .map(|(_, start, steps, known)| (start, steps, known))
         .collect::<Vec<_>>();
-    walks.extend(known.iter().cloned());
+    walks.extend(
+        known
+            .iter()
+            .map(|(start, steps, _)| (*start, steps.clone())),
+    );
     let reviewed_from = &walks[walked..walks.len() - known.len()];
     let found = Mutex::new(Findings::default());
     let still = Mutex::new(Vec::new());
+    let unnamed = Mutex::new(Vec::new());
     on_n_workers(
         KEEPING_WORKERS,
         &walks,
@@ -4881,11 +5115,11 @@ fn sweep(scenario: Scenario, taken: Walks) {
                 .iter()
                 .any(|(was, seen)| was == start && seen == steps);
             BAR_STEPS_SEATED.with(|seated| seated.set(reviewed));
-            if known
+            if let Some(&(_, _, named)) = known
                 .iter()
-                .any(|(was, seen)| was == start && seen == steps)
+                .find(|(was, seen, _)| was == start && seen == steps)
             {
-                // A known walk runs cold on a thread of its own: its panic, main's too, is printed.
+                // A known walk runs cold on a thread of its own, failing unless it does as named.
                 let preferences = crate::native_appearance::current_preferences();
                 let walked = std::thread::scope(|scope| {
                     std::thread::Builder::new()
@@ -4898,30 +5132,40 @@ fn sweep(scenario: Scenario, taken: Walks) {
                         .join()
                 });
                 let said = match walked {
-                    // Its reaches that draw another list are main's too: printed with its fault.
-                    Ok(walked) => std::iter::once(walked.faults.first().map_or_else(
-                        || format!("{start} {steps:?} no longer faults"),
-                        |(rule, said)| format!("{rule:?}: {said}"),
-                    ))
-                    .chain(
-                        walked
-                            .unlike
-                            .into_iter()
-                            .map(|said| format!("UNLIKE: {said}")),
-                    )
-                    .collect::<Vec<_>>()
-                    .join("\n  "),
-                    Err(panic) => format!(
-                        "PANIC: {start} {steps:?}: {}",
+                    Ok(walked) => {
+                        let does = (walked.firsts.clone(), !walked.unlike.is_empty());
+                        let said = std::iter::once(walked.faults.first().map_or_else(
+                            || format!("{start} {steps:?} no longer faults"),
+                            |(rule, said)| format!("{rule:?}: {said}"),
+                        ))
+                        .chain(
+                            walked
+                                .unlike
+                                .into_iter()
+                                .map(|said| format!("UNLIKE: {said}")),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("\n  ");
+                        if named.names(&does.0, does.1) {
+                            Ok(said)
+                        } else {
+                            Err(format!("named {named:?}, does {does:?}: {said}"))
+                        }
+                    }
+                    Err(panic) => Err(format!(
+                        "named {named:?}, panics: {start} {steps:?}: {}",
                         panic
                             .downcast_ref::<String>()
                             .map(String::as_str)
                             .or_else(|| panic.downcast_ref::<&str>().copied())
                             .unwrap_or("a non-text panic")
-                    ),
+                    )),
                 };
-                still
-                    .lock()
+                let (list, said) = match said {
+                    Ok(said) => (&still, said),
+                    Err(said) => (&unnamed, said),
+                };
+                list.lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(said);
                 return;
@@ -4945,6 +5189,14 @@ fn sweep(scenario: Scenario, taken: Walks) {
             still.join("\n  ")
         );
     }
+    let mut unnamed = unnamed.into_inner().unwrap_or_else(PoisonError::into_inner);
+    unnamed.sort_unstable();
+    assert!(
+        unnamed.is_empty(),
+        "{scenario}: {} known walks do other than their entries name:\n  {}",
+        unnamed.len(),
+        unnamed.join("\n  ")
+    );
     found.faults.sort_by_key(|(rule, _)| *rule);
     let mut excepted = found.exceptions.clone();
     excepted.sort_unstable();
@@ -5374,6 +5626,124 @@ fn the_keeping_rules_hold_off_the_list_on_nord() {
     );
 }
 
+/// The chrome c5ef831d7f chose at 2851x134@2, cutting the field to 54 of 56pt, breaks R2 anew.
+#[test]
+fn a_chrome_chosen_anew_that_cuts_the_keyboards_control_breaks_r2() {
+    let sweep = Sweep::new(Scenario {
+        keyboard: Keyboard::Sheet("settings/control/selection_foreground"),
+        theme: "GitHub Light",
+        in_use: "GitHub Light",
+    });
+    PAGE_CHROME_HELD.with(|held| held.set(Some(PageChrome::FULL.giving_bar_room())));
+    let walked = walk(&sweep, drawn_of("2851x134@2"), &[]);
+    PAGE_CHROME_HELD.with(|held| held.set(None));
+    assert!(
+        walked
+            .faults
+            .iter()
+            .any(|(rule, said)| *rule == Rule::R2 && said.contains("chosen anew")),
+        "a cut field in a chrome chosen anew breaks R2: {:?}",
+        walked.faults
+    );
+}
+
+/// A list laid out for one room is reused for another exactly where it plans its stops alike there.
+#[test]
+fn a_list_is_reused_for_another_room_exactly_where_it_plans_its_stops_alike() {
+    use Step::{Again, Press, Status, Text, Warning, Wheel, Window};
+    let on = |keyboard, theme| Scenario {
+        keyboard,
+        theme,
+        in_use: theme,
+    };
+    let nord = |keyboard| on(keyboard, "Nord");
+    let walks = [
+        // The palette's slot pressed: a list led by other nodes, as many and pinned alike.
+        (
+            nord(Keyboard::On(CUSTOMIZE)),
+            "273x635@2+warning",
+            vec![Press(PALETTE_SLOT), Again, Wheel(-1), Again, Status],
+        ),
+        // A listed footer that wraps otherwise at the panel's edges than in its frame.
+        (
+            nord(Keyboard::On(IMPORT)),
+            "423x140@2+status",
+            vec![
+                Window((423, 139)),
+                Status,
+                Again,
+                Window((423, 140)),
+                Warning,
+            ],
+        ),
+        // Rows as tall at the panel's edges as in its frame a gutter narrower, where it scrolls.
+        (
+            on(Keyboard::Row("Catppuccin Latte"), "GitHub Light"),
+            "2902x388@1",
+            vec![
+                Text,
+                Text,
+                Window((2_902, 389)),
+                Wheel(-1),
+                Again,
+                Window((315, 138)),
+                Again,
+                Text,
+                Warning,
+            ],
+        ),
+        // The room the bar gives back captions its sections, where the list laid out now has none.
+        (
+            nord(Keyboard::On(IMPORT)),
+            "310x1033@2+warning+status",
+            vec![],
+        ),
+    ];
+    for (scenario, start, steps) in walks {
+        let sweep = Sweep::new(scenario);
+        REUSES_CHECKED.with(|checked| checked.replace(Some(Vec::new())));
+        let _ = walk(&sweep, drawn_of(start), &steps);
+        let checked = REUSES_CHECKED
+            .with(|checked| checked.take())
+            .unwrap_or_default();
+        assert!(
+            checked.is_empty(),
+            "{start} {steps:?} plans its stops otherwise than its reuse: {checked:#?}"
+        );
+    }
+}
+
+/// A least bar's keyboard span told on the list laid out now, as 301c728680 told it, is caught.
+#[test]
+fn a_least_told_on_the_list_laid_out_now_is_caught() {
+    let caught = |by_now: bool| {
+        let sweep = Sweep::new(Scenario {
+            keyboard: Keyboard::On(IMPORT),
+            theme: "GitHub Light",
+            in_use: "GitHub Light",
+        });
+        LEAST_TOLD_BY_NOW.with(|told| told.set(by_now));
+        REUSES_CHECKED.with(|checked| checked.replace(Some(Vec::new())));
+        let _ = walk(&sweep, drawn_of("225x517@1+warning+status"), &[]);
+        LEAST_TOLD_BY_NOW.with(|told| told.set(false));
+        REUSES_CHECKED
+            .with(|checked| checked.take())
+            .unwrap_or_default()
+    };
+    let own = caught(false);
+    assert!(
+        own.is_empty(),
+        "the least's own list tells its span: {own:#?}"
+    );
+    let by_now = caught(true);
+    assert!(
+        by_now
+            .iter()
+            .any(|said| said.starts_with("told at least_from")),
+        "the list laid out now tells the least's span as its own does: {by_now:#?}"
+    );
+}
+
 /// A redraw seats its bar where the last frame settled it; a test build settles again, uncounted.
 #[test]
 fn a_redraw_seats_its_bar_where_the_frame_before_settled_it() {
@@ -5439,9 +5809,28 @@ fn the_keeping_rules_hold_with_the_keyboard_on_solarized_dark() {
     );
 }
 
-/// A revealed row is measured at the width its list lays it out: under a terminal face whose
-/// check is wider ([`WIDER_CHECK`]), the chooser's frame gives way at 291x177 and Solarized Dark's
-/// row is taller there than at the framed width (the sweep's faces draw it alike at both).
+/// The reviewed filter walk from 2977x1169 to 376x129 keeps the rules in [`WIDER_CHECK`]'s face.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_keeping_rules_hold_on_the_filter_in_a_wider_checked_terminal_face() {
+    crate::tray_raster::set_chrome_fonts(Some((WIDER_CHECK.into(), 0)), None, None);
+    let (scenario, start, steps) = reviewed()
+        .into_iter()
+        .find(|(scenario, start, _)| {
+            scenario.keyboard == Keyboard::Filter && start.window == (2_977, 1_169)
+        })
+        .expect("the reviewed filter walk from 2977x1169");
+    let found = walk(&Sweep::new(scenario), start, &steps);
+    assert_eq!(found.frames, steps.len() + 1, "every step drawn");
+    assert!(
+        found.faults.is_empty() && found.unlike.is_empty(),
+        "{:?} {:?}",
+        found.faults,
+        found.unlike
+    );
+}
+
+/// In [`WIDER_CHECK`]'s face, Solarized Dark's revealed row is measured where its list lays it out.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_keeping_rules_hold_on_solarized_dark_in_a_wider_checked_terminal_face() {
@@ -6349,6 +6738,39 @@ fn work_walks() -> Vec<WorkWalk> {
                 (step(Window((230, 420))), [1, 0, 1, 0, 1]),
             ],
         ),
+        // The control a press moved the keyboard away from is the seat's to keep: told no chrome.
+        (
+            on(Keyboard::SheetFirst, "Dracula"),
+            at((1_127, 888), 2, true, false),
+            vec![
+                (None, [1, 2, 0, 0, 2]),
+                (step(Press(SAVE_AS)), [1, 1, 0, 0, 2]),
+                (step(Again), [1, 0, 0, 0, 1]),
+                (step(Window((1_127, 887))), [1, 2, 0, 0, 1]),
+                (step(Window((1_127, 886))), [1, 2, 0, 0, 1]),
+                (step(Text), [1, 2, 0, 0, 2]),
+                (step(Again), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // Nor does a press that moved the keyboard hold its place for a status frames after it.
+        (
+            on(Keyboard::SheetFirst, "Dracula"),
+            at((2_181, 1_220), 1, true, false),
+            vec![
+                (None, [1, 2, 0, 0, 2]),
+                (step(Press(SAVE_AS)), [1, 1, 0, 0, 2]),
+                (step(Again), [1, 0, 0, 0, 1]),
+                (step(Window((2_322, 1_117))), [1, 2, 0, 0, 2]),
+                (step(Text), [1, 2, 0, 0, 2]),
+                (step(Status), [1, 1, 0, 1, 1]),
+            ],
+        ),
+        // The least's keyboard span told on its own list, its stops unlike the list's now: no seat.
+        (
+            on(Keyboard::Row("GitHub Light"), "Dracula"),
+            at((303, 942), 2, true, true),
+            vec![(None, [1, 2, 1, 1, 2])],
+        ),
     ]
 }
 
@@ -6637,5 +7059,176 @@ fn first_frames_show_whole_what_eb53a9b243_showed_whole() {
         cut.len(),
         frames.len(),
         cut.join("\n")
+    );
+}
+
+/// A walk from a start and the first stop and list room its last screen ends at.
+type EndedWalk = (Scenario, &'static str, Vec<Step>, (usize, f32));
+
+/// Walks no rule decides end where c5ef831d7f ends them: at its first stop and list room.
+#[test]
+fn walks_no_rule_holds_end_on_the_screens_c5ef831d7f_ends_them_on() {
+    use Step::{
+        Again, Erase, Focus, Left, Press, Refresh, Right, Status, Text, Tick, Type, Warning, Wheel,
+        Window,
+    };
+    let on = |keyboard, theme| Scenario {
+        keyboard,
+        theme,
+        in_use: theme,
+    };
+    let filter_tokyo = on(Keyboard::Filter, "Tokyo Night");
+    let first = on(Keyboard::SheetFirst, "Dracula");
+    let walks: Vec<EndedWalk> = vec![
+        // A start held for a stop shifted in at the top (seat_scroll's moved start).
+        (
+            on(Keyboard::Sheet(CURSOR_COLOR), "Nord"),
+            "1095x700@1+status",
+            vec![
+                Window((444, 292)),
+                Window((1_268, 165)),
+                Press(MOCHA),
+                Press(BACKGROUND_WELL),
+            ],
+            (5, 81.0),
+        ),
+        // The bar reads the reveal a first result shown whole gave back.
+        (
+            filter_tokyo,
+            "600x200@1+status",
+            vec![
+                Warning,
+                Warning,
+                Wheel(8),
+                Wheel(-2),
+                Again,
+                Right,
+                Window((640, 480)),
+                Left,
+                Type,
+                Warning,
+                Window((700, 250)),
+                Window((600, 200)),
+                Wheel(4),
+                Again,
+                Erase,
+                Window((178, 348)),
+            ],
+            (3, 33.0),
+        ),
+        // A filter matching nothing gives back the reveal its first result replaced.
+        (
+            filter_tokyo,
+            "534x236@2",
+            vec![
+                Refresh,
+                Text,
+                Status,
+                Left,
+                Window((1_654, 439)),
+                Press(DONE),
+                Right,
+                Window((443, 347)),
+                Left,
+                Again,
+                Again,
+                Window((2_657, 599)),
+                Wheel(-2),
+                Press(DONE),
+                Focus,
+                Window((1_827, 442)),
+                Text,
+                Wheel(-2),
+                Wheel(-3),
+                Tick,
+                Wheel(-1),
+                Again,
+                Type,
+                Type,
+                Window((531, 181)),
+                Focus,
+                Warning,
+                Press(SAVE_AS),
+                Status,
+                Text,
+            ],
+            (0, 64.0),
+        ),
+        // A press that moved the keyboard keeps its reveal where the list's place shows it whole.
+        (
+            first,
+            "772x699@1",
+            vec![
+                Status,
+                Focus,
+                Left,
+                Window((378, 848)),
+                Press(SAVE_AS),
+                Again,
+                Status,
+                Window((1_813, 252)),
+                Warning,
+                Window((683, 475)),
+            ],
+            (5, 243.0),
+        ),
+        (
+            first,
+            "838x537@2",
+            vec![
+                Window((839, 537)),
+                Text,
+                Again,
+                Press(SAVE_AS),
+                Window((840, 537)),
+                Window((166, 1_054)),
+                Text,
+            ],
+            (7, 280.0),
+        ),
+        (
+            first,
+            "1127x888@2+warning",
+            vec![
+                Press(SAVE_AS),
+                Again,
+                Window((1_127, 887)),
+                Window((1_127, 886)),
+                Text,
+                Again,
+                Warning,
+                Tick,
+                Window((2_691, 650)),
+                Window((2_950, 451)),
+            ],
+            (4, 243.0),
+        ),
+    ];
+    let parted = Mutex::new(Vec::new());
+    on_n_workers(
+        KEEPING_WORKERS,
+        &walks,
+        "walks no rule holds",
+        |(scenario, start, steps, (top, room))| {
+            let found = walk(&Sweep::new(*scenario), drawn_of(start), steps);
+            let ended = found.ended.expect("a walk draws its first frame");
+            if !found.faults.is_empty() || ended.0 != Some(*top) || (ended.1 - room).abs() > 0.5 {
+                parted
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(format!(
+                        "{scenario} from {start} {steps:?}: ends at {ended:?}, not \
+                         ({top}, {room}); faults {:?}",
+                        found.faults
+                    ));
+            }
+        },
+    );
+    let parted = parted.into_inner().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        parted.is_empty(),
+        "{} walks end elsewhere than c5ef831d7f ends them:\n{}",
+        parted.len(),
+        parted.join("\n")
     );
 }

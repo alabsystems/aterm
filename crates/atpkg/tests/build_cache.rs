@@ -146,6 +146,7 @@ fn fake_cargo(dir: &Path, release: &str) -> PathBuf {
         &format!(
             "#!/bin/sh\nif [ \"$1\" = -vV ] || [ \"$2\" = -vV ]; then printf '%s\\n' 'cargo {release} (0123456789 2026-07-14)' \
              'release: {release}' 'commit-hash: 0123456789abcdef' 'host: aarch64-apple-darwin'{trust}; exit 0; fi\n\
+             if [ -n \"$ATPKG_TEST_PID_TO\" ]; then echo $$ > \"$ATPKG_TEST_PID_TO\"; fi\n\
              printf '%s\\n' \"$@\"\n"
         ),
     );
@@ -170,7 +171,7 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
     let ws = home.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let config = atpkg::build_cache::config_value(&atpkg::build_cache::cache_root(&home)).unwrap();
-    let run = |release: &str, args: &[&str], env: &[(&str, &str)]| {
+    let command = |release: &str, args: &[&str], env: &[(&str, &str)]| {
         let bin = root.join(format!("bin-{release}"));
         fake_cargo(&bin, release);
         let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"));
@@ -181,17 +182,46 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", root.join("config"))
+            .env(atpkg::build_admit::LEDGER_ENV, root.join("ledger"))
             .current_dir(&ws);
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = cmd.output().unwrap();
+        cmd
+    };
+    let run = |release: &str, args: &[&str], env: &[(&str, &str)]| {
+        let out = command(release, args, env).output().unwrap();
         assert!(out.status.success(), "{out:?}");
         String::from_utf8(out.stdout).unwrap()
     };
     assert_eq!(
         run("1.97.1", &["build", "-q"], &[]),
         format!("--config\n{config}\nbuild\n-q\n")
+    );
+    // A rerouted build becomes cargo by exec, in the process its caller started, and claims
+    // nothing (BUILD-ADMIT): a front that claimed and stayed as cargo's parent would be what a
+    // tab's readers name (`program=atpkg`), the naming gate the shim's hop failed.
+    let pid_to = root.join("cargo-pid");
+    let pid_env = pid_to.to_string_lossy().into_owned();
+    let child = command(
+        "1.97.1",
+        &["build", "-q"],
+        &[("ATPKG_TEST_PID_TO", &pid_env)],
+    )
+    .stdout(aterm_uds::spawnfd::Stdio::null())
+    .spawn()
+    .unwrap();
+    let started = child.id();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&pid_to).unwrap().trim(),
+        started.to_string(),
+        "cargo ran in the rerouting process itself"
+    );
+    assert!(
+        !root.join("ledger").exists(),
+        "a rerouted build claims nothing, in the scratch ledger its test names or this user's"
     );
     assert_eq!(
         run("1.97.1", &["+1.97.1", "test"], &[]),

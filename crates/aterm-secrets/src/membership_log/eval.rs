@@ -109,6 +109,31 @@ pub struct Quorum {
     pub signers: BTreeSet<MemberId>,
 }
 
+/// Where the quorum `Remove` of one member that F16's "Undo" row signs stands, as one log says
+/// it ([`super::Log::undo`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Undo {
+    /// The member whose removals the shares undo.
+    pub member: MemberId,
+    /// The cutoff every share names ([`super::Log::undo_cutoff`]).
+    pub cutoff: RecordId,
+    /// The members at the cutoff, the member excluded: who may sign a share that counts.
+    pub voters: BTreeSet<MemberId>,
+    /// The voters whose share at this cutoff the log holds.
+    pub signed: BTreeSet<MemberId>,
+    /// A quorum `Remove` of the member at this cutoff took effect.
+    pub took_effect: bool,
+}
+
+impl Undo {
+    /// How many more shares the quorum needs: more than half of the voters, and at least two.
+    #[must_use]
+    pub fn needed(&self) -> usize {
+        let quorum = (self.voters.len() / 2 + 1).max(2);
+        quorum.saturating_sub(self.signed.len())
+    }
+}
+
 /// Who a fleet node key is, as one log says it ([`Membership::node`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeStanding {
@@ -292,6 +317,49 @@ pub(super) fn historical_seat_entry(records: &[Record], binding: &Binding) -> Op
 /// taken out for good by an effective quorum `Remove`.
 pub(super) fn has_historical_seat(records: &[Record], binding: &Binding) -> bool {
     historical_seat_entry(records, binding).is_some()
+}
+
+/// The cutoff of F16's quorum `Remove` of `actor` ([`super::Log::undo_cutoff`]).
+pub(super) fn undo_cutoff(records: &[Record], actor: &MemberId) -> Option<RecordId> {
+    let graph = Graph::new(records);
+    let mut scratch = AuthScratch::new(records.len());
+    let plain = graph.authorized(&vec![false; records.len()], &mut Memo::new(), &mut scratch);
+    graph
+        .undo_cutoff(actor, &plain, &mut scratch)
+        .map(|at| *records[at].id())
+}
+
+/// Where F16's quorum `Remove` of `actor` stands ([`super::Log::undo`]); `took_effect` is left
+/// for the caller, which holds the whole membership.
+pub(super) fn undo(records: &[Record], actor: &MemberId) -> Option<Undo> {
+    let graph = Graph::new(records);
+    let no_void = vec![false; records.len()];
+    let mut scratch = AuthScratch::new(records.len());
+    let plain = graph.authorized(&no_void, &mut Memo::new(), &mut scratch);
+    let cutoff = graph.undo_cutoff(actor, &plain, &mut scratch)?;
+    let voters: BTreeSet<MemberId> = graph
+        .members_at_cutoff(cutoff, &no_void, &plain, &mut scratch)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|mac| mac != actor)
+        .collect();
+    let signed = graph
+        .cutoffs
+        .iter()
+        .filter(|&(&r, &at)| {
+            at == cutoff
+                && matches!(records[r].body(), Body::Remove { member, .. } if member == actor)
+        })
+        .map(|(&r, _)| *graph.signer(r))
+        .filter(|signer| voters.contains(signer))
+        .collect();
+    Some(Undo {
+        member: *actor,
+        cutoff: *records[cutoff].id(),
+        voters,
+        signed,
+        took_effect: false,
+    })
 }
 
 /// Historical Commons writer bindings eligible to authenticate table records sealed under the
@@ -625,6 +693,34 @@ impl<'a> Graph<'a> {
         let active_recipients: BTreeSet<Recipient> =
             members.values().map(|m| m.binding.recipient()).collect();
         let active_labels: BTreeSet<&str> = members.values().map(|m| m.label.as_str()).collect();
+        let mut seat_recipients: BTreeMap<MemberId, Recipient> = BTreeMap::new();
+        for seat in self.bound_seats(&effects.out, &authorized, &effects.void, &standing) {
+            seat_recipients
+                .entry(seat.member())
+                .or_insert_with(|| seat.binding.recipient());
+        }
+        let mut superseded_by: BTreeMap<MemberId, MemberId> = BTreeMap::new();
+        for (&removed_actor, removal) in &removed {
+            if removal.quorum {
+                continue;
+            }
+            let Some(removes) = standing.removes.get(&removed_actor) else {
+                continue;
+            };
+            if removes.is_empty() {
+                continue;
+            }
+            if let Some((&active_actor, _)) = members.iter().find(|&(active_actor, m)| {
+                (active_actor[..32] == removed_actor[..32]
+                    || seat_recipients.get(&removed_actor) == Some(&m.binding.recipient()))
+                    && standing
+                        .members
+                        .get(active_actor)
+                        .is_some_and(|&entry| removes.iter().all(|&r| self.before(r, entry)))
+            }) {
+                superseded_by.insert(removed_actor, active_actor);
+            }
+        }
         let mut removed_recipients = BTreeSet::new();
         let mut removed_labels = BTreeSet::new();
         let mut claimed_labels: BTreeSet<String> =
@@ -634,7 +730,7 @@ impl<'a> Graph<'a> {
             if members.contains_key(&member) || removed.contains_key(&member) {
                 claimed_labels.insert(seat.label.to_owned());
             }
-            if removed.contains_key(&member) {
+            if removed.contains_key(&member) && !superseded_by.contains_key(&member) {
                 let recipient = seat.binding.recipient();
                 if !active_recipients.contains(&recipient) {
                     removed_recipients.insert(recipient);
@@ -648,9 +744,9 @@ impl<'a> Graph<'a> {
         let nodes = self.nodes(
             &members,
             &removed,
+            &superseded_by,
             &effects.out,
-            &authorized,
-            &effects.void,
+            (&authorized, &effects.void),
             &standing,
         );
         Membership {
@@ -722,9 +818,9 @@ impl<'a> Graph<'a> {
         &self,
         members: &BTreeMap<MemberId, Member>,
         removed: &BTreeMap<MemberId, Removal>,
+        superseded_by: &BTreeMap<MemberId, MemberId>,
         out: &BTreeSet<MemberId>,
-        authorized: &[bool],
-        void: &[bool],
+        (authorized, void): (&[bool], &[bool]),
         standing: &Standing,
     ) -> BTreeMap<[u8; 32], NodeStanding> {
         // Every Mac each key was bound to. Never a raw scan: a log holds inert records anyone
@@ -769,15 +865,21 @@ impl<'a> Graph<'a> {
         bound
             .into_iter()
             .filter_map(|(key, macs)| {
-                let standing = if let Some(out) = macs.iter().find(|m| removed.contains_key(*m)) {
+                let standing = if let Some(out) = macs
+                    .iter()
+                    .find(|m| removed.contains_key(*m) && !superseded_by.contains_key(*m))
+                {
                     NodeStanding::Removed(*out)
                 } else {
                     match current.get(&key).map(Vec::as_slice) {
                         Some([member]) => NodeStanding::Member(*member),
                         Some([_, _, ..]) => NodeStanding::Contested,
-                        _ => {
-                            NodeStanding::Retired(*macs.iter().find(|m| members.contains_key(*m))?)
-                        }
+                        _ => NodeStanding::Retired(*macs.iter().find_map(|m| {
+                            members
+                                .contains_key(m)
+                                .then_some(m)
+                                .or_else(|| superseded_by.get(m))
+                        })?),
                     }
                 };
                 Some((key, standing))
@@ -1496,6 +1598,164 @@ impl<'a> Graph<'a> {
         Some(set.into_iter().collect())
     }
 
+    /// The cutoff of a quorum `Remove` of `actor` that every honest Mac holding these records
+    /// signs (§3.3.7, F16's "Undo"), by record index; `plain` is authorization with nothing void.
+    ///
+    /// `actor`'s acts are its `Admit`s and its `Remove`s of other Macs. An act is acknowledged
+    /// when an independent Mac built on it before it saw a later act: an authorized record whose
+    /// signer is neither `actor` nor a Mac `actor`'s `Admit`s let in, directly or through Macs
+    /// those let in, holds the act in its causal past and holds no act of `actor` outside the
+    /// act's own past; every act in an acknowledged act's past is acknowledged too. A record that
+    /// is a `Remove` of `actor`, or holds one in its causal past, contests `actor` rather than
+    /// carries on from it, so it acknowledges nothing. The first contested act is the
+    /// unacknowledged one with the lowest sequence (at a tie the lowest id), and the cutoff is
+    /// `actor`'s last record in its causal past, else the record that let `actor` in. `None`
+    /// where `actor` has no contested act or no entry.
+    ///
+    /// One more rule keeps one Mac from taking the lab out for good: the Macs `actor` removed
+    /// after the cutoff must be able to make the quorum there (more than half of the voters, and
+    /// at least two). Where they cannot, an acknowledgment walked the cutoff past Macs the later
+    /// removals took out: a Mac that `actor` let stay to carry on from its first removals, and
+    /// then removed, leaves no quorum (one voter). The acknowledgments at the highest act are
+    /// then set aside, one level at a time, and the first cutoff whose removed Macs can make the
+    /// quorum is the one; where none can (a lab of two, or a removal of a few Macs whose members
+    /// in remove `actor` and allow them again), the cutoff stands as every acknowledgment puts it.
+    ///
+    /// So `Admit`s `actor` made on a branch nobody else saw before its removals (a stolen Mac's
+    /// Sybils, and the Macs they let in) fall after the cutoff, and those Macs never vote; an
+    /// act the lab carried on from (a stolen Mac removed long ago) stands. A record that later
+    /// arrives can move the cutoff; the Mac re-signs its share there.
+    fn undo_cutoff(
+        &self,
+        actor: &MemberId,
+        plain: &[bool],
+        scratch: &mut AuthScratch,
+    ) -> Option<usize> {
+        let n = self.records.len();
+        let mine: Vec<usize> = (1..n).filter(|&i| self.signer(i) == actor).collect();
+        let mut let_in: BTreeSet<MemberId> = BTreeSet::new();
+        let mut acts: Vec<usize> = Vec::new();
+        for &i in &mine {
+            match self.records[i].body() {
+                Body::Admit { entrant, .. } => {
+                    if entrant.member() != *actor {
+                        let_in.insert(entrant.member());
+                    }
+                    acts.push(i);
+                }
+                Body::Remove { member, .. } if member != actor => acts.push(i),
+                _ => {}
+            }
+        }
+        // The Macs those let in, and so on: none of them is independent of `actor`.
+        loop {
+            let before = let_in.len();
+            for i in 1..n {
+                if let Body::Admit { entrant, .. } = self.records[i].body()
+                    && let_in.contains(self.signer(i))
+                    && entrant.member() != *actor
+                {
+                    let_in.insert(entrant.member());
+                }
+            }
+            if let_in.len() == before {
+                break;
+            }
+        }
+        let contests: Vec<usize> = (1..n)
+            .filter(|&r| {
+                self.signer(r) != actor
+                    && matches!(self.records[r].body(), Body::Remove { member, .. } if member == actor)
+            })
+            .collect();
+        let mut acknowledged: Vec<usize> = Vec::new();
+        for (r, &authorized) in plain.iter().enumerate().skip(1) {
+            let signer = self.signer(r);
+            if !authorized
+                || signer == actor
+                || let_in.contains(signer)
+                || contests.iter().any(|&x| self.upto(x, r))
+            {
+                continue;
+            }
+            let seen: Vec<usize> = acts
+                .iter()
+                .copied()
+                .filter(|&y| self.before(y, r))
+                .collect();
+            if let Some(&latest) = seen.iter().max_by_key(|&&y| self.records[y].sequence())
+                && seen.iter().all(|&y| self.upto(y, latest))
+            {
+                acknowledged.push(latest);
+            }
+        }
+        let order = |a: &usize, b: &usize| {
+            let (a, b) = (&self.records[*a], &self.records[*b]);
+            a.sequence().cmp(&b.sequence()).then(a.id().cmp(b.id()))
+        };
+        acknowledged.sort_by(order);
+        acknowledged.dedup();
+        let cutoff_given = |acknowledged: &[usize]| -> Option<usize> {
+            let first = acts
+                .iter()
+                .copied()
+                .filter(|&x| !acknowledged.iter().any(|&d| self.upto(x, d)))
+                .min_by(order)?;
+            let before = mine
+                .iter()
+                .copied()
+                .filter(|&i| self.before(i, first))
+                .max_by(|&a, &b| {
+                    let (a, b) = (&self.records[a], &self.records[b]);
+                    a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id()))
+                });
+            before.or_else(|| {
+                let founder = self.founders().any(|seat| seat.member() == *actor);
+                if founder {
+                    return Some(0);
+                }
+                (1..n)
+                    .filter(|&i| {
+                        plain[i]
+                            && matches!(self.records[i].body(),
+                                Body::Admit { entrant, .. } if entrant.member() == *actor)
+                    })
+                    .min_by(|&a, &b| self.records[a].id().cmp(self.records[b].id()))
+            })
+        };
+        let no_void = vec![false; n];
+        let mut reachable = |cutoff: usize| -> bool {
+            let Some(members) = self.members_at_cutoff(cutoff, &no_void, plain, scratch) else {
+                return false;
+            };
+            let voters: BTreeSet<MemberId> =
+                members.into_iter().filter(|mac| mac != actor).collect();
+            let removed: BTreeSet<MemberId> = acts
+                .iter()
+                .filter(|&&x| !self.upto(x, cutoff))
+                .filter_map(|&x| match self.records[x].body() {
+                    Body::Remove { member, .. } if voters.contains(member) => Some(*member),
+                    _ => None,
+                })
+                .collect();
+            removed.len() >= (voters.len() / 2 + 1).max(2)
+        };
+        let settled = cutoff_given(&acknowledged)?;
+        let mut kept = acknowledged;
+        loop {
+            let Some(cutoff) = cutoff_given(&kept) else {
+                return Some(settled);
+            };
+            if reachable(cutoff) {
+                return Some(cutoff);
+            }
+            let Some(&top) = kept.last() else {
+                return Some(settled);
+            };
+            kept.retain(|&d| order(&d, &top).is_lt());
+        }
+    }
+
     /// Whether record `i` stops counting under `removes` and `admits`: its signer has a
     /// `Remove` there whose cutoff does not reach it, and no `Admit` of the signer that follows
     /// that `Remove` (a restoring one) is in its past.
@@ -1546,23 +1806,32 @@ impl<'a> Graph<'a> {
                     .any(|(j, other, _)| other == member && self.before(*j, *i))
             })
             .collect();
-        let mut claimants: BTreeMap<&str, Vec<(usize, MemberId)>> = BTreeMap::new();
+        let mut claimants: BTreeMap<&str, Vec<(usize, MemberId, Recipient)>> = BTreeMap::new();
         let mut mine: BTreeMap<MemberId, Vec<(usize, Seat<'a>)>> = BTreeMap::new();
         for (i, member, seat) in first {
-            claimants.entry(seat.label).or_default().push((*i, *member));
+            claimants
+                .entry(seat.label)
+                .or_default()
+                .push((*i, *member, seat.binding.recipient()));
             mine.entry(*member).or_default().push((*i, *seat));
         }
         mine.into_iter()
             .filter_map(|(member, claims)| {
                 let (at, base) = claims.iter().min_by_key(|(i, _)| self.records[*i].id())?;
+                let base_rec = base.binding.recipient();
                 let own_labels: BTreeSet<&str> =
                     claims.iter().map(|(_, seat)| seat.label).collect();
                 // Another Mac's claim of the label clashes unless it already had this one in its
-                // past: a claim that follows never relabels the Mac it follows.
+                // past: a claim that follows never relabels the Mac it follows, and a restored
+                // Mac's new incarnation that follows its own earlier seat keeps that seat's label.
                 let clash = own_labels.len() > 1
                     || claimants.get(base.label).is_some_and(|c| {
-                        c.iter()
-                            .any(|(j, other)| *other != member && !self.before(*at, *j))
+                        c.iter().any(|(j, other, other_rec)| {
+                            *other != member
+                                && !self.before(*at, *j)
+                                && !(self.before(*j, *at)
+                                    && (other[..32] == member[..32] || *other_rec == base_rec))
+                        })
                     });
                 let label = if clash {
                     let digest = Sha256::digest(base.binding.bytes());

@@ -821,6 +821,7 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     }
@@ -2756,5 +2757,17 @@ fn the_task_doors_rows_count_no_line() {
         acc.facts_would,
         std::collections::BTreeMap::from([("hold".to_string(), 1)]),
         "CONTROL: a would-be line's row counts"
+    );
+}
+
+/// A go-ahead's decision row names the owner's standing go-ahead and its limits, never the typed
+/// words, which quote the agent's own park.
+#[test]
+fn a_go_ahead_decision_says_the_owners_standing_go_ahead() {
+    let typed = "[aterm harness] Proceed now with your own work: build, test, commit…";
+    assert_eq!(&*prose_answer_words(RULE_GO_AHEAD, typed), GO_AHEAD_DID);
+    assert_eq!(
+        crate::harness::acts::self_claim_act(RULE_GO_AHEAD).map(|(word, _)| word),
+        Some("answer")
     );
 }

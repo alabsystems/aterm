@@ -7,6 +7,74 @@ const NOW: i64 = 1_790_000_000;
 const ACCOUNT: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 const OTHER: &str = "7d1e4a90-5b2c-4f3e-8a6d-0c9b8e7f6a5d";
 
+#[test]
+fn shared_account_metadata_is_visible_without_a_local_login_or_action() {
+    let catalog = Ok(super::super::account_catalog::Catalog {
+        table: "shared-table".into(),
+        history_complete: true,
+        rows: vec![super::super::account_catalog::Account {
+            key: "shared-one".into(),
+            operation: "operation-one".into(),
+            label: "Shared <one>".into(),
+            provider: "anthropic".into(),
+            method: Some("oauth".into()),
+            email: Some("one@example.test".into()),
+            realm: None,
+            secret_reference: true,
+            conflicted: false,
+            stopped: false,
+            import: None,
+        }],
+        ..Default::default()
+    });
+    let html = shared_accounts_html(Some(&catalog), None, &[], NOW);
+    assert!(html.contains("Shared &lt;one&gt;"));
+    assert!(html.contains("Not configured here"));
+    assert!(html.contains("Account details available"));
+    assert!(!html.contains("authorization required"));
+    assert!(!html.contains("/use"));
+    assert!(!html.contains("renew"));
+    assert!(html.contains("one@example.test"));
+}
+
+#[test]
+fn imported_unknown_provider_is_visible_with_pending_auth_and_source_evidence() {
+    use super::super::account_catalog::{Account, Catalog, ImportOrigin};
+    let catalog = Ok(Catalog {
+        rows: vec![Account {
+            key: "import:source:7:5".into(),
+            operation: "operation".into(),
+            label: "Source row 7".into(),
+            provider: "google".into(),
+            method: None,
+            email: Some("one@example.test".into()),
+            realm: None,
+            secret_reference: false,
+            conflicted: false,
+            stopped: false,
+            import: Some(ImportOrigin {
+                table: "imports".into(),
+                source: "source".into(),
+                record: 7,
+                provider_column: Some(5),
+                presence: Some(true),
+                machine_hint: Some("m3".into()),
+                unclassified_columns: vec![9],
+            }),
+        }],
+        history_complete: true,
+        ..Default::default()
+    });
+    let html = shared_accounts_html(Some(&catalog), None, &[], NOW);
+    assert!(html.contains("google"));
+    assert!(html.contains("one@example.test"));
+    assert!(html.contains("Imported row 7, provider column 5, marker present"));
+    assert!(html.contains("Not supplied"));
+    assert!(html.contains("Awaiting sign-in details"));
+    assert!(!html.contains("/use"));
+    assert!(!html.contains("renew"));
+}
+
 struct Bed {
     _root: aterm_tempfile::TempDir,
     env: Env,

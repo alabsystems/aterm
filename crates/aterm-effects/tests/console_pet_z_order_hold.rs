@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
-use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetInputKind, PetSense};
+use aterm_effects::kitty_pet::{OldPath, PetBrain, PetFrame, PetInputKind, PetSense};
 use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
 use aterm_models_effects::console_pet_z_order_model;
 use aterm_spec::derive::Model;
@@ -271,6 +271,8 @@ struct Walk {
     run_start: Option<Instant>,
     rejected: usize,
     steps: usize,
+    /// A rejected step fails the test (a negative control's walk counts them).
+    strict: bool,
 }
 
 impl Walk {
@@ -283,6 +285,7 @@ impl Walk {
             run_start: None,
             rejected: 0,
             steps: 0,
+            strict: true,
         }
     }
 
@@ -314,7 +317,11 @@ impl Walk {
                 .iter()
                 .all(|inv| self.model.check_invariant(inv.name, &post));
         if !ok {
-            assert!(old_rule, "{name}: {:?} -> {post:?}", self.state);
+            assert!(
+                old_rule || !self.strict,
+                "{name}: {:?} -> {post:?}",
+                self.state
+            );
             self.rejected += 1;
         }
         self.state = post;
@@ -483,5 +490,29 @@ fn claude_code_s_recorded_composer_conforms_and_never_paints_over_ink() {
     assert!(
         control.rejected > 0,
         "the model accepts the pre-fix rule over Claude Code's frames"
+    );
+}
+
+/// THE CONSOLE JUDGES THE BOX THE HEAD LAW DRAWS ([`OldPath::ConsoleReadsTheFit`]): Claude Code's
+/// composer sits between two inked rows, so the head law fits the escort to its row, clear of
+/// the ink over and under it. Judged whole, the fitted body stayed latched under ink it no
+/// longer met, which `ConsolePetZOrder` rejects (a `ClearDwelt` that kept it under). Negative
+/// control (the law reverted alone): the model rejects the replay's steps.
+#[test]
+fn the_console_judges_the_box_the_head_law_draws() {
+    let run = |old: bool| {
+        let mut f = Fixture::new(40, 120, (7, 14));
+        f.brain.set_old_path(OldPath::ConsoleReadsTheFit, old);
+        let mut walk = Walk::new();
+        walk.strict = false;
+        let src = include_str!("fixtures/claude-composer-2026-09-21.ptylog");
+        replay(&mut f, src, |f, frame| walk.step(f, frame, false));
+        assert!(walk.steps > 500, "fixture: the replay steps the walk");
+        walk.rejected
+    };
+    assert_eq!(run(false), 0, "the model rejects the real z-order's steps");
+    assert!(
+        run(true) > 0,
+        "negative control: judged whole, the fitted body's z-order still conforms"
     );
 }

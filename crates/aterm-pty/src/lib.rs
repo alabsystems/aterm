@@ -120,7 +120,7 @@ fn build_child_env(
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut claims_terminal = false;
     for (k, _) in env_add {
-        if k == "TERM_PROGRAM" {
+        if env_key_is(std::ffi::OsStr::new(k), "TERM_PROGRAM") {
             claims_terminal = true;
             break;
         }
@@ -144,16 +144,19 @@ fn build_child_env(
     });
     for (k, v) in env_add {
         let key = std::ffi::OsString::from(k);
-        let mut replaced = false;
-        for pair in env_pairs.iter_mut() {
-            if pair.0 == key {
-                pair.1 = std::ffi::OsString::from(v);
-                replaced = true;
-                break;
+        let val = std::ffi::OsString::from(v);
+        if let Some(first) = env_pairs.iter().position(|(ek, _)| env_key_is(ek, k)) {
+            env_pairs[first] = (key, val);
+            let mut idx = first + 1;
+            while idx < env_pairs.len() {
+                if env_key_is(&env_pairs[idx].0, k) {
+                    env_pairs.remove(idx);
+                } else {
+                    idx += 1;
+                }
             }
-        }
-        if !replaced {
-            env_pairs.push((key, std::ffi::OsString::from(v)));
+        } else {
+            env_pairs.push((key, val));
         }
     }
     env_pairs
@@ -825,16 +828,23 @@ mod tests {
             (os("Claude_Code"), os("1")),
             (os("Aterm_Update_Token"), os("secret")),
             (os("cursor_trace_id"), os("xyz")),
+            (os("PATH"), os("C:\\StaleDuplicate")),
         ];
-        let out = build_child_env(inherited.into_iter(), &[]);
-        let keys: Vec<String> = out
+        let env_add = vec![("PATH".to_string(), "C:\\Tools;C:\\Windows".to_string())];
+        let out = build_child_env(inherited.into_iter(), &env_add);
+        let pairs: Vec<(String, String)> = out
             .iter()
-            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
             .collect();
         assert_eq!(
-            keys,
-            vec!["Path".to_string()],
-            "every mixed-case deny-listed key must be filtered on Windows"
+            pairs,
+            vec![("PATH".to_string(), "C:\\Tools;C:\\Windows".to_string())],
+            "mixed-case deny-listed keys must be filtered and mixed-case overrides collapsed on Windows"
         );
     }
 
@@ -843,9 +853,23 @@ mod tests {
     fn build_child_env_stays_case_sensitive_on_unix() {
         use std::ffi::OsString;
         let os = |s: &str| OsString::from(s);
-        let inherited = vec![(os("anthropic_api_key"), os("distinct-var"))];
-        let out = build_child_env(inherited.into_iter(), &[]);
-        assert_eq!(out.len(), 1, "exact-case deny must not match on unix");
+        let inherited = vec![
+            (os("anthropic_api_key"), os("distinct-var")),
+            (os("Path"), os("/custom")),
+            (os("PATH"), os("/old-a")),
+            (os("PATH"), os("/old-b")),
+        ];
+        let env_add = vec![("PATH".to_string(), "/new".to_string())];
+        let out = build_child_env(inherited.into_iter(), &env_add);
+        assert_eq!(
+            out,
+            vec![
+                (os("anthropic_api_key"), os("distinct-var")),
+                (os("Path"), os("/custom")),
+                (os("PATH"), os("/new")),
+            ],
+            "exact-case deny and override must stay case-sensitive while collapsing duplicate exact keys on unix"
+        );
     }
 
     #[test]

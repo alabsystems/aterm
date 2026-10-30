@@ -1002,13 +1002,54 @@ impl Log {
     /// Age recipients belonging to Macs that were removed and not restored in this log.
     #[must_use]
     pub fn removed_recipients(&self) -> BTreeSet<Recipient> {
-        self.membership().removed_recipients().clone()
+        let membership = self.membership();
+        let mut out = membership.removed_recipients().clone();
+        for m in membership.members().values() {
+            let r = m.binding.recipient();
+            if !out.contains(&r) && self.recipient_is_removed(&r) {
+                out.insert(r);
+            }
+        }
+        for f in membership.unproved() {
+            let r = f.recipient;
+            if !out.contains(&r) && self.recipient_is_removed(&r) {
+                out.insert(r);
+            }
+        }
+        out
     }
 
     /// Whether `recipient` belongs to a Mac that was removed and not restored in this log.
     #[must_use]
     pub fn recipient_is_removed(&self, recipient: &Recipient) -> bool {
-        self.removed_recipients().contains(recipient)
+        let membership = self.membership();
+        if membership.removed_recipients().contains(recipient) {
+            return true;
+        }
+        let mut any_for_recipient = false;
+        for m in membership.members().values() {
+            if m.binding.recipient() == *recipient {
+                any_for_recipient = true;
+                let node_removed = m.node_key.is_some_and(|nk| {
+                    nk != [0; 32] && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
+                });
+                if !node_removed {
+                    return false;
+                }
+            }
+        }
+        for f in membership.unproved() {
+            if f.recipient == *recipient {
+                any_for_recipient = true;
+                let node_removed = f.node_key.is_some_and(|nk| {
+                    nk != [0; 32] && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
+                });
+                if !node_removed {
+                    return false;
+                }
+            }
+        }
+        any_for_recipient
     }
 
     /// Whether an effective [`Body::Wrap`] in this log is addressed to `recipient`.
@@ -1145,8 +1186,14 @@ impl Log {
         let my_recipient = identity.recipient();
         let membership = self.membership();
         if self.recipient_is_removed(&my_recipient)
+            || self.audience_left_out_recipient(&EpochAudience::Commons, &my_recipient)
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
             || !membership.members().iter().any(|(actor, m)| {
                 m.binding.recipient() == my_recipient
+                    && !m.node_key.is_some_and(|nk| {
+                        nk != [0; 32]
+                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
+                    })
                     && !self.audience_left_out(&EpochAudience::Commons, actor)
                     && !self.audience_left_out(&EpochAudience::Everyone, actor)
             })
@@ -1234,8 +1281,14 @@ impl Log {
         let my_recipient = identity.recipient();
         let membership = self.membership();
         if self.recipient_is_removed(&my_recipient)
+            || self.audience_left_out_recipient(&EpochAudience::Commons, &my_recipient)
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
             || !membership.members().iter().any(|(actor, m)| {
                 m.binding.recipient() == my_recipient
+                    && !m.node_key.is_some_and(|nk| {
+                        nk != [0; 32]
+                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
+                    })
                     && !self.audience_left_out(&EpochAudience::Commons, actor)
                     && !self.audience_left_out(&EpochAudience::Everyone, actor)
             })
@@ -1297,6 +1350,88 @@ impl Log {
         my_recipient: &Recipient,
         active_recipients: &BTreeSet<Recipient>,
         allow_coalesce: bool,
+    ) -> bool {
+        self.reconcile_due(my_recipient, active_recipients, allow_coalesce, true)
+    }
+
+    /// The coverage rule of §3.3.7 for host lists: the header hosts of each host list whose every
+    /// causally newest epoch is wrapped to `my_recipient` (so this Mac opens them) and which has two
+    /// or more newest epochs, or a newest epoch still wrapped to a Mac this log removed. A removal
+    /// by a member outside the list cannot rotate it, so one of the list's own members mints its
+    /// next epoch on a vault pass (F16's review).
+    #[must_use]
+    pub fn hosts_rotation_due(&self, my_recipient: &Recipient) -> Vec<Vec<String>> {
+        let effective = eval::effective_records(&self.order);
+        let mut epochs: BTreeMap<Vec<String>, Vec<(usize, RecordId)>> = BTreeMap::new();
+        let mut wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
+        for (i, record) in self.order.iter().enumerate().skip(1) {
+            if !effective.counts(i) {
+                continue;
+            }
+            match record.body() {
+                Body::Epoch {
+                    audience: EpochAudience::Hosts(hosts),
+                    ..
+                } => epochs
+                    .entry(hosts.clone())
+                    .or_default()
+                    .push((i, *record.id())),
+                Body::Wrap {
+                    epoch, recipient, ..
+                } => {
+                    wrapped.entry(*epoch).or_default().insert(*recipient);
+                }
+                _ => {}
+            }
+        }
+        let removed = self.removed_recipients();
+        epochs
+            .into_iter()
+            .filter(|(_, list)| {
+                let maximal: Vec<&RecordId> = list
+                    .iter()
+                    .filter(|&&(a, _)| !list.iter().any(|&(b, _)| a != b && effective.before(a, b)))
+                    .map(|(_, id)| id)
+                    .collect();
+                let opens = maximal.iter().all(|id| {
+                    wrapped
+                        .get(*id)
+                        .is_some_and(|set| set.contains(my_recipient))
+                });
+                let stale = maximal.len() > 1
+                    || maximal.iter().any(|id| {
+                        wrapped
+                            .get(*id)
+                            .is_some_and(|set| !set.is_disjoint(&removed))
+                    });
+                !maximal.is_empty() && opens && stale
+            })
+            .map(|(hosts, _)| hosts)
+            .collect()
+    }
+
+    /// The coverage rule of §3.3.7 alone (keychain "Epochs"): whether the member `my_recipient`,
+    /// among `active_recipients`, holds an [`EpochAudience::Commons`] or `[everyone]` epoch whose
+    /// audience has two or more causally newest epochs (concurrent removals on two sides of a
+    /// split) or a newest epoch still wrapped to a Mac this log removed (a quorum `Remove` voided
+    /// the remover's rotation, or a removal reached it before its new epoch), so the next writer
+    /// mints one higher epoch that covers them. No wrap gap counts here: those close by the
+    /// causal rule (`Log::wrap_gaps`).
+    #[must_use]
+    pub fn rotation_due(
+        &self,
+        my_recipient: &Recipient,
+        active_recipients: &BTreeSet<Recipient>,
+    ) -> bool {
+        self.reconcile_due(my_recipient, active_recipients, true, false)
+    }
+
+    fn reconcile_due(
+        &self,
+        my_recipient: &Recipient,
+        active_recipients: &BTreeSet<Recipient>,
+        allow_coalesce: bool,
+        gaps: bool,
     ) -> bool {
         if active_recipients.is_empty() || !active_recipients.contains(my_recipient) {
             return false;
@@ -1398,6 +1533,9 @@ impl Log {
                 return true;
             }
         }
+        if !gaps {
+            return false;
+        }
         let membership = self.membership();
         let left_out_of = |maximal: &[RecordId]| -> BTreeSet<Recipient> {
             membership
@@ -1422,18 +1560,28 @@ impl Log {
         };
         let left_out_commons = left_out_of(&maximal_commons);
         let left_out_everyone = left_out_of(&maximal_everyone);
-        if left_out_everyone.contains(my_recipient) {
+        if left_out_everyone.contains(my_recipient)
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, my_recipient)
+        {
             return false;
         }
         let commons_active: BTreeSet<Recipient> = active_recipients
             .iter()
             .copied()
-            .filter(|r| !left_out_commons.contains(r) && !left_out_everyone.contains(r))
+            .filter(|r| {
+                !left_out_commons.contains(r)
+                    && !left_out_everyone.contains(r)
+                    && !self.audience_left_out_recipient(&EpochAudience::Commons, r)
+                    && !self.audience_left_out_recipient(&EpochAudience::Everyone, r)
+            })
             .collect();
         let everyone_active: BTreeSet<Recipient> = active_recipients
             .iter()
             .copied()
-            .filter(|r| !left_out_everyone.contains(r))
+            .filter(|r| {
+                !left_out_everyone.contains(r)
+                    && !self.audience_left_out_recipient(&EpochAudience::Everyone, r)
+            })
             .collect();
         if commons_epochs.iter().any(|(_, ep_id)| {
             wrapped
@@ -1471,12 +1619,42 @@ impl Log {
         let my_recipient = identity.recipient();
         let membership = self.membership();
         if self.recipient_is_removed(&my_recipient)
-            || !membership.members().iter().any(|(actor, m)| {
+            || self.audience_left_out_recipient(&EpochAudience::Commons, &my_recipient)
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
+        {
+            return Ok(None);
+        }
+        let has_member_seat = membership
+            .members()
+            .values()
+            .any(|m| m.binding.recipient() == my_recipient);
+        let has_unproved_seat = membership
+            .unproved()
+            .iter()
+            .any(|f| f.recipient == my_recipient);
+        let permitted = if has_member_seat {
+            membership.members().iter().any(|(actor, m)| {
                 m.binding.recipient() == my_recipient
+                    && !m.node_key.is_some_and(|nk| {
+                        nk != [0; 32]
+                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
+                    })
                     && !self.audience_left_out(&EpochAudience::Commons, actor)
                     && !self.audience_left_out(&EpochAudience::Everyone, actor)
             })
-        {
+        } else if has_unproved_seat {
+            membership.unproved().iter().any(|f| {
+                f.recipient == my_recipient
+                    && !f.node_key.is_some_and(|nk| {
+                        nk != [0; 32]
+                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
+                    })
+                    && self.wraps_maximal_audience_to(&EpochAudience::Commons, &my_recipient)
+            })
+        } else {
+            self.wraps_maximal_audience_to(&EpochAudience::Commons, &my_recipient)
+        };
+        if !permitted {
             return Ok(None);
         }
         let effective = eval::effective_records(&self.order);
@@ -1626,18 +1804,22 @@ impl Log {
         let mut fully_unwrapped_audiences = BTreeSet::new();
         let mut excluded_audiences = BTreeSet::new();
         let mut hidden_epochs = false;
+        let left_out_everyone =
+            self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient);
         for (aud, list) in &epochs_by_aud {
             let max_ids: Vec<RecordId> = list
                 .iter()
                 .filter(|&&(a, _)| !list.iter().any(|&(b, _)| a != b && effective.before(a, b)))
                 .map(|&(_, id)| id)
                 .collect();
-            if max_ids.iter().all(|id| unwrapped.contains_key(id)) {
+            let is_excluded =
+                left_out_everyone || self.audience_left_out_recipient(aud, &my_recipient);
+            if !is_excluded && max_ids.iter().all(|id| unwrapped.contains_key(id)) {
                 fully_unwrapped_audiences.insert(aud.clone());
             } else if aud != &EpochAudience::Commons {
                 hidden_epochs = true;
             }
-            if self.audience_left_out_recipient(aud, &my_recipient) {
+            if is_excluded {
                 excluded_audiences.insert(aud.clone());
             }
             maximal_epochs.insert(aud.clone(), max_ids);

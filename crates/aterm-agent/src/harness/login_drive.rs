@@ -661,7 +661,10 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             };
         }
     };
-    let deadline = Instant::now() + spec.hang;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(spec.hang)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let (tx, rx) = mpsc::channel::<Option<(usize, String)>>();
     let said_done = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicUsize::new(0));
@@ -886,7 +889,10 @@ pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
         Ok(child) => child,
         Err(e) => return Some(format!("{} did not start ({e})", sandbox.display())),
     };
-    let until = Instant::now() + SANDBOX_PROBE_WAIT;
+    let now = Instant::now();
+    let until = now
+        .checked_add(SANDBOX_PROBE_WAIT)
+        .unwrap_or_else(|| now + Duration::from_secs(60));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,

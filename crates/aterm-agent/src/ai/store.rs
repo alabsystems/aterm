@@ -310,7 +310,7 @@ impl Store {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
+            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let file = open.open(self.dir.join(LOCK_FILE))?;
         loop {

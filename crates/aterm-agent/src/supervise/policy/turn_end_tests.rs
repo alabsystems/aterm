@@ -85,6 +85,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         opens_cut: false,
         turn_said: None,
         opened_by: None,
+        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -185,6 +186,15 @@ fn typed(rule: &'static str) -> TurnEndAction {
     TurnEndAction::Type {
         text,
         rule_id: rule,
+    }
+}
+
+/// Cruise's continuation within a person's hold: the hour after their turn, it does not say the
+/// go-ahead is no need ([`super::go_ahead::unless_held`]).
+fn continued_held() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: super::go_ahead::unless_held(&continuation_text(&cfg(), None), true).into_owned(),
+        rule_id: RULE_CONTINUE,
     }
 }
 
@@ -5592,8 +5602,10 @@ fn a_point_the_upgrade_owns_is_never_continued_at_the_grace_lapse() {
             model.action_enabled("LoopContinues", &m),
             "{why}: the policy's {action:?} against the model at {m:?}"
         );
+        // The person's turn holds the go-ahead for an hour, and the continuation's word that it
+        // is no need with it.
         if !owns && ago >= grace {
-            assert_eq!(action, typed(RULE_CONTINUE), "{why}");
+            assert_eq!(action, continued_held(), "{why}");
         }
     }
 }
@@ -15996,16 +16008,17 @@ fn an_off_park_ends_the_carry_and_land_begins_again_after_a_persons_greeting() {
             let a = decide_turn_end(&st, &r, &cfg(), now + 10 * MIN);
             (st.left_to_person(), a)
         };
+        // Cruise's continuation comes ten minutes after the person's greeting, inside its hold.
         let want = match mode {
             Autopilot::Land => land_nudged(),
-            _ => typed(RULE_CONTINUE),
+            _ => continued_held(),
         };
         // Cruise carries the person's own exchange (owner ruling 2026-10-26); Land carries one
         // the session did not open (owner ruling 2026-10-27), beginning again where the park
         // ended its carry.
         let parked = match mode {
             Autopilot::Land => (false, land_instruction()),
-            _ => (false, typed(RULE_CONTINUE)),
+            _ => (false, continued_held()),
         };
         assert_eq!(run(true), parked, "{mode:?}");
         assert_eq!(run(false), (false, want), "{mode:?}");
@@ -16344,11 +16357,12 @@ fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
         // Cruise carries the person's own exchange (owner ruling 2026-10-26); Land carries one
         // the session did not open (owner ruling 2026-10-27), beginning again where the park
         // ended its carry, whatever the turn's length. Off types nothing, and the bound alone
-        // says whose the turn is: a short one the person's, a job's not.
+        // says whose the turn is: a short one the person's, a job's not. Cruise's continuation
+        // comes ten minutes after the person's turn, inside its hold.
         let parked = match mode {
             Autopilot::Land => (false, land_instruction()),
             Autopilot::Off => (true, TurnEndAction::Nothing),
-            Autopilot::Cruise => (false, typed(RULE_CONTINUE)),
+            Autopilot::Cruise => (false, continued_held()),
         };
         assert_eq!(run(true, 8 * MIN), parked, "{mode:?}");
         let (on_the_ladder, after_the_park) = match mode {
@@ -16357,7 +16371,7 @@ fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
                 (true, TurnEndAction::Nothing),
                 (false, TurnEndAction::Nothing),
             ),
-            Autopilot::Cruise => ((false, typed(RULE_CONTINUE)), (false, typed(RULE_CONTINUE))),
+            Autopilot::Cruise => ((false, continued_held()), (false, continued_held())),
         };
         assert_eq!(run(false, 8 * MIN), on_the_ladder, "{mode:?}");
         assert_eq!(run(true, JOB), after_the_park, "{mode:?}");
@@ -18273,6 +18287,11 @@ mod wake_rider {
 mod angles {
     use super::*;
     include!("turn_end_angles_tests.rs");
+}
+
+mod go_ahead {
+    use super::*;
+    include!("turn_end_go_ahead_tests.rs");
 }
 
 #[test]
@@ -20616,6 +20635,7 @@ fn a_draft_submitted_and_answered_before_any_read_saw_it_run_is_taken_by_the_tur
             TurnEndReading {
                 answered: None,
                 opened_by: None,
+                opened_words: None,
                 ..shown(FIRST, PROMPT)
             },
             shown(REPLY, DRAFT),
@@ -20626,6 +20646,7 @@ fn a_draft_submitted_and_answered_before_any_read_saw_it_run_is_taken_by_the_tur
             TurnEndReading {
                 answered: None,
                 opened_by: None,
+                opened_words: None,
                 ..shown(REPLY, DRAFT)
             },
         );
@@ -21001,6 +21022,7 @@ fn a_turn_asked_since_the_point_is_told_by_its_submission_whatever_its_words() {
         let out_of_sight = |said: &str| TurnEndReading {
             answered: None,
             opened_by: None,
+            opened_words: None,
             program,
             ..idle(said, None)
         };
@@ -21337,6 +21359,7 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
         |st: &TurnEndState, submits: Option<u64>, inputs: Option<u64>| TurnEndReading {
             said_tail: None,
             opened_by: None,
+            opened_words: None,
             taskless: !st.redrawn_fresh(submits, inputs),
             submits,
             inputs_before: inputs,
@@ -21347,6 +21370,7 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
     let rewrapped = |st: &TurnEndState, submits: Option<u64>| TurnEndReading {
         said_tail: None,
         opened_by: None,
+        opened_words: None,
         taskless: !st.redrawn_fresh(submits, Some(7)),
         submits,
         inputs_before: Some(7),

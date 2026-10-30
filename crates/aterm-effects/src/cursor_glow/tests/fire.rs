@@ -1086,6 +1086,7 @@ fn fire_embers_keep_off_probed_glyph_cells() {
             hue: 0.6,
             cov_scale: 1.0,
             born: at,
+            latch: ParticleLatch::FRESH,
             edge_cut: false,
         });
         let (mut out, mut halos) = (Vec::new(), Vec::new());
@@ -2687,6 +2688,7 @@ fn the_light_fire_stands_up_out_of_the_line_and_its_embers_are_beads() {
         hue: 0.8,
         cov_scale: 1.0,
         born: at,
+        latch: ParticleLatch::FRESH,
         edge_cut: false,
     });
     let (mut out, mut halos) = (Vec::new(), Vec::new());
@@ -4429,6 +4431,7 @@ fn a_laser_spark_s_whole_dash_keeps_off_a_filled_row() {
                         hue: 0.3,
                         cov_scale: 1.0,
                         born: t1,
+                        latch: ParticleLatch::FRESH,
                         edge_cut: false,
                     });
                 }
@@ -4467,23 +4470,188 @@ fn a_laser_spark_s_whole_dash_keeps_off_a_filled_row() {
     );
 }
 
+/// One particle laid by hand at the centre of cell (4, 30) of `tall_geom` on
+/// the reference dark, the row above it a filled bar (`#268bd2`) across the
+/// grid: `(vx, vy, gy)` in rows a second, `life` in seconds. Each 16 ms
+/// frame's largest channel change against the same glow without it, over
+/// `frames` frames; `setup` sets the glow's controls.
+fn bar_flight(
+    style: GlowStyle,
+    (vx, vy, gy, life): (f32, f32, f32, f32),
+    frames: usize,
+    setup: &dyn Fn(&mut CursorGlow),
+) -> Vec<i32> {
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let ch = g.ch as f32;
+    let (bar, bar_row, row, col) = (0x0026_8BD2u32, 3usize, 4u16, 30u16);
+    let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for (r, line) in rows.iter_mut().enumerate() {
+        for cell in line.iter_mut() {
+            let ground = if r == bar_row { bar } else { DARK_PAIR.1 };
+            (cell.fg, cell.bg) = (rgb(DARK_PAIR.0), rgb(ground));
+        }
+    }
+    let mut c = cfg(style, true);
+    c.intensity = 1.0;
+    c.dark_theme = true;
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    let (mut with, mut without) = (CursorGlow::default(), CursorGlow::default());
+    setup(&mut with);
+    setup(&mut without);
+    let t0 = Instant::now();
+    let mut out = Vec::new();
+    for glow in [&mut with, &mut without] {
+        glow.observe_frame_text(Some((row, col)), &rows, t0);
+        glow.tick(Some((row, col)), t0, &c, g, &mut out);
+        out.clear();
+    }
+    let born = t0 + Duration::from_millis(16);
+    let (x0, y0) = g.cell_center(row, col);
+    with.particles.push(Particle {
+        x0,
+        y0,
+        vx: vx * ch,
+        vy: vy * ch,
+        gy: gy * ch,
+        life,
+        hue: 0.3,
+        cov_scale: 1.0,
+        born,
+        latch: ParticleLatch::FRESH,
+        edge_cut: false,
+    });
+    (0..frames)
+        .map(|k| {
+            let t = born + Duration::from_millis(16 * (k as u64 + 1));
+            let glass: Vec<Glass> = [&mut with, &mut without]
+                .into_iter()
+                .map(|glow| {
+                    out.clear();
+                    glow.observe_frame_text(Some((row, col)), &rows, t);
+                    glow.tick(Some((row, col)), t, &c, g, &mut out);
+                    let mut glass = Glass::new(g, DARK_PAIR.1);
+                    glass.add_quads(glow.under_quads());
+                    glass.add_quads(&out);
+                    glass.add_halos(glow.halos());
+                    glass
+                })
+                .collect();
+            let mut most = 0;
+            for y in 0..i32::from(g.win_h) {
+                for x in 0..i32::from(g.win_w) {
+                    let (a, b) = (glass[0].at(y, x), glass[1].at(y, x));
+                    for sh in [16u32, 8, 0] {
+                        most =
+                            most.max((((a >> sh) & 0xff) as i32 - ((b >> sh) & 0xff) as i32).abs());
+                    }
+                }
+            }
+            most
+        })
+        .collect()
+}
+
+/// looks9's review of Q8: A SPARK OR DROP THAT MEETS A BAR FADES OUT BEFORE
+/// IT, ONCE. Culled the frame its flight met a filled row, a Laser spark
+/// rising from the caret under a bar vanished mid-flight at well over half
+/// its brightness (frame 13 of 27, 119 of its 201), and a Water drop rising
+/// into the bar went out there and came back as it fell clear (`###…###`):
+/// a show/hide decided each frame. Laid by hand from the caret under a bar
+/// across the grid (the review's spark, and three of Water's typing drops),
+/// each is drawn for its first frames, is never put out and drawn again, and
+/// its last drawn frame lights a quarter of its brightest or less. Negative
+/// control (`bars_cut_per_frame`): culled each frame, each is cut at over
+/// half its brightest or comes back.
+#[test]
+fn a_spark_or_drop_that_meets_a_bar_fades_out_before_it_once() {
+    let flights = [
+        (GlowStyle::Laser, (0.3, -2.1, 3.6, 0.44)),
+        (GlowStyle::Water, (0.0, -1.5, 3.0, 0.65)),
+        (GlowStyle::Water, (0.0, -1.48, 3.0, 0.65)),
+        (GlowStyle::Water, (0.0, -1.5, 3.0, 0.75)),
+    ];
+    // `(drawn, came back, last drawn over the brightest)`.
+    let read = |deltas: &[i32]| -> (usize, bool, f32) {
+        let drawn = deltas.iter().take_while(|&&d| d > 0).count();
+        let back = deltas[drawn..].iter().any(|&d| d > 0);
+        let peak = deltas.iter().copied().max().unwrap_or(0).max(1);
+        let last = deltas[..drawn].last().copied().unwrap_or(0);
+        (drawn, back, last as f32 / peak as f32)
+    };
+    for (style, flight) in flights {
+        let frames = (flight.3 / 0.016) as usize;
+        let deltas = bar_flight(style, flight, frames, &|_| {});
+        let (drawn, back, last) = read(&deltas);
+        assert!(
+            drawn >= 5,
+            "{style:?} {flight:?}: drawn for only {drawn} frames ({deltas:?})"
+        );
+        assert!(
+            !back,
+            "{style:?} {flight:?}: put out and drawn again ({deltas:?})"
+        );
+        assert!(
+            last <= 0.25,
+            "{style:?} {flight:?}: cut at {last:.2} of its brightest ({deltas:?})"
+        );
+        let cut = bar_flight(style, flight, frames, &|glow| {
+            glow.bars_cut_per_frame = true
+        });
+        let (_, back, last) = read(&cut);
+        assert!(
+            back || last > 0.5,
+            "control: {style:?} {flight:?}: culled each frame it fades out ({cut:?})"
+        );
+    }
+}
+
+/// The light `glow`'s live bolts lay 16 ms after `born`
+/// ([`CursorGlow::emit_bolts`] on Laser at full strength on `pair`): every
+/// lit quad.
+fn bolt_light(glow: &CursorGlow, pair: (u32, u32), g: Geom, born: Instant) -> Vec<GlowQuad> {
+    let mut c = cfg(GlowStyle::Laser, true);
+    c.intensity = 1.0;
+    c.dark_theme = aterm_render::theme_is_dark(pair.1);
+    (c.theme_fg, c.theme_bg) = pair;
+    let mut quads = Vec::new();
+    glow.emit_bolts(
+        born + Duration::from_millis(16),
+        &c,
+        g,
+        &mut crate::cursor_glow::glow_sink(
+            &mut quads,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    quads.retain(|q| q.color & 0x00FF_FFFF != 0);
+    quads
+}
+
 /// looks9 Q8: Laser's crackle, laid at a random angle from a typed cell,
 /// rose onto Solarized Dark's powerline bar above the typed line as a
 /// violet arc apart from the bolt (the gallery's `context`), and one
 /// crossing a pane's edge is cut there to a lone fragment. Swept round every
 /// angle at three lengths from a cell under a filled row, and from a cell
-/// of the grid's top row, no kept crackle's corona meets the bar or leaves
-/// the grid, and a third or more of them are kept (a crackle that meets
-/// one is dropped: [`a_laser_crackle_that_meets_an_edge_is_dropped`]).
-/// Negative control: laid as they were, the crackles aimed up meet it.
+/// of the grid's top row, no kept crackle lays light (its corona drawn, as
+/// [`CursorGlow::emit_bolts`] lays it) on the bar or past the grid's top,
+/// and a third or more of them are kept (a crackle that meets one is
+/// dropped: [`a_laser_crackle_that_meets_an_edge_is_dropped`]). Negative
+/// control: laid as they were, the crackles aimed up meet it. (A crackle's
+/// corona is a fork's, 0.30 of a row thick: read a fifth of a row thick,
+/// none of these met the bar; the girth's law is the strikes',
+/// [`a_laser_strike_stays_in_its_pane`].)
 #[test]
 fn a_laser_crackle_keeps_off_a_filled_row_above() {
     let g = tall_geom();
     let (pair, bar) = (SOLARIZED_PAIR, 0x0030_3030u32);
     let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
     let ch = g.ch as f32;
-    let half = ch * 0.15;
-    // `(row, barred)`: under a filled row, or on the grid's top row.
+    // `(row, barred)`: under a filled row, or on the grid's top row; `kept`
+    // runs the keeper.
     let sweep = |(row, barred): (u16, bool), kept: bool| -> (usize, usize, usize) {
         let col = 20u16;
         let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
@@ -4501,38 +4669,39 @@ fn a_laser_crackle_keeps_off_a_filled_row_above() {
             cell.ch = 'm';
         }
         // The bar's foot, or the grid's top edge: the root row's top.
-        let ceiling = f32::from(g.origin_y) + f32::from(row) * ch;
+        let ceiling = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
         let (x0, y0) = g.cell_center(row, col - 3);
         let mut glow = CursorGlow::default();
         glow.observe_frame_text(Some((row, col)), &rows, Instant::now());
-        glow.particles_on_bars = !kept;
         let (mut laid, mut touched, mut dropped) = (0, 0, 0);
         for i in 0..72 {
             let (sin_a, cos_a) = (i as f32 * 5f32.to_radians()).sin_cos();
             for len in [1.6f32, 3.0, 4.4] {
+                let born = Instant::now();
                 glow.bolts.clear();
                 glow.spawn_bolt(
                     (x0, y0),
                     (x0 + cos_a * len * ch, y0 + sin_a * len * ch),
                     ch,
                     false,
-                    Instant::now(),
+                    born,
                 );
                 if kept {
                     glow.keep_crackle_off_bars(g, pair.1, row, y0);
                 }
-                let Some(b) = glow.bolts.last() else {
+                if glow.bolts.is_empty() {
                     dropped += 1;
                     continue;
-                };
+                }
                 laid += 1;
-                let top = b
-                    .pts
-                    .as_slice()
-                    .windows(2)
-                    .flat_map(|w| (0..=8).map(move |k| w[0].1 + (w[1].1 - w[0].1) * k as f32 / 8.0))
-                    .fold(f32::INFINITY, f32::min);
-                touched += usize::from(top - half < ceiling);
+                // On the bar, or (the effects box clipping at the grid's
+                // top) cut at its edge.
+                let reach = ceiling + i32::from(!barred);
+                touched += usize::from(
+                    bolt_light(&glow, pair, g, born)
+                        .iter()
+                        .any(|q| i32::from(q.y) < reach),
+                );
             }
         }
         (laid, touched, dropped)
@@ -4546,7 +4715,7 @@ fn a_laser_crackle_keeps_off_a_filled_row_above() {
         );
         assert_eq!(
             touched, 0,
-            "{fixture:?}: {touched} of {laid} crackles meet the bar or the edge"
+            "{fixture:?}: {touched} of {laid} crackles light the bar or past the edge"
         );
         let (old, old_touched, _) = sweep(fixture, false);
         assert!(
@@ -6011,13 +6180,11 @@ fn water_s_lit_rail_is_foam() {
 
 /// Water's foam laid on a flat rail 60 cells long at the tall cell (13 x 26
 /// px), its swell as the gallery's (`even`: looks9 round 1's foam,
-/// [`crate::cursor_glow::bed::BedScratch::foam_even`]): `(pitch, heights,
-/// sizes, bare)`, the longest over the shortest distance between successive
-/// troughs of its spine, the spread in px of its crests' heights, the
-/// largest over the smallest droplet, and the share of its open breaks (a
-/// trough whose light the foam takes) that shed no droplet. The rail's last
-/// three cells, where it feathers in to the caret, are left out.
-fn foam_on_a_flat_rail(even: bool) -> (f32, f32, f32, f32) {
+/// [`crate::cursor_glow::bed::BedScratch::foam_even`]): `(pitch, heights)`,
+/// the longest over the shortest distance between successive troughs of its
+/// spine, and the spread in px of its crests' heights. The rail's last three
+/// cells, where it feathers in to the caret, are left out.
+fn foam_on_a_flat_rail(even: bool) -> (f32, f32) {
     use crate::cursor_glow::bed::{FOAM_SWELL_VARY, foam_rail, swell_rail};
     let g = tall_geom();
     let (cw, ch) = (g.cw as f32, g.ch as f32);
@@ -6066,49 +6233,31 @@ fn foam_on_a_flat_rail(even: bool) -> (f32, f32, f32, f32) {
     };
     let (short, long) = spread(&pitches);
     let (low, high) = spread(&crests);
-    let sizes: Vec<f32> = drops.iter().filter(|d| d.0 <= reach).map(|d| d.2).collect();
-    let (least, most) = spread(&sizes);
-    let open: Vec<f32> = troughs
-        .iter()
-        .filter(|&&i| verts[i].cov < 0.5)
-        .map(|&i| verts[i].x)
-        .collect();
-    let bare = open
-        .iter()
-        .filter(|&&x| !drops.iter().any(|d| (d.0 - x).abs() < 0.5 * cw))
-        .count();
-    (
-        long / short,
-        high - low,
-        most / least,
-        bare as f32 / open.len().max(1) as f32,
-    )
+    (long / short, high - low)
 }
 
 /// looks9 round 2's Q3: WATER'S FOAM NEVER KEEPS ONE PITCH. On Solarized
-/// Dark round 1's foam broke at every trough a like arc's length apart, a
-/// like droplet under each, its crests of one height: a dash-dot rule. On a
-/// flat rail 60 cells long its troughs fall closer and farther apart (the
-/// longest pitch 1.4 times the shortest or more), its crests stand a pixel
-/// or more apart in height, its droplets run from small to large (the
-/// largest 1.5 times the smallest or more) and one in ten or more of its
-/// open breaks sheds none. Negative control: round 1's even foam keeps one pitch
-/// (within 1.2, the quarter-cell vertices'), one height (within 0.3 px), one
-/// droplet and sheds one under every break.
+/// Dark round 1's foam broke at every trough a like arc's length apart, its
+/// crests of one height: a dash-dot rule. On a flat rail 60 cells long its
+/// troughs fall closer and farther apart (the longest pitch 1.4 times the
+/// shortest or more) and its crests stand a pixel or more apart in height.
+/// (The rail's droplets are not read: the bed clears them wherever it lays
+/// the foam's body, as it always does outside a test's bodiless path, so
+/// laws on them pinned what is never drawn, looks9's review.) Negative
+/// control: round 1's even foam keeps one pitch (within 1.2, the
+/// quarter-cell vertices') and one height (within 0.3 px).
 #[test]
 fn water_s_foam_never_keeps_one_pitch() {
-    let (pitch, heights, sizes, bare) = foam_on_a_flat_rail(false);
+    let (pitch, heights) = foam_on_a_flat_rail(false);
     let even = foam_on_a_flat_rail(true);
     assert!(pitch >= 1.4, "the foam's pitch varies {pitch:.2} times");
     assert!(
         heights >= 1.0,
         "the foam's crests stand {heights:.2} px apart"
     );
-    assert!(sizes >= 1.5, "the foam's droplets vary {sizes:.2} times");
-    assert!(bare >= 0.1, "{bare:.2} of the foam's breaks shed nothing");
     assert!(
-        even.0 <= 1.2 && even.1 <= 0.3 && even.2 <= 1.0 && even.3 == 0.0,
-        "control: round 1's foam (pitch, heights, sizes, bare) reads {even:?}"
+        even.0 <= 1.2 && even.1 <= 0.3,
+        "control: round 1's foam (pitch, heights) reads {even:?}"
     );
 }
 
@@ -6789,15 +6938,17 @@ fn the_paper_comet_s_tail_is_a_needle_of_ice() {
 /// strike threw a fork at the pane's bottom edge, cut there by the divider
 /// to a lone violet fragment (the gallery's `split`, `b0`). Forged 400 times
 /// along jumps on the grid's last rows, under a filled bar of a row above
-/// that the jump does not cross, no fork and no channel of a strike reaches,
-/// its corona's girth and all, past the grid's edge or onto the bar.
-/// Negative control: laid as forged (`strike_forks_cut`), a tenth or more
-/// of the strikes throw a fork past the edge.
+/// that the jump does not cross, no fork and no channel of a strike lays
+/// light (its corona drawn, as [`CursorGlow::emit_bolts`] lays it) past
+/// the grid's edge or onto the bar. Negative controls: laid as forged
+/// (`strike_forks_cut`), a tenth or more of the strikes throw a fork past
+/// the edge; kept by a corona read a fifth of a row thick across its height
+/// alone (`bolt_girth_narrow`, looks9's review: 8 of 400 laid it on the
+/// bar), some strike lights the bar or the edge.
 #[test]
 fn a_laser_strike_stays_in_its_pane() {
     let g = tall_geom();
     let ch = g.ch as f32;
-    let half = ch * 0.15;
     let (pair, bar) = (SOLARIZED_PAIR, 0x0030_3030u32);
     let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
     let (row, bar_row) = ((g.rows - 2) as u16, (g.rows - 4) as u16);
@@ -6813,21 +6964,29 @@ fn a_laser_strike_stays_in_its_pane() {
         }
     }
     let (top, bot) = (
-        f32::from(g.origin_y),
-        f32::from(g.origin_y) + g.rows as f32 * ch,
+        i32::from(g.origin_y),
+        i32::from(g.origin_y) + (g.rows * g.ch) as i32,
     );
     let (left, right) = (
-        f32::from(g.origin_x),
-        f32::from(g.origin_x) + (g.cols * g.cw) as f32,
+        i32::from(g.origin_x),
+        i32::from(g.origin_x) + (g.cols * g.cw) as i32,
     );
     let (bar_top, bar_bot) = (
-        top + f32::from(bar_row) * ch,
-        top + f32::from(bar_row + 1) * ch,
+        top + i32::from(bar_row) * g.ch as i32,
+        top + i32::from(bar_row + 1) * g.ch as i32,
     );
-    let strikes = |cut: bool| {
+    let unclipped = Geom {
+        rows: g.rows + 2,
+        cols: g.cols + 2,
+        win_w: g.win_w + 2 * g.cw as u16,
+        win_h: g.win_h + 2 * g.ch as u16,
+        ..g
+    };
+    let strikes = |cut: bool, narrow: bool| {
         let mut glow = CursorGlow::default();
         glow.observe_frame_text(Some((row, 4)), &page, Instant::now());
         glow.strike_forks_cut = cut;
+        glow.bolt_girth_narrow = narrow;
         let (mut out, mut forks) = (0usize, 0usize);
         for i in 0..400u32 {
             let (r0, r1) = (row + (i % 2) as u16, row + ((i / 2) % 2) as u16);
@@ -6839,36 +6998,32 @@ fn a_laser_strike_stays_in_its_pane() {
             glow.spawn_bolt(from, to, ch, true, now);
             glow.keep_strike_in_grid(g, pair.1, (r0, r1), now);
             forks += glow.bolts.iter().filter(|b| b.branch).count();
-            let past = glow.bolts.iter().any(|b| {
-                b.pts.as_slice().windows(2).any(|w| {
-                    (0..=8).any(|k| {
-                        let f = k as f32 / 8.0;
-                        let (x, y) = (
-                            w[0].0 + (w[1].0 - w[0].0) * f,
-                            w[0].1 + (w[1].1 - w[0].1) * f,
-                        );
-                        y + half > bot
-                            || y - half < top
-                            || x < left
-                            || x > right
-                            || (y + half > bar_top && y - half < bar_bot)
-                    })
-                })
+            // Past the grid's edge (drawn into a box two cells wider and
+            // taller, where the effects box would cut it), or on the bar.
+            let past = bolt_light(&glow, pair, unclipped, now).iter().any(|q| {
+                let (x0, y0) = (i32::from(q.x), i32::from(q.y));
+                let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
+                y1 > bot || y0 < top || x0 < left || x1 > right || (y1 > bar_top && y0 < bar_bot)
             });
             out += usize::from(past);
         }
         (out, forks)
     };
-    let (kept, forks) = strikes(false);
-    let (cut, _) = strikes(true);
+    let (kept, forks) = strikes(false, false);
     assert_eq!(
         kept, 0,
-        "{kept} of 400 strikes leave the pane or meet the bar"
+        "{kept} of 400 strikes light past the pane or the bar"
     );
     assert!(forks >= 400, "fixture: the strikes keep {forks} forks");
+    let (cut, _) = strikes(true, false);
     assert!(
         cut >= 40,
         "control: laid as forged, only {cut} of 400 strikes leave the pane"
+    );
+    let (narrow, _) = strikes(false, true);
+    assert!(
+        narrow > 0,
+        "control: kept by a corona a fifth of a row thick, no strike lights the bar or the edge"
     );
 }
 
@@ -6879,11 +7034,14 @@ fn a_laser_strike_stays_in_its_pane() {
 /// a fragment. The window here is 16 rows by 48 columns and the caret's pane
 /// its top-left 8 rows by 24 columns (the frame hands the pane's cells at
 /// its offset, as the GUI's split does). Forged 400 times along jumps on the
-/// pane's last rows, no strike reaches past the pane's right edge, or, its
-/// corona's girth and all, past its bottom edge; swept round every angle at three lengths
-/// from the pane's next-to-last row, no kept crackle does. Negative control:
-/// the pane's edge unread (`bolt_window_edge`), a tenth or more of the
-/// strikes and of the crackles aimed down cross it.
+/// pane's last rows, no strike lays light (its corona drawn, as
+/// [`CursorGlow::emit_bolts`] lays it) past the pane's right or bottom
+/// edge; swept round every angle at three lengths from the pane's
+/// next-to-last row, no kept crackle does. Negative controls: the pane's
+/// edge unread (`bolt_window_edge`), a tenth or more of the strikes and of
+/// the crackles aimed down cross it; kept by a corona read a fifth of a row
+/// thick across its height alone (`bolt_girth_narrow`, looks9's review: 70
+/// of 400 strikes, the channel past the bottom edge), strikes light past it.
 #[test]
 fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
     let pane_g = tall_geom();
@@ -6893,7 +7051,6 @@ fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
         ..pane_g
     };
     let ch = g.ch as f32;
-    let half = ch * 0.15;
     let pair = SOLARIZED_PAIR;
     let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
     let pane_cols = pane_g.cols / 2;
@@ -6904,26 +7061,21 @@ fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
         }
     }
     let (bot, right) = (
-        f32::from(g.origin_y) + pane_g.rows as f32 * ch,
-        f32::from(g.origin_x) + (pane_cols * g.cw) as f32,
+        i32::from(g.origin_y) + (pane_g.rows * g.ch) as i32,
+        i32::from(g.origin_x) + (pane_cols * g.cw) as i32,
     );
-    let crosses = |b: &Bolt| {
-        b.pts.as_slice().windows(2).any(|w| {
-            (0..=8).any(|k| {
-                let f = k as f32 / 8.0;
-                let (x, y) = (
-                    w[0].0 + (w[1].0 - w[0].0) * f,
-                    w[0].1 + (w[1].1 - w[0].1) * f,
-                );
-                y + half > bot || x > right
-            })
+    // Whether `glow`'s bolts light past the pane's bottom or right edge.
+    let crosses = |glow: &CursorGlow, born: Instant| {
+        bolt_light(glow, pair, g, born).iter().any(|q| {
+            i32::from(q.y) + i32::from(q.h) > bot || i32::from(q.x) + i32::from(q.w) > right
         })
     };
     let row = (pane_g.rows - 2) as u16;
-    let strikes = |window_edge: bool| {
+    let strikes = |window_edge: bool, narrow: bool| {
         let mut glow = CursorGlow::default();
         glow.observe_frame_text_at(Some((row, 4)), &pane, ((0, 0), pane_cols), Instant::now());
         glow.bolt_window_edge = window_edge;
+        glow.bolt_girth_narrow = narrow;
         let mut out = 0usize;
         for i in 0..400u32 {
             let (r0, r1) = (row + (i % 2) as u16, row + ((i / 2) % 2) as u16);
@@ -6934,7 +7086,7 @@ fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
             glow.rng = i.wrapping_mul(2_654_435_761) | 1;
             glow.spawn_bolt(from, to, ch, true, now);
             glow.keep_strike_in_grid(g, pair.1, (r0, r1), now);
-            out += usize::from(glow.bolts.iter().any(crosses));
+            out += usize::from(crosses(&glow, now));
         }
         out
     };
@@ -6947,27 +7099,33 @@ fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
         for i in 0..72 {
             let (sin_a, cos_a) = (i as f32 * 5f32.to_radians()).sin_cos();
             for len in [1.6f32, 3.0, 4.4] {
+                let born = Instant::now();
                 glow.bolts.clear();
                 glow.spawn_bolt(
                     (x0, y0),
                     (x0 + cos_a * len * ch, y0 + sin_a * len * ch),
                     ch,
                     false,
-                    Instant::now(),
+                    born,
                 );
                 glow.keep_crackle_off_bars(g, pair.1, row, y0);
                 down += usize::from(sin_a > 0.2);
-                out += usize::from(glow.bolts.last().is_some_and(crosses));
+                out += usize::from(crosses(&glow, born));
             }
         }
         (down, out)
     };
-    let kept = strikes(false);
-    assert_eq!(kept, 0, "{kept} of 400 strikes cross the pane's edge");
-    let cut = strikes(true);
+    let kept = strikes(false, false);
+    assert_eq!(kept, 0, "{kept} of 400 strikes light past the pane's edge");
+    let cut = strikes(true, false);
     assert!(
         cut >= 40,
         "control: the pane's edge unread, only {cut} of 400 strikes cross it"
+    );
+    let narrow = strikes(false, true);
+    assert!(
+        narrow > 0,
+        "control: kept by a corona a fifth of a row thick, no strike lights past the pane"
     );
     let (down, kept) = crackles(false);
     assert!(down >= 60, "fixture: {down} crackles aimed down");
@@ -6976,6 +7134,169 @@ fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
     assert!(
         cut * 10 >= down,
         "control: the pane's edge unread, only {cut} of {down} crackles aimed down cross it"
+    );
+}
+
+/// looks9's review: A JUMP'S STRIKE IS KEPT IN ITS PANE ON THE TICK'S PATH.
+/// The keepers' laws were read off the keepers called by hand, so a spawn
+/// path that never ran them passed every test. On the split of
+/// [`a_laser_strike_and_crackle_stay_in_a_split_s_pane`] the caret jumps
+/// 60 times, 400 ms apart, between cells of the pane's last two rows through
+/// [`CursorGlow::tick`], the frame read as the GUI's split hands it: the
+/// jumps forge strikes, and none lights past the pane's edge. Negative
+/// control (`strike_forks_cut`, the keeper on the spawn path run as laid):
+/// a tenth or more of the strikes do.
+#[test]
+fn a_jump_s_strike_is_kept_in_its_pane_on_the_tick_s_path() {
+    let pane_g = tall_geom();
+    let g = Geom {
+        rows: pane_g.rows * 2,
+        win_h: pane_g.win_h * 2,
+        ..pane_g
+    };
+    let pair = SOLARIZED_PAIR;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let pane_cols = pane_g.cols / 2;
+    let mut pane = vec![vec![aterm_core::terminal::RenderCell::default(); pane_cols]; pane_g.rows];
+    for line in &mut pane {
+        for cell in line.iter_mut() {
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
+        }
+    }
+    let (bot, right) = (
+        i32::from(g.origin_y) + (pane_g.rows * g.ch) as i32,
+        i32::from(g.origin_x) + (pane_cols * g.cw) as i32,
+    );
+    let mut c = cfg(GlowStyle::Laser, true);
+    c.intensity = 1.0;
+    c.dark_theme = true;
+    (c.theme_fg, c.theme_bg) = pair;
+    let row = (pane_g.rows - 2) as u16;
+    // `(strikes forged, strikes lit past the pane)`.
+    let jumps = |cut: bool| {
+        let mut glow = CursorGlow {
+            strike_forks_cut: cut,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        let (mut forged, mut past) = (0usize, 0usize);
+        for i in 0..=60u32 {
+            let caret = if i % 2 == 0 {
+                (row + (i / 2 % 2) as u16, 2 + (i % 5) as u16)
+            } else {
+                (row + (i / 4 % 2) as u16, 10 + (i % 11) as u16)
+            };
+            t += Duration::from_millis(400);
+            glow.note_synthetic_move(t);
+            glow.observe_frame_text_at(Some(caret), &pane, ((0, 0), pane_cols), t);
+            out.clear();
+            glow.tick(Some(caret), t, &c, g, &mut out);
+            if i == 0 || !glow.bolts.iter().any(|b| b.born == t && !b.crackle) {
+                continue;
+            }
+            forged += 1;
+            past += usize::from(bolt_light(&glow, pair, g, t).iter().any(|q| {
+                i32::from(q.y) + i32::from(q.h) > bot || i32::from(q.x) + i32::from(q.w) > right
+            }));
+        }
+        (forged, past)
+    };
+    let (forged, past) = jumps(false);
+    assert!(forged >= 40, "fixture: the jumps forge {forged} strikes");
+    assert_eq!(
+        past, 0,
+        "{past} of {forged} strikes light past the pane's edge"
+    );
+    let (old_forged, old_past) = jumps(true);
+    assert!(
+        old_past * 10 >= old_forged,
+        "control: laid as forged, only {old_past} of {old_forged} strikes light past the pane"
+    );
+}
+
+/// looks9's review: A TYPED CRACKLE KEEPS OFF A FILLED ROW ABOVE ON THE
+/// TICK'S PATH. The crackle keeper's law was read off the keeper called by
+/// hand. Laser typed 40 keys 50 ms apart under a filled bar on the row
+/// above, through [`CursorGlow::tick`] with a frame every 16 ms: the typing
+/// throws crackles (2 of them since a crackle springs from its row's edge
+/// into a blank row, looks10 round 2), and no bolt lights the bar. Negative
+/// control (`crackle_unkept`, the keeper not run on the spawn path): bolts
+/// light it.
+#[test]
+fn a_typed_crackle_keeps_off_a_filled_row_above_on_the_tick_s_path() {
+    let g = tall_geom();
+    let (pair, bar) = (SOLARIZED_PAIR, 0x0030_3030u32);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (row, start) = (4u16, 2u16);
+    let mut c = cfg(GlowStyle::Laser, true);
+    c.intensity = 1.0;
+    c.dark_theme = true;
+    (c.theme_fg, c.theme_bg) = pair;
+    let (bar_top, bar_bot) = (
+        i32::from(g.origin_y) + i32::from(row - 1) * g.ch as i32,
+        i32::from(g.origin_y) + i32::from(row) * g.ch as i32,
+    );
+    // `(crackles thrown, frames whose bolts light the bar)`.
+    let burst = |unkept: bool| {
+        let mut glow = CursorGlow {
+            crackle_unkept: unkept,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let t0 = Instant::now();
+        let (mut thrown, mut lit) = (0usize, 0usize);
+        let mut seen: Vec<Instant> = Vec::new();
+        for f in 0..=(40 * 50 / 16 + 30) {
+            let t = t0 + Duration::from_millis(16 * f);
+            let typed = ((16 * f) / 50).min(40) as u16;
+            let mut caret = start + typed;
+            if f > 0 && typed > ((16 * (f - 1)) / 50).min(40) as u16 {
+                text[usize::from(start + typed - 1)] = 'm';
+                glow.note_synthetic_typed(t, 1);
+            } else if typed == 0 {
+                caret = start;
+            }
+            glow.observe_row(row, caret, &text, t);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (r, line) in rows.iter_mut().enumerate() {
+                for cell in line.iter_mut() {
+                    let ground = if r + 1 == usize::from(row) {
+                        bar
+                    } else {
+                        pair.1
+                    };
+                    (cell.fg, cell.bg) = (rgb(pair.0), rgb(ground));
+                }
+            }
+            for (col, &ch) in text.iter().enumerate() {
+                rows[usize::from(row)][col].ch = ch;
+            }
+            glow.observe_frame_text(Some((row, caret)), &rows, t);
+            out.clear();
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            for b in glow.bolts.iter().filter(|b| b.crackle) {
+                if !seen.contains(&b.born) {
+                    seen.push(b.born);
+                }
+            }
+            thrown = seen.len();
+            lit += usize::from(
+                bolt_light(&glow, pair, g, t - Duration::from_millis(16))
+                    .iter()
+                    .any(|q| i32::from(q.y) < bar_bot && i32::from(q.y) + i32::from(q.h) > bar_top),
+            );
+        }
+        (thrown, lit)
+    };
+    let (thrown, lit) = burst(false);
+    assert!(thrown > 0, "fixture: the typing throws no crackle");
+    assert_eq!(lit, 0, "{lit} frames' bolts light the bar above");
+    let (_, old_lit) = burst(true);
+    assert!(
+        old_lit > 0,
+        "control: the keeper not run, no bolt lights the bar"
     );
 }
 

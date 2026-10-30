@@ -373,7 +373,9 @@ impl Access {
                             crate::client::trusted_commons_log(paths, self.trust)
                                 .ok()
                                 .flatten()?;
-                        if self.log_heads_digest == Some(heads_digest) {
+                        if self.log_heads_digest
+                            == Some(commons_log_state_digest(paths, heads_digest))
+                        {
                             return Some(true);
                         }
                         current_from_loaded_log(paths, self.trust, &id, &log, heads_digest)
@@ -446,7 +448,7 @@ impl Access {
                     members: members.clone(),
                     key: SecretBytes::from(key_bytes.as_slice()),
                     log_paths: Some(paths.clone()),
-                    log_heads_digest: Some(heads_digest),
+                    log_heads_digest: self.log_heads_digest,
                     local_recipient: Some(self.local().binding.recipient()),
                 }));
         }
@@ -491,7 +493,7 @@ impl Access {
             members,
             key: SecretBytes::from(key.as_slice()),
             log_paths: Some(paths.clone()),
-            log_heads_digest: Some(heads_digest),
+            log_heads_digest: self.log_heads_digest,
             local_recipient: Some(self.local().binding.recipient()),
         }))
     }
@@ -683,7 +685,9 @@ impl Historical {
                             crate::client::trusted_commons_log(paths, self.trust)
                                 .ok()
                                 .flatten()?;
-                        if self.log_heads_digest == Some(heads_digest) {
+                        if self.log_heads_digest
+                            == Some(commons_log_state_digest(paths, heads_digest))
+                        {
                             return Some(true);
                         }
                         current_from_loaded_log(paths, self.trust, &id, &log, heads_digest)
@@ -709,6 +713,29 @@ impl Historical {
     }
 }
 
+fn commons_log_state_digest(paths: &crate::client::Paths, heads_digest: [u8; 32]) -> [u8; 32] {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(heads_digest);
+    if let Ok(bytes) = std::fs::read(paths.state_file()) {
+        hash.update(&bytes);
+    }
+    for extra in [
+        paths.dir.join("applied.vault"),
+        paths.dir.join("source.toml"),
+    ] {
+        if let Ok(meta) = std::fs::symlink_metadata(&extra) {
+            hash.update(meta.len().to_le_bytes());
+            if let Ok(dur) = meta.modified().and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)
+            }) {
+                hash.update(dur.as_nanos().to_le_bytes());
+            }
+        }
+    }
+    hash.finalize()
+}
+
 /// Observe current Commons membership and network key from the peer-synced membership log (`F18`).
 pub(super) fn current_from_loaded_log(
     paths: &crate::client::Paths,
@@ -723,7 +750,8 @@ pub(super) fn current_from_loaded_log(
         std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
-    let cache_key = (trust, identity.recipient().0, heads_digest);
+    let state_digest = commons_log_state_digest(paths, heads_digest);
+    let cache_key = (trust, identity.recipient().0, state_digest);
     if let Ok(cache) = ACCESS_CACHE.lock()
         && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
     {
@@ -739,9 +767,18 @@ pub(super) fn current_from_loaded_log(
                     local: *local,
                     key: SecretBytes::from(key_bytes.as_slice()),
                     log_paths: Some(paths.clone()),
-                    log_heads_digest: Some(heads_digest),
+                    log_heads_digest: Some(state_digest),
                 },
             ));
+    }
+    if crate::client::local_recipient_denied_in_roster(paths) {
+        if let Ok(mut cache) = ACCESS_CACHE.lock() {
+            if cache.len() >= 16 {
+                cache.pop_front();
+            }
+            cache.push_back((cache_key, None));
+        }
+        return Ok(None);
     }
     let Some(view) = log.commons_epoch_view(identity)? else {
         if let Ok(mut cache) = ACCESS_CACHE.lock() {
@@ -752,19 +789,102 @@ pub(super) fn current_from_loaded_log(
         }
         return Ok(None);
     };
-    let mut members: Vec<Member> = log
-        .membership()
-        .members()
-        .iter()
-        .filter(|(actor, _)| {
-            !log.audience_left_out(&crate::membership_log::EpochAudience::Commons, actor)
-                && !log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
-        })
-        .map(|(_, m)| Member {
-            binding: m.binding.clone(),
+    let roster = crate::client::local_swarm_roster_for_log(paths, log);
+    let membership = log.membership();
+    let mut by_recipient: std::collections::BTreeMap<
+        crate::age::Recipient,
+        Vec<&crate::membership_log::Member>,
+    > = std::collections::BTreeMap::new();
+    for (actor, m) in membership.members() {
+        if *m.binding.network() == trust.network
+            && *m.binding.authority() == trust.authority
+            && !log.recipient_is_removed(&m.binding.recipient())
+            && !log.audience_left_out(&crate::membership_log::EpochAudience::Commons, actor)
+            && !log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+            && !log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Commons,
+                &m.binding.recipient(),
+            )
+            && !log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &m.binding.recipient(),
+            )
+            && !m.node_key.is_some_and(|nk| {
+                nk != [0; 32]
+                    && matches!(
+                        membership.node(&nk),
+                        crate::membership_log::NodeStanding::Removed(_)
+                    )
+            })
+            && !roster
+                .as_ref()
+                .is_some_and(|r| crate::client::member_denied_by_roster(r, m))
+        {
+            by_recipient
+                .entry(m.binding.recipient())
+                .or_default()
+                .push(m);
+        }
+    }
+    let genesis_id = *log.network();
+    let mut chosen_per_recipient: Vec<([u8; 32], bool, Binding)> =
+        Vec::with_capacity(by_recipient.len());
+    for (_, group) in by_recipient {
+        if group.len() == 1 {
+            let m = group[0];
+            chosen_per_recipient.push((m.entry, m.entry == genesis_id, m.binding.clone()));
+            continue;
+        }
+        let earliest_is_genesis = group.iter().any(|m| m.entry == genesis_id);
+        let earliest_entry = group
+            .iter()
+            .map(|m| (m.entry != genesis_id, m.entry))
+            .min()
+            .map(|(_, e)| e)
+            .unwrap_or(genesis_id);
+        let chosen = group
+            .iter()
+            .copied()
+            .filter(|a| {
+                !group.iter().any(|b| {
+                    a.entry != b.entry
+                        && log
+                            .ancestor_chain(&b.entry)
+                            .is_some_and(|chain| chain.iter().any(|r| *r.id() == a.entry))
+                })
+            })
+            .min_by(|a, b| {
+                (a.entry == genesis_id, &a.entry, &a.binding).cmp(&(
+                    b.entry == genesis_id,
+                    &b.entry,
+                    &b.binding,
+                ))
+            })
+            .unwrap_or(group[0]);
+        chosen_per_recipient.push((earliest_entry, earliest_is_genesis, chosen.binding.clone()));
+    }
+    chosen_per_recipient.sort_by(|a, b| (!a.1, &a.0, &a.2).cmp(&(!b.1, &b.0, &b.2)));
+    let (mut actors, mut writers, mut machines) =
+        (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let mut members: Vec<Member> = Vec::with_capacity(chosen_per_recipient.len().min(MAX_MEMBERS));
+    for (_, _, binding) in chosen_per_recipient {
+        if members.len() >= MAX_MEMBERS {
+            break;
+        }
+        if actors.contains(&binding.actor())
+            || writers.contains(binding.writer())
+            || machines.contains(binding.machine())
+        {
+            continue;
+        }
+        actors.insert(binding.actor());
+        writers.insert(*binding.writer());
+        machines.insert(*binding.machine());
+        members.push(Member {
+            binding,
             role: Role::Writer,
-        })
-        .collect();
+        });
+    }
     if members.is_empty() {
         return Ok(None);
     }
@@ -786,6 +906,9 @@ pub(super) fn current_from_loaded_log(
     hash.update(b"ALCO2");
     hash.update(heads_digest);
     hash.update(view.basis);
+    for m in &members {
+        hash.update(m.binding.bytes());
+    }
     let head = hash.finalize();
     if let Ok(mut cache) = ACCESS_CACHE.lock() {
         if cache.len() >= 16 {
@@ -812,7 +935,7 @@ pub(super) fn current_from_loaded_log(
         local,
         key: SecretBytes::from(view.key.as_slice()),
         log_paths: Some(paths.clone()),
-        log_heads_digest: Some(heads_digest),
+        log_heads_digest: Some(state_digest),
     }))
 }
 

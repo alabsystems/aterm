@@ -4,6 +4,8 @@
 use super::*;
 use std::cell::RefCell;
 
+type Release = (u64, u64, u64);
+
 struct FakeSupervisor {
     pid: RefCell<Option<u32>>,
     loads: RefCell<usize>,
@@ -12,6 +14,9 @@ struct FakeSupervisor {
     misplaced: RefCell<Option<String>>,
     renews: RefCell<usize>,
     stop_error: RefCell<Option<&'static str>>,
+    releases: RefCell<std::collections::BTreeMap<PathBuf, Option<Release>>>,
+    release_probes: RefCell<Vec<PathBuf>>,
+    off_on_probe: RefCell<Option<(PathBuf, PathBuf)>>,
 }
 
 impl FakeSupervisor {
@@ -24,6 +29,9 @@ impl FakeSupervisor {
             misplaced: RefCell::new(None),
             renews: RefCell::new(0),
             stop_error: RefCell::new(None),
+            releases: RefCell::new(std::collections::BTreeMap::new()),
+            release_probes: RefCell::new(Vec::new()),
+            off_on_probe: RefCell::new(None),
         }
     }
 }
@@ -39,6 +47,19 @@ impl ServiceSupervisor for FakeSupervisor {
 
     fn running_pid(&self, _home: &Path) -> Result<Option<u32>, String> {
         Ok(*self.pid.borrow())
+    }
+
+    fn program_release(&self, program: &Path) -> Result<Release, String> {
+        self.release_probes.borrow_mut().push(program.to_path_buf());
+        if let Some((home, state)) = self.off_on_probe.borrow_mut().take() {
+            remove_with(&home, &state, true, self).unwrap();
+        }
+        self.releases
+            .borrow()
+            .get(program)
+            .copied()
+            .unwrap_or(Some(required_node_release().unwrap()))
+            .ok_or_else(|| "program did not identify as aterm".to_owned())
     }
 
     fn load_and_start(&self, _unit_path: &Path) -> Result<(), String> {
@@ -712,4 +733,212 @@ fn sync_node_rewrites_a_unit_an_earlier_build_wrote() {
         read_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap(),
         SyncNodeState::Current(_)
     ));
+}
+
+/// A newer helper's fallback path is not evidence that the fallback executable is newer.
+#[test]
+fn sync_node_measures_both_programs_before_moving_the_service() {
+    for (offered, moves) in [
+        (Some((0, 91, 0)), false),
+        (None, false),
+        (Some((0, 147, 0)), true),
+    ] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let current = tmp.path().join("active-app");
+        let fallback = tmp.path().join("Applications-app");
+        std::fs::write(&current, b"current").unwrap();
+        std::fs::write(&fallback, b"fallback").unwrap();
+        aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+        use std::io::Write as _;
+        aterm_uds::private_file::open_private_rw(&state, aterm_net::fleet::KEY_FILE)
+            .unwrap()
+            .write_all(b"0123456789abcdef0123456789abcdef01234567\n")
+            .unwrap();
+        let sup = FakeSupervisor::new(None);
+        install_with(&current, &home, &state, false, &sup).unwrap();
+        sup.releases
+            .borrow_mut()
+            .insert(current.clone(), Some((0, 146, 0)));
+        sup.releases.borrow_mut().insert(fallback.clone(), offered);
+
+        let read = read_for_sync_with(&home, &state, None, Some(&fallback), false, &sup).unwrap();
+        assert_eq!(
+            matches!(read, SyncNodeState::Due { .. }),
+            moves,
+            "{offered:?}: {read:?}"
+        );
+        ensure_for_sync_with(&home, &state, None, Some(&fallback), false, &sup).unwrap();
+        let expected = if moves { &fallback } else { &current };
+        assert!(matches!(
+            state_with(&home, &sup).unwrap(),
+            NodeJobState::Installed { program: Some(kept), .. } if &kept == expected
+        ));
+        assert_eq!(*sup.loads.borrow(), if moves { 2 } else { 1 });
+
+        if !moves {
+            // Preserving the active path must still repair its replaced image without
+            // restarting the obsolete fallback or declaring an unrepaired job current.
+            sup.replaced.set(true);
+            ensure_for_sync_with(&home, &state, None, Some(&fallback), false, &sup).unwrap();
+            assert_eq!((*sup.renews.borrow(), *sup.loads.borrow()), (1, 1));
+        }
+    }
+}
+
+#[test]
+fn sync_node_gates_off_and_missing_membership_before_program_probes() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    let current = tmp.path().join("active-app");
+    let fallback = tmp.path().join("Applications-app");
+    let sup = FakeSupervisor::new(None);
+    install_with(&current, &home, &state, false, &sup).unwrap();
+    assert!(matches!(
+        read_for_sync_with(&home, &state, None, Some(&fallback), false, &sup).unwrap(),
+        SyncNodeState::NotApplicable(_)
+    ));
+    std::fs::write(off_path(&state), b"off\n").unwrap();
+    assert!(matches!(
+        read_for_sync_with(&home, &state, None, Some(&fallback), false, &sup).unwrap(),
+        SyncNodeState::NotApplicable(_)
+    ));
+    assert!(sup.release_probes.borrow().is_empty());
+    assert_eq!(*sup.loads.borrow(), 1);
+}
+
+#[test]
+fn sync_node_keeps_an_unknown_running_program_but_repairs_a_missing_one() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let current = tmp.path().join("active-app");
+    let proposed = tmp.path().join("Applications-app");
+    std::fs::write(&current, b"current").unwrap();
+    let state = NodeJobState::Installed {
+        pid: Some(123),
+        unit: tmp.path().join("node.plist"),
+        program: Some(current.clone()),
+    };
+    let sup = FakeSupervisor::new(Some(123));
+    sup.releases.borrow_mut().insert(current.clone(), None);
+    assert!(
+        sync_program(&proposed, &state, &sup)
+            .unwrap_err()
+            .contains("release is unknown")
+    );
+    std::fs::remove_file(&current).unwrap();
+    assert_eq!(sync_program(&proposed, &state, &sup).unwrap(), proposed);
+}
+
+#[test]
+fn off_during_version_probe_is_rechecked_before_applying_a_node_upgrade() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    let current = tmp.path().join("active-app");
+    let proposed = tmp.path().join("new-app");
+    std::fs::write(&current, b"current").unwrap();
+    let sup = FakeSupervisor::new(None);
+    install_with(&current, &home, &state, false, &sup).unwrap();
+    use std::io::Write as _;
+    aterm_uds::private_file::open_private_rw(&state, aterm_net::fleet::KEY_FILE)
+        .unwrap()
+        .write_all(b"0123456789abcdef0123456789abcdef01234567\n")
+        .unwrap();
+    sup.releases.borrow_mut().insert(current, Some((0, 146, 0)));
+    *sup.off_on_probe.borrow_mut() = Some((home.clone(), state.clone()));
+    let said = ensure_for_sync_with(&home, &state, None, Some(&proposed), false, &sup).unwrap();
+    assert!(said.contains("off on this Mac"), "{said}");
+    assert_eq!((*sup.loads.borrow(), *sup.unloads.borrow()), (1, 1));
+    assert!(node_turned_off(&state));
+    assert_eq!(state_with(&home, &sup).unwrap(), NodeJobState::Absent);
+}
+
+#[cfg(unix)]
+#[test]
+fn node_off_serializes_with_an_in_progress_service_change() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    let unit = FileOnlySupervisor.unit_file(&home);
+    install_with(
+        &tmp.path().join("aterm"),
+        &home,
+        &state,
+        false,
+        &FileOnlySupervisor,
+    )
+    .unwrap();
+    let guard = node_admin_lock(&state).unwrap();
+    let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+    let other_home = home.clone();
+    let other_state = state.clone();
+    let worker = std::thread::spawn(move || {
+        NODE_ADMIN_WAITER.with(|waiter| *waiter.borrow_mut() = Some(wait_tx));
+        remove_with(&other_home, &other_state, true, &FileOnlySupervisor)
+    });
+    wait_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    assert!(!node_turned_off(&state));
+    assert!(unit.is_file());
+    drop(guard);
+    assert!(worker.join().unwrap().unwrap().is_some());
+    assert!(node_turned_off(&state));
+    assert!(!unit.exists());
+}
+
+#[test]
+fn fresh_node_requires_a_verified_compatible_destination_before_mutation() {
+    for has_unit in [false, true] {
+        for release in [
+            None,
+            Some((0, 91, 0)),
+            Some(required_node_release().unwrap()),
+        ] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let state = tmp.path().join("state");
+            let proposed = tmp.path().join("Applications-app");
+            aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+            use std::io::Write as _;
+            aterm_uds::private_file::open_private_rw(&state, aterm_net::fleet::KEY_FILE)
+                .unwrap()
+                .write_all(b"0123456789abcdef0123456789abcdef01234567\n")
+                .unwrap();
+            let sup = FakeSupervisor::new(None);
+            sup.releases.borrow_mut().insert(proposed.clone(), release);
+            let unit = sup.unit_file(&home);
+            if has_unit {
+                std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+                std::fs::write(&unit, "unreadable program\n").unwrap();
+            }
+            let before = std::fs::read(&unit).ok();
+            let result = ensure_for_sync_with(&home, &state, None, Some(&proposed), false, &sup);
+            if release == Some(required_node_release().unwrap()) {
+                assert!(result.is_ok(), "{has_unit} {release:?}: {result:?}");
+                assert_eq!(*sup.loads.borrow(), 1);
+            } else {
+                assert!(result.is_err(), "{has_unit} {release:?}: {result:?}");
+                assert_eq!(*sup.loads.borrow(), 0);
+                assert_eq!(std::fs::read(&unit).ok(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unknown_running_node_path_cannot_be_replaced_as_a_fresh_install() {
+    let sup = FakeSupervisor::new(Some(123));
+    let state = NodeJobState::Installed {
+        pid: Some(123),
+        unit: PathBuf::from("node.plist"),
+        program: None,
+    };
+    assert!(
+        sync_program(Path::new("candidate"), &state, &sup)
+            .unwrap_err()
+            .contains("running node program is unknown")
+    );
+    assert!(sup.release_probes.borrow().is_empty());
+    assert_eq!(*sup.loads.borrow(), 0);
 }

@@ -640,7 +640,10 @@ fn reset_at_once() -> (String, String) {
 
 /// `aterm <args>` run as a program on `inst`'s machine would run it: its HOME, config and
 /// runtime dirs, nothing of the test's `ATERM_*`; its exit code and both outputs, within the
-/// hang detector.
+/// hang detector. A `ctl survey`'s probe of each instance and a `fabric brief`'s read of the
+/// bus, which serve, wait half that ([`aterm_ctl::PROBE_WITHIN_SEAM`],
+/// [`harness::FABRIC_IO_WAIT`]), not their 2 s and 3 s, so one that never answers is reported
+/// before the run is killed.
 fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
     let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
     for (name, _) in std::env::vars_os() {
@@ -649,6 +652,14 @@ fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
         }
     }
     cmd.args(args)
+        .env(
+            aterm_ctl::PROBE_WITHIN_SEAM,
+            (DEADLINE / 2).as_millis().to_string(),
+        )
+        .env(
+            harness::FABRIC_IO_WAIT.0,
+            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
+        )
         .env("HOME", inst.root.join("home"))
         .env("XDG_CONFIG_HOME", inst.root.join("cfg"))
         .env("XDG_RUNTIME_DIR", inst.root.join("run"))

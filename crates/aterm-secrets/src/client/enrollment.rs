@@ -47,7 +47,9 @@ pub(super) fn include_approved(
             .into_iter()
             .find(|m| &m.recipient == recipient)
             .ok_or_else(|| Error::new("approved Commons recipient is not in the vault"))?;
-        if !hosts.contains(&machine.name) {
+        if !machine_denied_in_doc(doc, &machine.name, &machine.recipient)
+            && !hosts.contains(&machine.name)
+        {
             hosts.push(machine.name);
         }
     }
@@ -105,6 +107,9 @@ impl Admin {
             .ok_or_else(|| Error::new("Commons enrollment recipient is not admitted"))?
             .name
             .clone();
+        if self.is_denied_in_published_roster(&host, &binding.recipient()) {
+            return Err(Error::new("Commons enrollment recipient is not admitted"));
+        }
         crate::commons::membership::check_candidate(
             &self.commons_seed,
             journal,
@@ -140,6 +145,10 @@ impl Admin {
         access.check_addition(binding, Role::Writer)?;
         let grants = self.kept(&access, |_| false)?;
         Ok(Candidate::New { host, grants })
+    }
+
+    fn is_denied_in_published_roster(&self, host: &str, recipient: &Recipient) -> bool {
+        machine_denied_in_doc(&self.published_doc, host, &recipient.to_bech32())
     }
 
     /// The current members a roster write keeps, as recorded grants: all but those `leaving`,
@@ -251,6 +260,7 @@ impl Admin {
             if !self
                 .commons_eligibility
                 .includes(&machine.name, binding.recipient())
+                || self.is_denied_in_published_roster(&machine.name, &binding.recipient())
                 || grants.len() == MAX_MEMBERS
             {
                 continue;
@@ -340,6 +350,26 @@ impl Admin {
     }
 }
 
+pub(super) fn machine_denied_in_doc(doc: &Document, host: &str, recipient_str: &str) -> bool {
+    let Some(roster) = crate::swarm_roster::SwarmRoster::from_document(doc)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let rec_trimmed = recipient_str.trim();
+    roster.is_label_denied(host)
+        || roster
+            .members
+            .iter()
+            .filter(|m| {
+                m.recipient.trim() == rec_trimmed
+                    || m.label.eq_ignore_ascii_case(host)
+                    || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(host))
+            })
+            .any(|m| steward::member_is_denied_in_roster(&roster, m))
+}
+
 /// Open the exact locally applied admin snapshot without contacting a server,
 /// repairing materialized files, or creating an identity. LAN enrollment must
 /// remain available while the compatibility vault server is offline.
@@ -353,6 +383,10 @@ pub(super) fn admin_cached_until(paths: &Paths, deadline: Instant) -> crate::Res
 
 fn admin_cached_with_lock(paths: &Paths, lock: Option<StateLock>) -> crate::Result<Admin> {
     let _lock = lock.ok_or_else(|| Error::new("vault state is changing; retry enrollment"))?;
+    admin_cached_unlocked(paths)
+}
+
+pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
     let config = config(paths)?.ok_or_else(|| Error::new("no cached vault configured"))?;
     let pin = config
         .signer

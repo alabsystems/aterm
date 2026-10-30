@@ -201,6 +201,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
+/// Append `bytes` to the regular file at `path` (never through a symlink) while it is still
+/// `len` bytes long, and make them durable ([`aterm_durable::durable_data`]). A file of another
+/// length is left as it is: its writer was not the one that last read or wrote it.
+///
+/// # Errors
+/// The file is missing, not `len` bytes long, or the open, write or flush fails. A write cut
+/// short leaves part of `bytes` on the end of the file; its writer replaces the file whole then.
+pub fn append_at(path: &Path, len: u64, bytes: &[u8]) -> crate::Result<()> {
+    let appended = OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|mut file| {
+            let metadata = file.metadata()?;
+            if !metadata.file_type().is_file() || metadata.len() != len {
+                return Err(io::Error::other("not the file this writer last left"));
+            }
+            file.write_all(bytes)?;
+            aterm_durable::durable_data(&file)
+        });
+    appended.map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
 /// [`write_atomic`] for one of many files a pass writes: the temporary file's bytes ordered
 /// before its rename ([`aterm_durable::ordered`]) and no flush of the directory, which the
 /// pass flushes once for all its files, so `path` holds `bytes` or what it held, never a part.

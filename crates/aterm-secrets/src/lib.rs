@@ -62,6 +62,7 @@ pub mod discover;
 pub mod fsx;
 #[cfg(unix)]
 pub mod heard;
+pub mod keychain_tools;
 #[cfg(unix)]
 pub mod materialize;
 #[cfg(unix)]
@@ -70,6 +71,10 @@ pub mod members;
 pub mod need;
 #[cfg(unix)]
 pub mod network;
+#[cfg(unix)]
+pub mod release_keychain;
+#[cfg(unix)]
+pub mod release_ring;
 #[cfg(unix)]
 pub mod server;
 #[cfg(unix)]

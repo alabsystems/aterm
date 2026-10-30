@@ -113,6 +113,11 @@ pub struct CursorStep<'a> {
     /// row may stop at its last glyph), which bound the pane a Laser strike
     /// keeps inside; `0` when not known.
     pub frame_cells_cols: usize,
+    /// The combining marks of `frame_cells` (`RenderInput::combining`: per
+    /// row, sparse `(col, marks)`; empty when not known): a marked cell's
+    /// accent stands over its letter's x-height
+    /// ([`crate::cursor_glow::CursorGlow::observe_frame_text_marked`]).
+    pub frame_marks: &'a [crate::cursor_glow::RowMarks],
     /// Keystrokes the host batched since its last step, replayed at this frame's instant after the
     /// history fence (a page's straggler keys; a native window notes each key at its press and
     /// passes `0`).
@@ -141,6 +146,7 @@ impl<'a> CursorStep<'a> {
             frame_cells: None,
             frame_cells_at: (0, 0),
             frame_cells_cols: 0,
+            frame_marks: &[],
             pending_keys: 0,
             print_anchor: None,
             print_anchor_glyph: None,
@@ -180,6 +186,16 @@ impl<'a> CursorStep<'a> {
     #[must_use]
     pub const fn with_frame_cells_cols(mut self, frame_cells_cols: usize) -> Self {
         self.frame_cells_cols = frame_cells_cols;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_frame_marks(
+        mut self,
+        frame_marks: &'a [crate::cursor_glow::RowMarks],
+    ) -> Self {
+        self.frame_marks = frame_marks;
         self
     }
 
@@ -1544,10 +1560,24 @@ impl EffectsPipeline {
     /// word pass's ink), and to its free sprites ([`CursorGlow::yield_glass`]). Every host's word
     /// publish runs it ([`Self::publish_words`]), the composed frame's and the captures' too,
     /// before the word icons' shade, which recuts the stream's lights into pieces the yield
-    /// could no longer name as the glass. A frame with no glass is left as it is, and only a
-    /// step's first publish cuts its glass: a later one before the next step is left as it is.
+    /// could no longer name as the glass. A frame with no glass is left as it is, and so is the
+    /// stream the step's cut already left; a copy of the step's uncut glass (a retained
+    /// projection's) is cut again.
     #[inline]
     pub fn yield_glass(&mut self, input: &mut RenderInput) {
+        self.yield_glass_over(input, true);
+    }
+
+    /// The yield on a frame no word pass ran over (the heterogeneous route, which projects the
+    /// trail beside a native view and publishes no words): [`Self::yield_glass`] with no free
+    /// sprites, the frame's cells its only words.
+    #[inline]
+    pub fn yield_glass_unworded(&mut self, input: &mut RenderInput) {
+        self.yield_glass_over(input, false);
+    }
+
+    /// [`Self::yield_glass`], with the word pass's sprites when `worded`.
+    fn yield_glass_over(&mut self, input: &mut RenderInput, worded: bool) {
         let Some((at, _)) = self.frame_light else {
             return;
         };
@@ -1559,7 +1589,8 @@ impl EffectsPipeline {
         {
             return;
         }
-        let _ = self.cursor.glow.yield_glass(input, &self.free_scratch, at);
+        let sprites: &[FreeSprite] = if worded { &self.free_scratch } else { &[] };
+        let _ = self.cursor.glow.yield_glass(input, sprites, at);
     }
 
     /// The page veil under the letters the pet lies beneath, by the body its
@@ -1954,9 +1985,9 @@ pub(super) fn step_cursor_family(
         .observe_print_anchor_glyph(step.print_anchor, step.print_anchor_glyph);
     cursor.glow.observe_caret_drawn(step.caret_drawn);
     if let Some(cells) = step.frame_cells {
-        cursor.glow.observe_frame_text_at(
+        cursor.glow.observe_frame_text_marked(
             step.input.cur,
-            cells,
+            (cells, step.frame_marks),
             (step.frame_cells_at, step.frame_cells_cols),
             now,
         );
@@ -2387,6 +2418,7 @@ mod constructor_tests {
             frame_cells,
             frame_cells_at,
             frame_cells_cols,
+            frame_marks,
             pending_keys,
             print_anchor,
             print_anchor_glyph,
@@ -2394,12 +2426,14 @@ mod constructor_tests {
         } = s;
         format!(
             "{:?} {:?} {:p} {trail:?} {animate} {row_probe:?} {:?} {frame_cells_at:?} \
-             {frame_cells_cols} {pending_keys} {print_anchor:?} {print_anchor_glyph:?} \
+             {frame_cells_cols} {:p} {} {pending_keys} {print_anchor:?} {print_anchor_glyph:?} \
              {caret_drawn}",
             input.now,
             input.cur,
             *glow,
             frame_cells.map(<[Vec<RenderCell>]>::as_ptr),
+            frame_marks.as_ptr(),
+            frame_marks.len(),
         )
     }
 
@@ -2465,6 +2499,7 @@ mod constructor_tests {
             frame_cells: None,
             frame_cells_at: (0, 0),
             frame_cells_cols: 0,
+            frame_marks: &[],
             pending_keys: 0,
             print_anchor: None,
             print_anchor_glyph: None,
@@ -2483,6 +2518,7 @@ mod constructor_tests {
             cols: &row,
             flanks: Some((None, Some(&row))),
         };
+        let marks: Vec<crate::cursor_glow::RowMarks> = vec![vec![(1, Box::from(['\u{301}']))]];
         let every = CursorStep {
             input: fx_input(now),
             glow: &glow,
@@ -2492,6 +2528,7 @@ mod constructor_tests {
             frame_cells: Some(&cells),
             frame_cells_at: (4, 5),
             frame_cells_cols: 2,
+            frame_marks: &marks,
             pending_keys: 3,
             print_anchor: Some((2, 1, 9)),
             print_anchor_glyph: Some('b'),
@@ -2503,6 +2540,7 @@ mod constructor_tests {
             .with_frame_cells(Some(&cells))
             .with_frame_cells_at((4, 5))
             .with_frame_cells_cols(2)
+            .with_frame_marks(&marks)
             .with_pending_keys(3)
             .with_print_anchor(Some((2, 1, 9)))
             .with_print_anchor_glyph(Some('b'))
@@ -2861,28 +2899,20 @@ mod constructor_tests {
         }
     }
 
-    /// The yield cuts a step's glass once (§15.2 1.9): the first word publish after a glass step
-    /// cuts the glass off an app's red words, and a second publish before the next step (a
-    /// capture's) leaves the input it is handed as it came, even a copy of the uncut stream the
-    /// step's record still names; the next step's first publish cuts its own glass. The
-    /// negative control is each step's first publish, which cuts.
-    #[test]
-    fn a_step_s_glass_yields_once() {
-        const RED: [u8; 3] = [0xC4, 0x26, 0x2E];
-        let glow = GlowConfig {
+    /// The glass on Default Light at the glass level, light latched.
+    fn glass_glow() -> GlowConfig {
+        GlowConfig {
             light: Light::at(Live::Glass),
             dark_theme: false,
             theme_fg: 0x002B_2D33,
             theme_bg: 0x00F6_F7F9,
             ..GlowConfig::default()
-        };
-        let step = |fx: &mut EffectsPipeline, t: Instant, col: u16| {
-            fx.cursor_mut().glow.note_synthetic_typed(t, 1);
-            let mut input = fx_input(t);
-            input.cur = Some((2, col));
-            input.default_bg = glow.theme_bg;
-            let _ = fx.cursor_step(&CursorStep::new(input, &glow, TRAIL), std::iter::empty());
-        };
+        }
+    }
+
+    /// A frame of an app's red words on `glow`'s page: rows 1-3, columns 0-19, a blank every
+    /// fifth cell.
+    fn red_words(glow: &GlowConfig) -> RenderInput {
         let page = RenderCell {
             fg: [0x2B, 0x2D, 0x33],
             bg: [0xF6, 0xF7, 0xF9],
@@ -2897,14 +2927,36 @@ mod constructor_tests {
         for row in 1..4 {
             for (col, cell) in words.cells[row].iter_mut().enumerate().take(20) {
                 cell.ch = if col % 5 == 4 { ' ' } else { 'w' };
-                cell.fg = RED;
+                cell.fg = [0xC4, 0x26, 0x2E];
             }
         }
+        words
+    }
+
+    /// One typed step at `t` under `glow`, the caret at row 2, column `col`.
+    fn typed_step(fx: &mut EffectsPipeline, glow: &GlowConfig, t: Instant, col: u16) {
+        fx.cursor_mut().glow.note_synthetic_typed(t, 1);
+        let mut input = fx_input(t);
+        input.cur = Some((2, col));
+        input.default_bg = glow.theme_bg;
+        let _ = fx.cursor_step(&CursorStep::new(input, glow, TRAIL), std::iter::empty());
+    }
+
+    /// The yield cuts each stream of a step's glass once (§15.2 1.9): the first word publish
+    /// after a glass step cuts the glass off an app's red words; a second publish of the frame it
+    /// left (a host's second word pass) leaves it as it is; a copy of the step's uncut stream
+    /// published again (a retained projection's, a windowed capture's) is cut as the frame's own
+    /// was; the next step's first publish cuts its own glass. The negative control is each
+    /// step's first publish, which cuts.
+    #[test]
+    fn a_step_s_glass_yields_once_per_stream() {
+        let glow = glass_glow();
+        let words = red_words(&glow);
         let mut fx = EffectsPipeline::for_window();
         let mut t = Instant::now();
         for col in 3..12u16 {
             t += Duration::from_millis(60);
-            step(&mut fx, t, col);
+            typed_step(&mut fx, &glow, t, col);
         }
         let mut frame = words.clone();
         fx.publish_cursor(&mut frame);
@@ -2914,15 +2966,21 @@ mod constructor_tests {
             fx.cursor().glow.yielded_at(t).is_some() && frame.glow_under != uncut.glow_under,
             "control: the step's first publish cuts its glass"
         );
-        let mut again = uncut.clone();
+        let mut again = frame.clone();
         fx.publish_words(&mut again);
         assert!(
-            again.glow_under == uncut.glow_under
-                && again.glow_under_ramps == uncut.glow_under_ramps,
-            "a second publish of the step's glass cuts nothing"
+            again.glow_under == frame.glow_under
+                && again.glow_under_ramps == frame.glow_under_ramps,
+            "a second publish of the cut frame cuts nothing more"
+        );
+        let mut copy = uncut.clone();
+        fx.publish_words(&mut copy);
+        assert!(
+            copy.glow_under == frame.glow_under && copy.glow_under_ramps == frame.glow_under_ramps,
+            "a copy of the step's uncut glass yields as the frame's own did"
         );
         t += Duration::from_millis(60);
-        step(&mut fx, t, 12);
+        typed_step(&mut fx, &glow, t, 12);
         let mut next = words.clone();
         fx.publish_cursor(&mut next);
         let next_uncut = next.clone();
@@ -2930,6 +2988,49 @@ mod constructor_tests {
         assert!(
             fx.cursor().glow.yielded_at(t).is_some() && next.glow_under != next_uncut.glow_under,
             "control: the next step's first publish cuts its own glass"
+        );
+    }
+
+    /// The yield's state goes with the light (§10.1, §15.2 1.9): a glass step on Default Light
+    /// whose publish cut an app's red words holds the cut's report, the step it spent, the caps
+    /// it solved and its glass's record (the negative control); the first step on a dark page
+    /// after it holds none of them.
+    #[test]
+    fn the_yield_s_state_goes_with_the_light() {
+        let glow = glass_glow();
+        let mut fx = EffectsPipeline::for_window();
+        let mut t = Instant::now();
+        for col in 3..12u16 {
+            t += Duration::from_millis(60);
+            typed_step(&mut fx, &glow, t, col);
+        }
+        let mut frame = red_words(&glow);
+        fx.publish_cursor(&mut frame);
+        fx.publish_words(&mut frame);
+        let held = |fx: &EffectsPipeline| {
+            let glow = &fx.cursor().glow;
+            (
+                glow.last_yield().map(|(at, _)| at),
+                glow.yield_held(),
+                glow.glass_laid().is_empty(),
+            )
+        };
+        let (yielded, (spent, memo), unlaid) = held(&fx);
+        assert!(
+            yielded == Some(t) && spent == Some(t) && memo > 0 && !unlaid,
+            "control: the light step holds its yield: {:?}",
+            held(&fx)
+        );
+        t += Duration::from_millis(60);
+        let dark = GlowConfig::default();
+        fx.cursor_mut().glow.note_synthetic_typed(t, 1);
+        let mut input = fx_input(t);
+        input.cur = Some((2, 12));
+        let _ = fx.cursor_step(&CursorStep::new(input, &dark, TRAIL), std::iter::empty());
+        assert_eq!(
+            held(&fx),
+            (None, (None, 0), true),
+            "the first dark step forgets the yield"
         );
     }
 

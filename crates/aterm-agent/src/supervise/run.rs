@@ -4020,7 +4020,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                     {
                         self.unstick_woken_turn(&screen, reader, opts, review)?;
                     }
-                    if self.wall_memory.is_none() && !self.turn_end.compacting() && !signing_in {
+                    // The agent working ends what it was told for, but a refused go-ahead
+                    // stands through the breaks of its own background work, where it is told.
+                    let at_break = reader.background_wait(&screen.rows).is_some();
+                    if self.wall_memory.is_none()
+                        && !self.turn_end.compacting()
+                        && !signing_in
+                        && self
+                            .exception_open
+                            .as_ref()
+                            .is_none_or(|(open, _)| open.ends_at_work(at_break))
+                    {
                         self.exception_ended(screen.seq, Some("the agent working"), review);
                     }
                     if self.box_ask.is_some() && !writing {
@@ -6626,7 +6636,18 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         let mut line_gone = None;
-        if let Some((line, kind)) = host.at_background() {
+        // A tape a build without the guarded door recorded replays the door it had.
+        let stepped = if self.fx.replay_lacks_host_door("host.at_background_on") {
+            host.at_background()
+        } else {
+            // A manager's wait the loop has not read yet (its first fold not reached since it
+            // started) is read now, as a line's write reads it; a read that says nothing holds.
+            let unread = self.managed_at_write()?;
+            let mut point = self.break_point(self.fx.mono(), cfg, &screen.rows);
+            point.held = point.held.or(unread);
+            host.at_background_on(point)
+        };
+        if let Some((line, kind)) = stepped {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
             self.host_turn(kind, screen.seq);
             self.hold_line(screen.seq, cfg, review);

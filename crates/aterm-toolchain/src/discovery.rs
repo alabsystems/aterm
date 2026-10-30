@@ -374,6 +374,7 @@ fn commit_date(bin: &Path) -> Option<String> {
 fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
     use std::io::Read as _;
     use std::process::Stdio;
+    const MAX_STDOUT: u64 = 64 << 10;
     #[expect(
         clippy::disallowed_types,
         reason = "a std-only probe: this crate takes no dependency, so it cannot reach aterm-uds"
@@ -385,6 +386,19 @@ fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<Stri
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let pipe = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let read = pipe
+            .take(MAX_STDOUT.saturating_add(1))
+            .read_to_end(&mut buf);
+        let _ = tx.send(
+            read.ok()
+                .filter(|_| (buf.len() as u64) <= MAX_STDOUT)
+                .and_then(|_| String::from_utf8(buf).ok()),
+        );
+    });
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -399,8 +413,11 @@ fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<Stri
             }
         }
     };
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let rem = bound
+        .saturating_sub(started.elapsed())
+        .max(Duration::from_millis(10));
+    let out = rx.recv_timeout(rem).ok().flatten()?;
+    let _ = reader.join();
     status.success().then_some(out)
 }
 
@@ -1670,5 +1687,29 @@ mod tests {
             "fail-closed: a directory is not the verified driver"
         );
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_stdout_drains_large_output_without_pipe_deadlock_and_rejects_oversize() {
+        let sh = Path::new("/bin/sh");
+        let exact = bounded_stdout(
+            sh,
+            &[
+                "-c",
+                "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\\0' x",
+            ],
+            Duration::from_secs(5),
+        );
+        assert_eq!(exact.as_ref().map(String::len), Some(64 << 10));
+        let over = bounded_stdout(
+            sh,
+            &[
+                "-c",
+                "dd if=/dev/zero bs=1024 count=65 2>/dev/null | tr '\\0' x",
+            ],
+            Duration::from_secs(5),
+        );
+        assert_eq!(over, None);
     }
 }

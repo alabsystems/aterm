@@ -1326,7 +1326,15 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The session's Autopilot as the loop last read it.
     pub(super) fn autopilot(&self, opts: &SuperviseOpts) -> Autopilot {
-        opts.policy.autopilot_for(self.autopilot.word)
+        self.autopilot_under(&opts.policy)
+    }
+
+    /// [`Self::autopilot`] under the policy `cfg`.
+    pub(super) fn autopilot_under(
+        &self,
+        cfg: &super::super::config::SupervisorConfig,
+    ) -> Autopilot {
+        cfg.autopilot_for(self.autopilot.word)
     }
 
     /// [`Self::autopilot`] for a decision about to act.

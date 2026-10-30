@@ -1798,7 +1798,7 @@ fn stamp_with(
     move |manifest, dir, nonce| {
         let results =
             crate::handoff_history::HistoryPlan::Deferred(vec![(0, Arc::clone(&term))].into())
-                .results(dir);
+                .results_for_test(dir);
         let verdicts = crate::handoff_history::stamp_manifest(
             manifest,
             &screens,

@@ -353,13 +353,24 @@ fn full(logs: &[(Source, Log)], epoch: u64, actor: Actor, caps: Caps) -> bool {
 }
 
 /// The day table a row that lapses at `until` goes into, by the clock `now` and this Mac's ring
-/// `state`: the current day's, this writer's own latest day's (`own`) where later, and never
-/// earlier than the day before the one `until` falls in, so `until < (epoch + 2) · EPOCH_S` and the
-/// row has lapsed on any clock that deletes its table. A full table spills into the next day's
-/// while that lies in the window.
+/// `state`: the current day's, this writer's own latest day's (`own`) where later, never below the
+/// floor, so never a table this Mac deleted (`RingState::outdated`), and never earlier than the
+/// day before the one `until` falls in, so `until < (epoch + 2) · EPOCH_S` and the row has lapsed
+/// on any clock that deletes its table. A full table spills into the next day's while that lies
+/// in the window.
+///
+/// No row is written while the clock is behind the floor. Such a clock either ran ahead and came
+/// back or is set back, and no Mac can tell which: set back, its window (the clock's,
+/// `RingState::current`) leaves out the day after the floor, its peers' today, where its own
+/// latest row and its peers' current claims can sit, so a row written at the floor would be
+/// claimed on a view without them and outranked by its own later one. Once the clock reaches the
+/// floor, the window reaches every table that holds a row of this Mac's: each write raises the
+/// floor to the day before the current one first and goes at most a day past the current one, so
+/// no row lies more than two days past the floor.
 ///
 /// # Errors
-/// The row lapses beyond the window's last day, or both its tables are full.
+/// The clock is behind the floor, the row lapses beyond the window's last day, or both its tables
+/// are full.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -378,8 +389,14 @@ pub(crate) fn target(
     let last = *state.window(&CLAIMS, now).end();
     let epoch = state
         .current(&CLAIMS, now)
+        .max(state.floor)
         .max(own.unwrap_or(0))
         .max(CLAIMS.epoch_of(until).saturating_sub(1));
+    if CLAIMS.epoch_of(now) < state.floor {
+        return Err(Error::new(
+            "this Mac's clock is behind the claims tables it took up; claims resume when it reaches them",
+        ));
+    }
     if epoch > last {
         return Err(Error::new(
             "claim row lapses beyond the claims tables' window",
@@ -572,8 +589,10 @@ fn counter(body: &Value) -> Result<u64> {
         .ok_or_else(|| Error::new("claim row needs a positive counter"))
 }
 
-/// The clock the claims ring runs on moves forward a step (`Tick`) or is set back (`ClockBack`):
-/// neither is code here; each path that reads the clock places the window by `RingState::current`.
+/// The clock the claims ring runs on moves forward a step (`Tick`), is set back no further than
+/// the floor (`ClockBack`), or is set back below it, as a clock that ran ahead and came back
+/// (`ClockCorrected`): none is code here; each path that reads the clock places the window by
+/// `RingState::current`.
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -589,6 +608,14 @@ fn counter(body: &Value) -> Result<u64> {
         machine = "DbClaimRing",
         action = "ClockBack",
         reason = "A clock set back is the environment: no code chooses it. claim_ring_conforms sets the clock it hands RingState::current, target and the retirement back a day where the model does."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbClaimRing",
+        action = "ClockCorrected",
+        reason = "A clock that comes back from running ahead is the environment: no code chooses it. claim_ring_conforms sets the clock it hands RingState::current, target and the retirement back a day below the floor where the model does."
     )
 )]
 #[doc(hidden)]

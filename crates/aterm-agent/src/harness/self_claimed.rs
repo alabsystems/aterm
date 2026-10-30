@@ -729,10 +729,14 @@ impl Witnesses {
                 let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
             }
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut open = std::fs::OpenOptions::new();
+        open.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = open.open(&self.path)?;
         writeln!(file, "{}", Self::line(pid, start))
     }
 }

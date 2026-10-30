@@ -40,6 +40,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         opens_cut: false,
         turn_said: None,
         opened_by: None,
+        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -1084,4 +1085,29 @@ fn an_outage_walls_same_answers_raise_nothing_however_long_it_stands() {
     };
     let (_, told) = point(&mut st, &left, &cfg(), now + MIN);
     assert_eq!(told, None, "its notice left the screen");
+}
+
+/// A REFUSED GO-AHEAD STANDS THROUGH THE AGENT'S BACKGROUND BREAKS (2026-10-29 review 2): the
+/// agent working ends every exception it was told for, but the refusal of the standing go-ahead
+/// is told at a break of its own background work, where nothing is typed, so such a break never
+/// ends it.
+#[test]
+fn a_refused_go_ahead_stands_at_a_break_of_background_work() {
+    let refused = Exception::refuses_go_ahead();
+    assert!(!refused.ends_at_work(true));
+    assert!(refused.ends_at_work(false));
+    let held = Exception {
+        held: Some(HeldBy::SameReply),
+        ..Exception::refuses_go_ahead()
+    };
+    assert!(!held.ends_at_work(true));
+    for other in [
+        Exception::repeats(HeldBy::SameReply),
+        Exception::unread_limit(),
+    ] {
+        assert!(
+            other.ends_at_work(true) && other.ends_at_work(false),
+            "{other:?}"
+        );
+    }
 }

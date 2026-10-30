@@ -513,6 +513,12 @@ pub fn run(words: &[String]) -> Result<Value> {
     Ok(value)
 }
 
+#[derive(Clone, Copy)]
+struct LiveObservationError {
+    kind: std::io::ErrorKind,
+    stage: Option<&'static str>,
+}
+
 fn read_network_state_with(
     network: std::io::Result<crate::network_state::Publication>,
     read_history: impl FnOnce() -> Result<crate::network_state::Publication>,
@@ -521,7 +527,13 @@ fn read_network_state_with(
 ) -> Result<Value> {
     let (network, error) = match network {
         Ok(network) => (network, None),
-        Err(error) => (read_history()?, Some(format!("{:?}", error.kind()))),
+        Err(error) => (
+            read_history()?,
+            Some(LiveObservationError {
+                kind: error.kind(),
+                stage: crate::network_state::live_error_stage(&error),
+            }),
+        ),
     };
     Ok(network_state_value_with(
         network,
@@ -533,7 +545,7 @@ fn read_network_state_with(
 
 fn network_state_value_with(
     network: crate::network_state::Publication,
-    live_error: Option<String>,
+    live_error: Option<LiveObservationError>,
     read_services: impl FnOnce() -> crate::service_state::Publication,
     clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
 ) -> Value {
@@ -548,7 +560,8 @@ fn network_state_value_with(
         "last_success_ms":state.last_success_ms,"revision":state.revision,"detail":state.detail,"refresh_failed":state.refresh_failed})
     };
     json!({"live_observation":network.via_local_process.is_some(),
-        "live_observation_error":live_error,
+        "live_observation_error":live_error.map(|error|format!("{:?}",error.kind)),
+        "live_observation_error_stage":live_error.and_then(|error|error.stage),
         "live_network":network.via_local_process.is_some() && network.visibility == aterm_types::network_state::Visibility::Active,
         "network":crate::network_state::value(&network),
         "services":{"accounts":service(services.accounts),"secrets":service(services.secrets)}})
@@ -713,7 +726,7 @@ mod network_state_tests {
     #[test]
     fn failed_live_read_reports_its_kind_without_exposing_private_errors() {
         let at = Instant::now();
-        let private = "private diagnostic payload";
+        let private = "snapshot-json: private diagnostic payload";
         for (kind, code) in [
             (std::io::ErrorKind::InvalidData, "InvalidData"),
             (std::io::ErrorKind::NotFound, "NotFound"),
@@ -737,6 +750,10 @@ mod network_state_tests {
             )
             .unwrap();
             assert_eq!(value["live_observation_error"], json!(code));
+            assert_eq!(
+                value.get("live_observation_error_stage"),
+                Some(&Value::Null)
+            );
             assert_eq!(value["live_observation"], json!(false));
             assert_eq!(value["live_network"], json!(false));
             assert_eq!(value["network"]["history"], json!("Ready"));
@@ -752,7 +769,43 @@ mod network_state_tests {
         )
         .unwrap();
         assert_eq!(live.get("live_observation_error"), Some(&Value::Null));
+        assert_eq!(live.get("live_observation_error_stage"), Some(&Value::Null));
         assert_eq!(live["live_network"], json!(true));
+    }
+
+    #[test]
+    fn failed_native_endpoint_reports_safe_stage_and_retains_history() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let private = "private-observer-diagnostic";
+        let config = root.path().join(private).join("aterm.toml");
+        let error = crate::network_state::read_live_publication(&config).unwrap_err();
+        assert!(error.to_string().contains(private));
+        let at = Instant::now();
+        let value = read_network_state_with(
+            Err(error),
+            || {
+                Ok(crate::network_state::Publication::new(
+                    NetworkObservation {
+                        visibility: Visibility::Unavailable,
+                        history: HistoryState::Ready,
+                        observed_at_ms: 100_000,
+                        revision: 23,
+                        ..NetworkObservation::default()
+                    },
+                    at,
+                ))
+            },
+            || services(at, 100_000),
+            || (at, Some(100_000)),
+        )
+        .unwrap();
+        assert_eq!(value["live_observation_error"], json!("NotFound"));
+        assert_eq!(value["live_observation_error_stage"], json!("endpoint"));
+        assert_eq!(value["live_observation"], json!(false));
+        assert_eq!(value["live_network"], json!(false));
+        assert_eq!(value["network"]["revision"], json!(23));
+        assert_eq!(value["network"]["observed_at_ms"], json!(100_000));
+        assert!(!aterm_json::to_string(&value).unwrap().contains(private));
     }
 
     #[test]

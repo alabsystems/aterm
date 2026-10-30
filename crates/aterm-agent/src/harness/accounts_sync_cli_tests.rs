@@ -1847,6 +1847,7 @@ machines = [\"m16\"]
 region = \"global\"
 ";
     bed.secret(&cli_fleet_file(Cli::Kimi), kimi_fleet_toml);
+    // The mailbox update below follows wrong_at and still precedes the real read cutoff.
     let now = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1854,8 +1855,17 @@ region = \"global\"
             .as_secs(),
     )
     .unwrap()
-        + 1_000;
+        - 1_000;
     assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
+    // Initial input precedes both wrong-account marks; only the later mailbox is new.
+    let initial_time =
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(now - 180).unwrap());
+    fs::File::options()
+        .write(true)
+        .open(bed.secrets().join(cli_fleet_file(Cli::Kimi)))
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(initial_time))
+        .unwrap();
     let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
 

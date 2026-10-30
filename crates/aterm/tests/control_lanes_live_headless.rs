@@ -567,7 +567,9 @@ fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
     ctl_accept::until_accepted(|| {
         let mut cmd = Command::new(launch_isolation::aterm_executable());
         launch_isolation::apply(&mut cmd, root);
-        cmd.arg("ctl")
+        // `ls`'s probe of the instance, which serves, waits the hang detector, not its 2 s.
+        cmd.env(aterm_ctl::PROBE_WITHIN_SEAM, HANG.as_millis().to_string())
+            .arg("ctl")
             .arg("--sock")
             .arg(sock)
             .args(args)

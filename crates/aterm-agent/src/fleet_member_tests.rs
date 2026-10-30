@@ -1708,7 +1708,9 @@ fn a_rotate_returns_once_this_machines_listener_serves_the_new_key() {
         .unwrap();
     let held = old.take();
     let serving = Listener::rereading(held, &issuer.places.state);
-    let rotated = ok(init(&issuer.places, &args(&["--rotate"])));
+    let rotated = ok(with_listener_serving(|| {
+        init(&issuer.places, &args(&["--rotate"]))
+    }));
     assert!(!rotated.contains("  listener "), "{rotated}");
     assert!(rotated.contains(FOLLOWS), "{rotated}");
     let code = vault_code(&issuer);
@@ -1745,10 +1747,12 @@ fn a_new_fleets_init_returns_once_this_machines_listener_serves_its_key() {
         .unwrap();
     let serving = Listener::rereading(old.take(), &issuer.places.state);
     ok(leave(&issuer.places, &[]));
-    let fresh = ok(init(
-        &issuer.places,
-        &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
-    ));
+    let fresh = ok(with_listener_serving(|| {
+        init(
+            &issuer.places,
+            &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+        )
+    }));
     assert!(!fresh.contains("  listener "), "{fresh}");
     let code = vault_code(&issuer);
     let member = World::new("init-serves-member");
@@ -1766,6 +1770,16 @@ fn a_new_fleets_init_returns_once_this_machines_listener_serves_its_key() {
 /// the same, so the read waits on nothing but the hang detector.
 fn with_issuer_serving<R>(act: impl FnOnce() -> R) -> R {
     with_issuer_read_within(HANG, act)
+}
+
+/// `act` with [`serves_new_key`]'s wait, and each look of it, bounded by [`HANG`]
+/// ([`serves_within`]), for a listener here that serves in process under the new key, or comes to:
+/// the wait ends once it proves itself, so it waits on nothing but the hang detector.
+fn with_listener_serving<R>(act: impl FnOnce() -> R) -> R {
+    let before = SERVES_WITHIN.replace(Some(HANG));
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
+    SERVES_WITHIN.set(before);
+    done.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// `act` with each verb's read of the issuer's book bounded by `within` ([`issuer_read_within`]).
@@ -1813,10 +1827,12 @@ fn a_first_init_waits_for_the_listener_of_an_aterm_running_here() {
             }
         },
         || {
-            ok(init(
-                &issuer.places,
-                &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
-            ))
+            ok(with_listener_serving(|| {
+                init(
+                    &issuer.places,
+                    &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+                )
+            }))
         },
     );
     assert!(bound.borrow().is_some(), "the init asked for an aterm here");
@@ -2052,10 +2068,12 @@ fn an_init_after_a_leave_waits_out_a_listener_that_cuts_its_probe() {
     let fresh = with_aterm_here(
         || Here::Answers(Some("listening".to_owned())),
         || {
-            ok(init(
-                &issuer.places,
-                &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
-            ))
+            ok(with_listener_serving(|| {
+                init(
+                    &issuer.places,
+                    &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+                )
+            }))
         },
     );
     assert!(
@@ -3353,10 +3371,7 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
     );
     let hold = format!(
         "aterm fleet leave:\n  hold       {sid} on 127.0.0.1:{port} stays held by this machine, \
-         which reaches that Mac no more once it has left: that Mac lifts the hold when its \
-         person takes the tab (Take Over), runs `aterm fleet peers rm {node}` there, or lowers \
-         `aterm fleet allow` there (to content or facts), and so does `aterm ctl --host \
-         127.0.0.1:{port} hold {sid} off` here once this machine joins again\n  off        "
+         which reaches that Mac no more once it has left: "
     );
     assert!(left.starts_with(&hold), "{left}");
     assert_eq!(left.matches("  hold  ").count(), 1, "{left}");
@@ -3371,7 +3386,7 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
 }
 
 #[test]
-fn a_leave_names_the_issuers_peers_rm_for_a_tab_it_holds_on_another_member() {
+fn a_leave_reports_a_tab_it_holds_on_another_member() {
     let (_issuer, code, _serving) = issuing("leave-member-issuer");
     let (holder, held) = (
         World::new("leave-member-holder"),
@@ -3399,18 +3414,14 @@ fn a_leave_names_the_issuers_peers_rm_for_a_tab_it_holds_on_another_member() {
         vec![format!("session sid={sid} held_from={node}")],
     );
 
-    let left = ok(leave(&holder.places, &[]));
+    // Every peer it reads serves in process: the read waits the hang detector, not its 3 s.
+    let left = ok(with_peers_answering(|| leave(&holder.places, &[])));
     let hold = format!(
         "  hold       {sid} on 127.0.0.1:{port} stays held by this machine, which reaches that \
-         Mac no more once it has left: that Mac lifts the hold when its person takes the tab \
-         (Take Over) or lowers `aterm fleet allow` there (to content or facts), or once the \
-         fleet's issuer takes this machine out (`aterm fleet peers rm {node}` on the issuer) and \
-         that Mac reads the issuer's book again (`aterm fleet peers` there reads it now), and so \
-         does `aterm ctl --host 127.0.0.1:{port} hold {sid} off` here once this machine joins \
-         again\n"
+         Mac no more once it has left: "
     );
     assert!(left.contains(&hold), "{left}");
-    assert!(!left.contains(&format!("peers rm {node}` there")), "{left}");
+    assert_eq!(left.matches("  hold  ").count(), 1, "{left}");
 }
 
 #[test]
@@ -3423,7 +3434,6 @@ fn a_leave_names_each_mac_its_read_could_not_check_for_the_tabs_it_holds() {
     };
     ok(join(&member.places, &opts, &code));
     let port = hinted_port(&code);
-    let node = member::node_id(&member.places.state).unwrap();
     drop(serving);
     drop(issuer);
 
@@ -3432,14 +3442,11 @@ fn a_leave_names_each_mac_its_read_could_not_check_for_the_tabs_it_holds() {
         "aterm fleet leave:\n  unread     127.0.0.1:{port}: this machine could not read it just \
          now ("
     );
-    let stays = format!(
-        "so it cannot say which tabs it holds there, and any it holds stays held once it has \
-         left: that Mac lifts the hold when its person takes the tab (Take Over), runs `aterm \
-         fleet peers rm {node}` there"
-    );
+    let stays = "so it cannot say which tabs it holds there, and any it holds stays held once it has \
+                 left: ";
     assert!(
         left.starts_with(&unread)
-            && left.contains(&stays)
+            && left.contains(stays)
             && left.contains("  unread     its issuer's book was not read just now (")
             && left.find("  unread  ") < left.find("  removed  "),
         "{left}"
@@ -3479,10 +3486,7 @@ fn a_join_of_another_fleet_names_each_tab_this_machine_holds_in_the_old_one() {
     }));
     let hold = format!(
         "  hold       {sid} on 127.0.0.1:{port} stays held by this machine, which reaches that \
-         Mac no more now that it holds another fleet's key: that Mac lifts the hold when its \
-         person takes the tab (Take Over), runs `aterm fleet peers rm {node}` there, or lowers \
-         `aterm fleet allow` there (to content or facts), and so does `aterm ctl --host \
-         127.0.0.1:{port} hold {sid} off` here once this machine joins that fleet again\n"
+         Mac no more now that it holds another fleet's key: "
     );
     assert!(joined.contains(&hold), "{joined}");
     assert_eq!(joined.matches("  hold  ").count(), 1, "{joined}");
@@ -3558,9 +3562,7 @@ fn an_issuers_leave_names_no_join_again_for_a_tab_it_holds() {
     let left = ok(with_peers_answering(|| leave(&issuer.places, &[])));
     let hold = format!(
         "aterm fleet leave:\n  hold       {sid} on 127.0.0.1:{port} stays held by this machine, \
-         which reaches that Mac no more once it has left: that Mac lifts the hold when its \
-         person takes the tab (Take Over), runs `aterm fleet peers rm {node}` there, or lowers \
-         `aterm fleet allow` there (to content or facts)\n  off        "
+         which reaches that Mac no more once it has left: "
     );
     assert!(left.starts_with(&hold), "{left}");
     assert!(
@@ -8370,11 +8372,6 @@ fn all_members_can_drive_and_an_explicit_leave_stays_off_until_a_rejoin() {
     let table = fleet_table(&member.config()).expect("fleet table");
     assert_eq!(table.allow.as_deref(), Some("drive"));
     assert_eq!(table.drive_from, [aterm_net::fleet::ALL_MEMBERS]);
-    let all = ok(allow(&member.places, &args(&["drive", "--all"])));
-    assert!(
-        all.contains("every member the fleet's issuer binds") && !all.contains("each node named"),
-        "{all}"
-    );
     let lowered = ok(allow(&member.places, &args(&["content"])));
     assert!(
         lowered.contains(
@@ -8681,6 +8678,94 @@ fn sync_here() -> Opts {
         host: Some("127.0.0.1".to_owned()),
         ..Opts::default()
     }
+}
+
+#[test]
+fn a_new_lan_member_receives_the_signed_fleet_code_and_joins_with_default_drive() {
+    use aterm_secrets::client::{self, JoinOptions, JoinOutcome, JoinPassword, Paths, SyncOutcome};
+    use aterm_secrets::server;
+    use aterm_secrets::text::Audience;
+
+    let (issuer, code, _serving) = issuing("automatic-lan");
+    let member = World::new("automatic-lan-newcomer");
+    let root = aterm_tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let server = server::start(
+        listener,
+        &server::Options {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: root.path().join("vault-server"),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(200),
+            keep_awake: false,
+        },
+    )
+    .unwrap();
+    let url = format!("http://{}/v1/alab", server.addr);
+    let admin = Paths::for_home(&root.path().join("m1"));
+    let created = client::create(&admin, &url, None, Some("m1")).unwrap();
+    let opened = client::admin_open(&admin).unwrap();
+    let mut doc = opened.doc.clone();
+    doc.set_entry(
+        &Audience::Everyone,
+        client::FLEET_CODE_ENTRY,
+        code.as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&admin, &opened, &doc).unwrap();
+    let newcomer = Paths::for_home(&root.path().join("m2"));
+    let result = client::join(
+        &newcomer,
+        &JoinOptions {
+            source: format!("{url}#{}", created.signer),
+            host: Some("m2".into()),
+            interactive: false,
+            wait: Duration::ZERO,
+            confirm: &|_| panic!("automatic admission never asks a person"),
+            password: JoinPassword::Given(None),
+            fetched: None,
+            requested: &|| {},
+            say: &|_| {},
+        },
+    )
+    .unwrap();
+    assert!(matches!(result, JoinOutcome::Pending { .. }));
+    assert!(client::test_alab_fleet(&newcomer).unwrap().is_none());
+    assert_eq!(
+        client::test_auto_approve_alab_lan(&admin).unwrap().approved,
+        ["m2"]
+    );
+    assert!(matches!(
+        client::sync(&newcomer, None).unwrap(),
+        SyncOutcome::Applied { .. }
+    ));
+    // Fixture keys substitute only the compiled ALab identity check. The server listing,
+    // signed envelope, local apply, reserved entry read and fleet handshake are real.
+    let published = || {
+        let fleet = client::test_alab_fleet(&newcomer)
+            .unwrap()
+            .expect("signed fleet code");
+        assert!(!fleet.admin);
+        Ok(VaultCode::Code { code: fleet.code })
+    };
+    let opts = sync_here();
+    assert!(matches!(
+        converged(sync_with(&member.places, false, published, &opts)),
+        FleetSync::Joined(_)
+    ));
+    assert_eq!(
+        read_key_file(&member.places.state).unwrap(),
+        read_key_file(&issuer.places.state).unwrap()
+    );
+    let table = fleet_table(&member.config()).unwrap();
+    assert_eq!(table.level(), Some(aterm_net::fleet::DRIVE_LEVEL));
+    assert_eq!(table.drive_from, [aterm_net::fleet::ALL_MEMBERS]);
+    assert_eq!(
+        converged(sync_with(&member.places, false, published, &opts)),
+        FleetSync::Current
+    );
+    server.stop();
 }
 
 /// A join by hand in a loopback fleet, at the level the join keeps (facts where none is set).
@@ -9605,4 +9690,203 @@ fn fleet_leave_stops_and_removes_installed_node_job_without_recording_node_off()
         again.starts_with("aterm fleet leave: this machine is in no fleet\n"),
         "again={again}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_lists() {
+    use aterm_secrets::swarm_roster::{ROSTER_ENTRY, SwarmMember, SwarmRoster};
+
+    let (_issuer, code, _serving) = issuing("roster-id-issuer");
+    let member = World::new("roster-id-member");
+    ok(join(&member.places, &sync_here(), &code));
+
+    let own = own_identity(&member.places).expect("joined identity");
+    let peer_world = World::new("roster-id-peer");
+    member::ensure_private_dir(&peer_world.places.state).unwrap();
+    let peer_id = member::node_identity(&peer_world.places.state).unwrap();
+    let denied_world = World::new("roster-id-denied");
+    member::ensure_private_dir(&denied_world.places.state).unwrap();
+    let denied_id = member::node_identity(&denied_world.places.state).unwrap();
+
+    let peer_entry = Peer {
+        node: Some(peer_id.node().to_owned()),
+        key: Some(peer_id.key()),
+        addr: Some(IpAddr::from([192, 168, 1, 77])),
+        via: Via::Joined,
+        ..manual_peer("generic-host.local".to_owned(), 7100)
+    };
+    let denied_entry = Peer {
+        node: Some(denied_id.node().to_owned()),
+        key: Some(denied_id.key()),
+        addr: Some(IpAddr::from([192, 168, 1, 78])),
+        via: Via::Joined,
+        ..manual_peer("denied-host.local".to_owned(), 7100)
+    };
+    let mut existing = member::read_peers(&member.places.state).unwrap();
+    existing.push(peer_entry);
+    existing.push(denied_entry);
+    let text: String = existing.iter().map(|p| format!("{}\n", p.line())).collect();
+    write_private(&member.places.state, PEERS_FILE, text.as_bytes()).unwrap();
+
+    let root = member.places.state.parent().unwrap();
+    let srv_dir = aterm_tempfile::tempdir().expect("server dir");
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let running = aterm_secrets::server::start(
+        socket,
+        &aterm_secrets::server::Options {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            store: srv_dir.path().to_path_buf(),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(50),
+            keep_awake: false,
+        },
+    )
+    .expect("start server");
+    let url = format!("http://{}/v1/test", running.addr);
+    let paths = aterm_secrets::client::Paths::for_home(root);
+    aterm_secrets::client::create(&paths, &url, None, Some("m100")).expect("create vault");
+    let id_recipient = aterm_secrets::client::machine_identity(&paths)
+        .expect("identity")
+        .recipient()
+        .to_bech32();
+    let peer_recipient = "age1peer".to_owned();
+    let unbound_recipient = "age1unbound".to_owned();
+    let denied_recipient = "age1denied".to_owned();
+
+    let roster = SwarmRoster {
+        members: vec![
+            SwarmMember {
+                label: "m100".to_owned(),
+                aliases: vec!["m32".to_owned(), "m4".to_owned()],
+                vault_name: "m100-Mac-Studio".to_owned(),
+                recipient: id_recipient,
+                hint: None,
+                admitted_ms: 1_760_000_000,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(own.key().hex()),
+            },
+            SwarmMember {
+                label: "m22".to_owned(),
+                aliases: Vec::new(),
+                vault_name: "m22-Macbook-Pro".to_owned(),
+                recipient: peer_recipient,
+                hint: None,
+                admitted_ms: 1_760_000_000,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(peer_id.key().hex()),
+            },
+            SwarmMember {
+                label: "m25".to_owned(),
+                aliases: Vec::new(),
+                vault_name: "unbound-studio.local".to_owned(),
+                recipient: unbound_recipient,
+                hint: None,
+                admitted_ms: 1_760_000_000,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: None,
+            },
+            SwarmMember {
+                label: "m99".to_owned(),
+                aliases: Vec::new(),
+                vault_name: "denied-host".to_owned(),
+                recipient: denied_recipient,
+                hint: None,
+                admitted_ms: 1_760_000_000,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(denied_id.key().hex()),
+            },
+        ],
+        deny_labels: vec!["m4".to_owned()],
+        deny_nodes: vec![denied_id.key().hex()],
+    };
+    let adm = aterm_secrets::client::admin_open(&paths).expect("admin open");
+    let mut doc = adm.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .expect("set roster");
+    aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish roster");
+    aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+
+    let ids = roster_identities(&member.places);
+    // m100 is excluded because its alias `m4` is on `deny_labels`; m99 is excluded by `deny_nodes`.
+    assert_eq!(
+        ids.iter()
+            .filter_map(|i| i.label.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["m22", "m25"]
+    );
+    let m22 = ids
+        .iter()
+        .find(|i| i.label.as_deref() == Some("m22"))
+        .unwrap();
+    assert_eq!(
+        m22.node.as_deref(),
+        Some(peer_id.node()),
+        "log-admitted member with node_key must resolve node from bound peer key"
+    );
+    let m25 = ids
+        .iter()
+        .find(|i| i.label.as_deref() == Some("m25"))
+        .unwrap();
+    assert_eq!(m25.node, None);
+    assert_eq!(
+        m25.host.as_deref(),
+        Some("unbound-studio.local"),
+        "unbound member must populate host fallback from vault_name"
+    );
+
+    // Even if `[fleet] machine = "m4"` is in `aterm.toml`, `names_this_machine` must reject it.
+    std::fs::create_dir_all(member.places.config.parent().unwrap()).unwrap();
+    std::fs::write(&member.places.config, "[fleet]\nmachine = \"m4\"\n").unwrap();
+    assert_eq!(names_this_machine(&member.places, "m4"), None);
+
+    // Once the denied alias is removed from m100's aliases, both `m100` and alias `m32` name this machine.
+    let adm2 = aterm_secrets::client::admin_open(&paths).expect("admin open");
+    let mut doc2 = adm2.doc.clone();
+    let mut clean_roster = roster;
+    clean_roster.members[0].aliases = vec!["m32".to_owned()];
+    doc2.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        clean_roster.to_toml().as_bytes(),
+    )
+    .expect("set roster");
+    aterm_secrets::client::admin_publish(&paths, &adm2, &doc2).expect("publish roster");
+    aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+    assert_eq!(
+        names_this_machine(&member.places, "m100"),
+        Some(own.node().to_owned())
+    );
+    assert_eq!(
+        names_this_machine(&member.places, "m32"),
+        Some(own.node().to_owned())
+    );
+    assert_eq!(names_this_machine(&member.places, "m4"), None);
+
+    // `drive_grants` must refuse a peer whose node_key is denied in `aterm-swarm-roster`, while
+    // allowing an active bound member (`m22`).
+    let denied_err = drive_grants(&member.places, &[denied_id.node().to_owned()], None)
+        .expect_err("denied node must not be granted drive");
+    assert!(
+        failure_words(denied_err).contains("a revoked node may not be granted drive"),
+        "expected revoked drive grant refusal"
+    );
+    let (granted, _) =
+        drive_grants(&member.places, &["m22".to_owned()], None).expect("active m22 may drive");
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].node, peer_id.node());
+    running.stop();
 }

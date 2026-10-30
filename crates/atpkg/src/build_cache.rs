@@ -444,6 +444,17 @@ pub enum Unused {
     Moved { idle: Duration, after: Duration },
     /// What an earlier pass renamed aside and did not finish removing.
     Unfinished,
+    /// A different compiler target is waiting; this settled disposable generation must
+    /// retire whole before another target can be created in the same package cache.
+    PackageSuperseded,
+    /// An explicitly disposable package generation exceeded its settled allocation budget,
+    /// or its volume fell below the package disk floor. Its whole producer coordinator is
+    /// held, its attempt is retired, and ordinary Cargo/process gates still apply.
+    PackageBudget {
+        allocated: u64,
+        budget: u64,
+        low_disk: bool,
+    },
     /// NOT A REMOVAL WHOLE: what a removal ([`remove::tree`]) left of the stage it is returned
     /// beside, a build directory renamed aside or a stage of its parts — `stayed` entries of it
     /// would not go even once made removable (another user's, on another volume, or still

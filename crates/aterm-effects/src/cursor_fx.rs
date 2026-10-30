@@ -67,6 +67,16 @@ pub struct CursorFx {
     /// caret's, the negative control of [`CursorGlow::hold_off_neighbour_ink`].
     #[cfg(test)]
     pub(crate) rainbow_rim_unheld: bool,
+    /// Test-only: read no colour as one the user chose, so paper concentrates a chosen colour as
+    /// it does a style's own: the negative control of [`crate::color_math::light_caret_fill`].
+    #[cfg(test)]
+    pub(crate) chosen_unread: bool,
+    /// Test-only: the typing-momentum glow reads no colour as one the user chose
+    /// ([`MomentumGlowConfig::chosen_hue`], [`MomentumGlowConfig::chosen_base`]), so its paper
+    /// halo wears its hue's vivid ink and its caret is charged toward its hue's pure colour: the
+    /// negative control of the momentum glow's chosen-colour law alone.
+    #[cfg(test)]
+    pub(crate) momentum_chosen_unread: bool,
     /// The comet cells this tick produced, projected through load shedding, brightness, and
     /// legibility.
     pub trail_scratch: Vec<TrailCell>,
@@ -495,10 +505,10 @@ pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
 
 #[inline]
 #[must_use]
-const fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
+const fn bolt_body(color: u32, blaze: f32, dark: bool, chosen: bool) -> u32 {
     let blaze = blaze.clamp(0.0, 1.0);
     if !dark {
-        return crate::color_math::light_body_fill(color, blaze);
+        return crate::color_math::light_caret_fill(color, blaze, chosen);
     }
     crate::effect_util::lerp_rgb(color, 0x00FF_FFFF, 0.55 * blaze)
 }
@@ -1287,10 +1297,23 @@ impl CursorFx {
             && matches!(glow_cfg.style, GlowStyle::Sparkle)
         {
             Some(crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(
-                glow_cfg, 1.0,
+                glow_cfg, false, 1.0,
             ))
         } else {
             None
+        };
+        // A colour the user chose: the pinned cursor colour, or the trail colour a style that
+        // reads it wears. Paper darkens it in its own hue and saturation and never saturates it
+        // ([`crate::color_math::light_caret_fill`]).
+        #[cfg(test)]
+        let chosen_unread = self.chosen_unread;
+        #[cfg(not(test))]
+        let chosen_unread = false;
+        let chosen = |c: u32| {
+            let c = c & 0x00FF_FFFF;
+            !chosen_unread
+                && ((tinted && c == glow_cfg.color & 0x00FF_FFFF)
+                    || matches!(pinned_base, Some(p) if (p & 0x00FF_FFFF) == c))
         };
         let (rod_color, rod_haze) = match glow_cfg.style {
             GlowStyle::Beam => (glow_cfg.color, aterm_render::BEAM_SPACE_HAZE),
@@ -1326,24 +1349,37 @@ impl CursorFx {
         } else {
             None
         };
+        let momentum_base = sparkle_paper_gold.unwrap_or(f.live_cursor);
+        // The hue the paper glow wears, and whether it is a colour the user chose: the cursor's
+        // with no trail, Sparkle's paper gold (a shade of a chosen trail colour where one is
+        // pinned), else the rod's.
+        let (momentum_hue, momentum_hue_chosen) = if !glow_cfg.enabled {
+            (f.live_cursor & 0x00FF_FFFF, chosen(f.live_cursor))
+        } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
+            match sparkle_paper_rod {
+                Some(rod) => (rod, false),
+                None => (
+                    crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, tinted, 1.0),
+                    chosen(glow_cfg.color),
+                ),
+            }
+        } else {
+            (rod_color, chosen(rod_color))
+        };
+        // A test's control: the momentum glow reads no colour as chosen, as before it did.
+        #[cfg(test)]
+        let momentum_reads_chosen = !self.momentum_chosen_unread;
+        #[cfg(not(test))]
+        let momentum_reads_chosen = true;
         let momentum_cfg = MomentumGlowConfig {
             enabled: momentum_enabled,
             intensity: body_amp,
             tau_s: MOMENTUM_GLOW_TAU_S,
             radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
-            base: sparkle_paper_gold.unwrap_or(f.live_cursor),
+            base: momentum_base,
             dark_theme: dark,
             light: glow_cfg.light,
-            hue: if !glow_cfg.enabled {
-                f.live_cursor & 0x00FF_FFFF
-            } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
-                match sparkle_paper_rod {
-                    Some(rod) => rod,
-                    None => crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0),
-                }
-            } else {
-                rod_color
-            },
+            hue: momentum_hue,
             theme_fg: glow_cfg.theme_fg,
             theme_bg: glow_cfg.theme_bg,
             block: is_block(f.cursor_style),
@@ -1356,6 +1392,8 @@ impl CursorFx {
                 None
             },
             light_vivid: sparkle_paper_gold.is_some(),
+            chosen_hue: momentum_reads_chosen && momentum_hue_chosen,
+            chosen_base: momentum_reads_chosen && chosen(momentum_base),
         };
         #[cfg(any(test, debug_assertions))]
         {
@@ -1415,6 +1453,7 @@ impl CursorFx {
             theme_fg: glow_cfg.theme_fg,
             theme_bg: glow_cfg.theme_bg,
             pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (glow_cfg.color & 0x00FF_FFFF)),
+            chosen: chosen(glow_cfg.color),
         };
         #[cfg(any(test, debug_assertions))]
         {
@@ -1481,6 +1520,7 @@ impl CursorFx {
             theme_fg: glow_cfg.theme_fg,
             theme_bg: glow_cfg.theme_bg,
             pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (rod_color & 0x00FF_FFFF)),
+            chosen: chosen(rod_color),
         };
         #[cfg(any(test, debug_assertions))]
         {
@@ -1535,7 +1575,12 @@ impl CursorFx {
             && glow_cfg.intensity > 0.0
             && matches!(glow_cfg.style, GlowStyle::Laser);
         let bolt_fill = if bolt_cursor {
-            Some(bolt_body(glow_cfg.color, blaze, dark))
+            Some(bolt_body(
+                glow_cfg.color,
+                blaze,
+                dark,
+                chosen(glow_cfg.color),
+            ))
         } else {
             None
         };
@@ -2445,6 +2490,282 @@ mod tests {
         }
     }
 
+    /// A COLOUR THE USER CHOSE IS NEVER SATURATED ON PAPER
+    /// ([`crate::color_math::light_caret_fill`]): a caret charged on a light page wears a chosen
+    /// colour (the trail colour, or a pinned cursor colour) darkened in its own hue and
+    /// saturation, so every frame's fill keeps the pin's hue and no more than its chroma, and the
+    /// charged caret still reads on the page. Sparkle pinned to `#b0b0c8` charged to navy
+    /// `#000079` on paper, chroma 0.475 against the pin's 0.094 (review9fix round 1's judge,
+    /// the gallery's `sparkle-pin` on GitHub Light and Default Light). Control:
+    /// [`CursorFx::chosen_unread`], which reads no colour as chosen.
+    #[test]
+    fn a_chosen_colour_charges_in_its_own_hue_and_chroma_on_paper() {
+        use crate::color_math::{contrast_ratio, rgb2hsv};
+        const PIN: u32 = 0x00B0_B0C8;
+        let chroma = |c: u32| {
+            let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+            r.max(g).max(b) - r.min(g).min(b)
+        };
+        let default_light = aterm_types::scheme::builtin("Default Light")
+            .expect("Default Light ships")
+            .to_theme_parts()
+            .bg
+            & 0x00FF_FFFF;
+        let run = |style: GlowStyle, page: u32, cursor_pin: bool, unread: bool| -> Vec<u32> {
+            let (mut glow, mut trail) = style_cfgs(style, page);
+            glow.color = PIN;
+            glow.accent = brighten(PIN, 1.5);
+            trail.color = PIN;
+            let mut fx = CursorFx {
+                chosen_unread: unread,
+                ..CursorFx::default()
+            };
+            let t0 = Instant::now();
+            let input = |now, col: u16| CursorFxInput {
+                cur: Some((2, col)),
+                cursor_style: CursorStyle::SteadyBlock,
+                live_cursor: if cursor_pin { PIN } else { 0x0009_69DA },
+                cursor_color_pinned: cursor_pin,
+                user_tinted: !cursor_pin,
+                accent_pinned: false,
+                default_bg: page,
+                momentum_glow: false,
+                ..frame_input(now)
+            };
+            (0..24u16)
+                .filter_map(|k| {
+                    let now = t0 + std::time::Duration::from_millis(50 * u64::from(k));
+                    fx.glow.note_synthetic_typed(now, 1);
+                    fx.trail.note_synthetic_typed(now);
+                    fx.cadence.on_keystroke(now);
+                    fx.tick(&input(now, 4 + k), &glow, trail)
+                        .block_fill
+                        .map(|owned| owned.fill)
+                })
+                .collect()
+        };
+        let (pin_hue, _, _) = rgb2hsv(PIN);
+        let mut control_saturated = false;
+        for page in [0x00FF_FFFF, default_light] {
+            for style in [
+                GlowStyle::Sparkle,
+                GlowStyle::Beam,
+                GlowStyle::Lumen,
+                GlowStyle::Comet,
+                GlowStyle::Laser,
+            ] {
+                for cursor_pin in [false, true] {
+                    let fills = run(style, page, cursor_pin, false);
+                    let charged = fills.iter().copied().filter(|&f| f != PIN);
+                    assert!(
+                        charged.clone().count() > 0,
+                        "{style:?} on {page:06x} (cursor pin {cursor_pin}): the burst charges the \
+                         caret: {fills:06x?}"
+                    );
+                    for fill in charged.clone() {
+                        let (hue, _, _) = rgb2hsv(fill);
+                        assert!(
+                            chroma(fill) <= chroma(PIN) + 1 && (hue - pin_hue).abs() < 6.0,
+                            "{style:?} on {page:06x} (cursor pin {cursor_pin}): the charged \
+                             caret {fill:06x} (chroma {}, hue {hue:.0}) recolours the chosen \
+                             {PIN:06x} (chroma {}, hue {pin_hue:.0})",
+                            chroma(fill),
+                            chroma(PIN)
+                        );
+                    }
+                    let deepest = charged
+                        .map(|f| contrast_ratio(f, page))
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        deepest >= CARET_PAGE_MIN_CONTRAST,
+                        "{style:?} on {page:06x} (cursor pin {cursor_pin}): the charged caret \
+                         reads at {deepest:.2}:1"
+                    );
+                    control_saturated |= run(style, page, cursor_pin, true)
+                        .into_iter()
+                        .any(|f| chroma(f) > 2 * chroma(PIN));
+                }
+            }
+        }
+        assert!(
+            control_saturated,
+            "control: concentrated as a style's own colour, some charged caret on paper wears \
+             more than twice the pin's chroma"
+        );
+    }
+
+    /// A COLOUR THE USER CHOSE IS NEVER RE-SATURATED BY THE TYPING-MOMENTUM GLOW
+    /// ([`MomentumGlowConfig::chosen_hue`], [`MomentumGlowConfig::chosen_base`]): beside a
+    /// chosen colour (Sparkle's or Classic's pinned trail colour, or a pinned cursor colour with
+    /// no trail), every pixel of the paper halo keeps the pin's hue and no more than its chroma,
+    /// and a caret it charges in the chosen colour keeps them on paper and on a dark page.
+    /// Beside Sparkle pinned to `#b0b0c8` (chroma 0.094) the paper halo was laid up to
+    /// `#c1c1ee`, chroma 0.176, its ink walked from the hue's vivid ink (review9fix round 2's
+    /// judge, the gallery's `sparkle-pin` on paper), and a pinned cursor colour's charged caret
+    /// went navy on paper and amber on a dark page. The three cases take the wiring's three
+    /// hues (Sparkle's paper gold, a style's rod, the cursor's own). Control:
+    /// [`CursorFx::momentum_chosen_unread`], the momentum glow alone reading no colour as
+    /// chosen, which lays each case's paper halo off the pin.
+    #[test]
+    fn the_momentum_glow_wears_a_chosen_colour_in_its_own_hue_and_chroma() {
+        use crate::color_math::rgb2hsv;
+        const PIN: u32 = 0x00B0_B0C8;
+        let chroma = |c: u32| {
+            let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+            r.max(g).max(b) - r.min(g).min(b)
+        };
+        let (pin_hue, _, _) = rgb2hsv(PIN);
+        let default_light = aterm_types::scheme::builtin("Default Light")
+            .expect("Default Light ships")
+            .to_theme_parts()
+            .bg
+            & 0x00FF_FFFF;
+        // What a burst draws beside the chosen colour: the halo's pixels (paper only: a dark
+        // page's halo is additive, the momentum's own warm light), its quads laid as the
+        // renderer lays them over a neutral white, so a tinted page's own hue (Default Light's
+        // `#f6f7f9`) does not read as the halo's, and the caret fills the momentum glow owns.
+        // The halo's quads are the ones a twin with no momentum glow, fed the same frames,
+        // does not lay: the momentum glow's alone, not the style's own marks under the letters.
+        let run = |style: Option<GlowStyle>, page: u32, unread: bool| -> (Vec<u32>, Vec<u32>) {
+            let (mut glow, mut trail) = style_cfgs(style.unwrap_or(GlowStyle::Sparkle), page);
+            let cursor_pin = style.is_none();
+            if cursor_pin {
+                glow.enabled = false;
+            } else {
+                glow.color = PIN;
+                glow.accent = brighten(PIN, 1.5);
+                // A pinned colour selects Classic's one-colour face (`resolve_glow_config`).
+                glow.classic_mono = matches!(style, Some(GlowStyle::Classic));
+                trail.color = PIN;
+            }
+            let mut fx = CursorFx {
+                momentum_chosen_unread: unread,
+                ..CursorFx::default()
+            };
+            let mut twin = CursorFx::default();
+            let t0 = Instant::now();
+            let geom = frame_input(t0).geom;
+            let (w, h) = (usize::from(geom.win_w), usize::from(geom.win_h));
+            let (mut halo, mut carets) = (Vec::new(), Vec::new());
+            for k in 0..24u16 {
+                let now = t0 + std::time::Duration::from_millis(50 * u64::from(k));
+                for f in [&mut fx, &mut twin] {
+                    f.glow.note_synthetic_typed(now, 1);
+                    f.trail.note_synthetic_typed(now);
+                    f.cadence.on_keystroke(now);
+                }
+                fx.momentum
+                    .on_key(now, crate::cursor_momentum::MOMENTUM_GLOW_TAU_S);
+                let input = |momentum_glow| CursorFxInput {
+                    cur: Some((2, 4 + k)),
+                    cursor_style: CursorStyle::SteadyBlock,
+                    live_cursor: if cursor_pin { PIN } else { 0x0009_69DA },
+                    cursor_color_pinned: cursor_pin,
+                    user_tinted: !cursor_pin,
+                    accent_pinned: false,
+                    default_bg: page,
+                    momentum_glow,
+                    ..frame_input(now)
+                };
+                if let Some(owned) = fx
+                    .tick(&input(true), &glow, trail)
+                    .block_fill
+                    .filter(|owned| owned.owner == BlockFillOwner::Momentum)
+                {
+                    carets.push(owned.fill);
+                }
+                let _ = twin.tick(&input(false), &glow, trail);
+                let (laid, style_own) = (fx.glow.under_quads(), twin.glow.under_quads());
+                let (own, halo_quads) = laid.split_at(style_own.len().min(laid.len()));
+                assert_eq!(
+                    own, style_own,
+                    "frame {k}: the momentum glow lays its halo after the style's own marks"
+                );
+                if aterm_render::theme_is_dark(page) {
+                    continue;
+                }
+                const NEUTRAL: u32 = 0x00FF_FFFF;
+                let mut px = vec![NEUTRAL; w * h];
+                for q in halo_quads {
+                    let qw = u32::from(q.w.max(1));
+                    let at = |i: u32, a: u32, b: u32| {
+                        (a * (2 * qw - (2 * i + 1)) + b * (2 * i + 1) + qw) / (2 * qw)
+                    };
+                    for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                        for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                            let i = (x - usize::from(q.x)) as u32;
+                            let (color, alpha) = if q.is_flat() {
+                                (q.color, q.alpha)
+                            } else {
+                                let lerp = |sh: u32| {
+                                    at(i, (q.color >> sh) & 0xff, (q.color2 >> sh) & 0xff) << sh
+                                };
+                                (
+                                    lerp(16) | lerp(8) | lerp(0),
+                                    at(i, u32::from(q.alpha), u32::from(q.alpha2)) as u8,
+                                )
+                            };
+                            let slot = &mut px[y * w + x];
+                            *slot = aterm_render::over_premul(*slot, color, alpha);
+                        }
+                    }
+                }
+                halo.extend(px.into_iter().filter(|&p| p != NEUTRAL));
+            }
+            (halo, carets)
+        };
+        let off_pin = |c: u32| {
+            let (hue, _, _) = rgb2hsv(c);
+            let hue_off = (hue - pin_hue).abs().min(360.0 - (hue - pin_hue).abs());
+            chroma(c) > chroma(PIN) + 1 || (chroma(c) >= 8 && hue_off >= 6.0)
+        };
+        let styles = [Some(GlowStyle::Sparkle), Some(GlowStyle::Classic), None];
+        let mut control_halo = [0usize; 3];
+        let mut control_carets = 0;
+        for page in [0x00FF_FFFF, default_light, 0x0010_1016] {
+            for (si, style) in styles.into_iter().enumerate() {
+                let at = format!("{style:?} on {page:06x}");
+                // Classic's caret wears the theme's cursor colour, which nobody chose; its halo
+                // wears the trail's.
+                let caret_chosen = !matches!(style, Some(GlowStyle::Classic));
+                let (halo, mut carets) = run(style, page, false);
+                if !aterm_render::theme_is_dark(page) {
+                    assert!(!halo.is_empty(), "{at}: the burst lays a paper halo");
+                }
+                carets.retain(|_| caret_chosen);
+                let off: Vec<String> = halo
+                    .iter()
+                    .chain(&carets)
+                    .filter(|&&c| off_pin(c))
+                    .map(|c| format!("{c:06x}"))
+                    .collect();
+                assert!(
+                    off.is_empty(),
+                    "{at}: {} momentum pixels or carets leave the pin {PIN:06x}'s hue or pass \
+                     its chroma: {:?}",
+                    off.len(),
+                    &off[..off.len().min(8)]
+                );
+                if style.is_none() {
+                    assert!(
+                        carets.iter().any(|&c| c != PIN),
+                        "{at}: the burst charges the pinned caret: {carets:06x?}"
+                    );
+                }
+                let (halo, mut carets) = run(style, page, true);
+                carets.retain(|_| caret_chosen);
+                control_halo[si] += halo.iter().filter(|&&c| off_pin(c)).count();
+                control_carets += carets.iter().filter(|&&c| off_pin(c)).count();
+            }
+        }
+        assert!(
+            control_halo.iter().all(|&n| n > 0) && control_carets > 0,
+            "control: reading no colour as chosen, each style's paper halo ({styles:?}) and the \
+             charged caret leave the pin's hue or chroma (halo pixels, carets): \
+             {control_halo:?}, {control_carets}"
+        );
+    }
+
     #[test]
     fn the_rainbow_kitty_caret_reads_on_every_shipped_light_theme() {
         use crate::color_math::contrast_ratio;
@@ -2630,10 +2951,10 @@ mod tests {
     fn the_bolt_whitens_on_dark_and_deepens_on_light() {
         use crate::color_math::relative_luminance;
         let violet = crate::cursor_glow::LASER_DEFAULT_COLOR;
-        assert_eq!(bolt_body(violet, 0.0, true), violet);
-        let hot_dark = bolt_body(violet, 1.0, true);
+        assert_eq!(bolt_body(violet, 0.0, true, false), violet);
+        let hot_dark = bolt_body(violet, 1.0, true, false);
         assert!(relative_luminance(hot_dark) > relative_luminance(violet));
-        let hot_light = bolt_body(violet, 1.0, false);
+        let hot_light = bolt_body(violet, 1.0, false, false);
         assert!(relative_luminance(hot_light) < relative_luminance(violet));
         assert!(
             crate::color_math::contrast_ratio(hot_light, 0x00FF_FFFF) >= 3.0,

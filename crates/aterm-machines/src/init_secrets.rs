@@ -1204,9 +1204,9 @@ fn chosen(sys: &dyn System, ops: &dyn SecretsOps, typed: &str) -> Result<Chose, 
     }
 }
 
-/// The secrets step for this run. An unconfigured Mac joins the ALab vault where it answers,
-/// asking only its join password, or the vault `vault` (`--vault`) names; where neither, it
-/// asks nothing.
+/// The secrets step for this run. An unconfigured Mac joins the open default ALab vault on
+/// its LAN without a password. A password-protected vault or the vault `vault` (`--vault`)
+/// names may ask for its join password; where neither vault answers, it asks nothing.
 /// # Errors
 /// The run does not name exactly one user, or the person stopped a prompt (Ctrl-C); nothing
 /// was changed then.

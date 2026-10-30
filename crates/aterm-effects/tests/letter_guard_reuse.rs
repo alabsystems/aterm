@@ -276,8 +276,12 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
 /// of `docs/design/PRISM-GLASS.md` §15.2 1.9, which noted no light-owned range. At b11eed7965 it
 /// was `0x2f59_80aa_2780_cadd`. The trail/looks10 branch changes these styles' lights and the
 /// guard's cuts; this test, run on that branch's tip before it merged 1.9 (0088eabcf0), folded to
-/// the value below, and so did the merged tree: 1.9 still leaves the guard as its parent had it.
-const GUARDED_FOLD_AT_THE_PARENT: u64 = 0xc907_d12e_9b56_8217;
+/// `0xc907_d12e_9b56_8217`, and so did the merged tree: 1.9 still leaves the guard as its parent
+/// had it. Review 9's trail/rev9fix floats Comet's dark dust only into a row blank across on the
+/// page's own ground (the owner's ruling); merged onto main 227b056193 it folds to the value
+/// below. Folded style by style there and on that main, 22 of the 24 styles and grounds fold
+/// alike, and the two that differ are Comet on the dark and dim grounds, where the dust is drawn.
+const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x0664_f9bc_280d_ea74;
 
 /// FNV-1a over `words`, from `h`.
 fn fold_words(mut h: u64, words: impl IntoIterator<Item = u64>) -> u64 {

@@ -1918,24 +1918,31 @@ pub(crate) enum WhyFixture {}
 impl WhyFixture {
     fn from_seam() -> Option<Self> {
         let named = aterm_types::dev_seam!(WHY_FIXTURE_SEAM)?;
-        let calm = aterm_vitals::explain::fixtures::calm_1510();
-        let scene = match named.to_str()? {
-            "spotlight" => aterm_vitals::explain::fixtures::Scene {
-                mem: calm.mem,
-                thermal: calm.thermal,
-                ..aterm_vitals::explain::fixtures::spotlight_1032()
-            },
-            "calm" => calm,
-            other => {
-                aterm_log::warn!("system vitals: {WHY_FIXTURE_SEAM}={other} names no scene");
-                return None;
-            }
+        let name = named.to_str()?;
+        let Some(scene) = Self::scene_named(name) else {
+            aterm_log::warn!("system vitals: {WHY_FIXTURE_SEAM}={name} names no scene");
+            return None;
         };
         aterm_log::info!(
             "system vitals: reading the {} scene",
             named.to_string_lossy()
         );
         Some(Self { scene, t0: None })
+    }
+
+    /// The scene the seam's `name` names: `calm`, or `spotlight`'s work under calm's memory and
+    /// thermal state (it records neither); `None` for any other name.
+    fn scene_named(name: &str) -> Option<aterm_vitals::explain::fixtures::Scene> {
+        let calm = aterm_vitals::explain::fixtures::calm_1510();
+        match name {
+            "spotlight" => Some(aterm_vitals::explain::fixtures::Scene {
+                mem: calm.mem,
+                thermal: calm.thermal,
+                ..aterm_vitals::explain::fixtures::spotlight_1032()
+            }),
+            "calm" => Some(calm),
+            _ => None,
+        }
     }
 
     fn reading(&mut self, live: &Sample, split: bool) -> Sample {

@@ -10,6 +10,15 @@ use super::*;
 /// A wait for something that must happen: a hang detector, never a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
+/// A pace a peer the test serves keeps however loaded the machine: it always answers, so its
+/// race waits the hang detector, never [`PEER_PACE`]'s 5 s head and 2 s idle.
+const ANSWERS: Pace = Pace {
+    head: HANG,
+    window: HANG,
+    step: 1024 * 1024,
+    idle: HANG,
+};
+
 fn sha256_hex(bytes: &[u8]) -> String {
     aterm_codec::hex::encode_lower(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
@@ -71,12 +80,13 @@ fn a_peer_that_holds_the_unit_lands_it_and_stops_the_release_host() {
     let unit = b"the signed toolset archive".to_vec();
     let (peer, _judged) = one_shot_peer(unit.clone());
     let dest = dir.join("trust-1.tar.zst");
-    let got = race(
+    let got = race_paced(
         &[peer],
         &sha256_hex(&unit),
         unit.len() as u64,
         &dest,
         release_host(b"never written", until_stopped),
+        &ANSWERS,
     );
     assert_eq!(got, Ok(()));
     assert_eq!(
@@ -145,7 +155,7 @@ fn a_good_peer_lands_its_unit_when_the_release_host_fails() {
     let unit = b"the signed toolset archive".to_vec();
     let (peer, judged) = one_shot_peer(unit.clone());
     let dest = dir.join("trust-1.tar.zst");
-    let got = race(
+    let got = race_paced(
         &[peer],
         &sha256_hex(&unit),
         unit.len() as u64,
@@ -154,6 +164,7 @@ fn a_good_peer_lands_its_unit_when_the_release_host_fails() {
             judged.recv_timeout(HANG).expect("the peer was asked");
             Err("the release host is down".to_string())
         },
+        &ANSWERS,
     );
     assert_eq!(got, Ok(()));
     assert_eq!(std::fs::read(&dest).unwrap(), unit);
@@ -440,12 +451,13 @@ fn a_sharing_store_serves_a_kept_unit_by_default_and_lists_nothing() {
     keep_with_free(&layout, &dl, &sha, &build, ROOM);
 
     let dest = layout.prefix.join("got.tar.zst");
-    let got = race(
+    let got = race_paced(
         std::slice::from_ref(&addr),
         &sha,
         unit.len() as u64,
         &dest,
         release_host(b"never written", until_stopped),
+        &ANSWERS,
     );
     assert_eq!(got, Ok(()));
     assert_eq!(std::fs::read(&dest).unwrap(), unit, "served from the peer");

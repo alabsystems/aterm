@@ -15,6 +15,8 @@ pub use console_guard::serve_console_client;
 #[cfg(any(test, debug_assertions))]
 pub use console_guard::set_console_client;
 
+#[cfg(any(test, debug_assertions))]
+pub use openconsole::set_health_window_for_test;
 pub use openconsole::{
     console_host_report, preview_console_host, probe_console_host, set_console_host,
     take_console_host_fallback,

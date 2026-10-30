@@ -1688,6 +1688,8 @@ pub(crate) struct SettingsViewState {
     first_beside: Option<(UiKey, Option<UiKey>)>,
     /// Whether this render's seats let go a start held for a stop moved in at the top ([`page`]).
     start_let_go: Cell<bool>,
+    /// The control a press that moved the keyboard revealed ([`SettingsViewState::reveal_press`]).
+    press_left: Option<UiKey>,
     /// Whether an event came since the page opened ([`SettingsViewState::settle_page_scroll`]).
     page_events: bool,
     /// Where the control a press found whole on the screen drawn ended there, which the bar of
@@ -1920,6 +1922,7 @@ impl SettingsViewState {
             reveal_as: scroll::Reveal::Keep,
             first_beside: None,
             start_let_go: Cell::new(false),
+            press_left: None,
             page_events: false,
             pressed_at: RefCell::new(None),
             status_place: Cell::new(StatusPlace::Rule),
@@ -8480,11 +8483,11 @@ impl SettingsApp {
                 let reveal_before = view.page_reveal.clone();
                 view.list_reseated.set(false);
                 let result = self.reduce_action(view, invocation, cx);
-                // A press that took the keyboard to another control keeps that one in view (R2).
-                let kept = view.common.last_focus == focus_before
-                    || view.common.last_focus.as_ref() == Some(&pressed);
+                // Whether the press took the keyboard to a control other than the one pressed.
+                let moved = view.common.last_focus != focus_before
+                    && view.common.last_focus.as_ref() != Some(&pressed);
                 view.reveal_moved_focus(focus_before, true);
-                view.reveal_press(&pressed, reveal_before.as_ref(), kept);
+                view.reveal_press(&pressed, reveal_before.as_ref(), moved);
                 self.sync_draft_close_projection(view_id, view);
                 return result;
             }
@@ -14516,6 +14519,12 @@ fn unseen<R>(check: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Whether this thread's renders hold each list they reuse to the one laid out there.
+#[cfg(test)]
+fn reuses_checked() -> bool {
+    REUSES_CHECKED.with(|checked| checked.borrow().is_some())
+}
+
 /// `weigh`, once a render for `key` while [`BarsShared`] is open.
 fn weighed<K: PartialEq, V: Copy>(
     of: fn(&mut BarsWeighed) -> &mut Weighed<K, V>,
@@ -15855,6 +15864,33 @@ fn page(
     let laid = |chrome: PageChrome, most: Option<f32>| {
         measured(chrome, most, false).map(|(laid, _, _)| laid)
     };
+    // A test holds a list laid in `laid`, `reused` for `there` at `site` or not, to the one there.
+    #[cfg(test)]
+    let reuse_checked = |site: &str,
+                         (laid, list): (showcase_page::ListRoom, &scroll::ListLaid),
+                         (there, reused): (showcase_page::ListRoom, bool),
+                         (chrome, most): (PageChrome, Option<f32>)| {
+        if !there.held_as(laid) {
+            return;
+        }
+        let Some(fresh) = unseen(|| measured(chrome, most, true)).and_then(|(.., fresh)| fresh)
+        else {
+            return;
+        };
+        let plan = |list: &scroll::ListLaid| list.planned(there.room(), there.extra()).0.clone();
+        // A list built otherwise there is held only to a plan unlike, as its key does not tell it.
+        let built = list.builds_alike_in(there.room());
+        if (plan(&fresh) == plan(list)) != reused && (reused || built) {
+            let said = if reused { "reused" } else { "laid out again" };
+            REUSES_CHECKED.with(|checked| {
+                if let Some(seen) = checked.borrow_mut().as_mut() {
+                    seen.push(format!(
+                        "{said} at {site}: {laid:?} for {there:?} in {chrome:?}"
+                    ));
+                }
+            });
+        }
+    };
     // The plan a seat in `chrome` seats, told from its list measured unseated, `calm` or not.
     let told_plan = |chrome: PageChrome, calm: bool| {
         let (there, _, list) = measured_as(chrome, state.status_bar_most.get(), true, calm)?;
@@ -15880,11 +15916,23 @@ fn page(
                 .iter()
                 .any(|(by, _, _, list)| *by == (chrome, false) && matches!(list, Some(Some(_))));
         let (there, pinned, list) = measured(chrome, most, !other)?;
+        #[cfg(test)]
+        if list.is_none() && reuses_checked() {
+            let lists = measures.borrow().clone();
+            for (by, _, laid, list) in lists {
+                if let (Some((laid, _)), Some(Some(list))) = (laid, list)
+                    && by == (chrome, false)
+                {
+                    let reused = there.drawn_as(laid, state) && list.builds_alike_in(there.room());
+                    reuse_checked("rows_at", (laid, &list), (there, reused), (chrome, most));
+                }
+            }
+        }
         let alike = list.or_else(|| {
             measures.borrow().iter().find_map(|(by, _, laid, list)| {
                 let list = list.clone().flatten()?;
                 (*by == (chrome, false)
-                    && laid.is_some_and(|(laid, _)| laid.stops_as(there))
+                    && laid.is_some_and(|(laid, _)| there.drawn_as(laid, state))
                     && list.builds_alike_in(there.room()))
                 .then_some(list)
             })
@@ -15922,6 +15970,30 @@ fn page(
         && drawn_at.is_some_and(|at| !at.same_page(&chrome_at) || at.warning != chrome_at.warning);
     // Blocks between reveal and keyboard's control per panel width and frame, once a render (R3).
     let between: RefCell<Vec<BetweenAt>> = RefCell::new(Vec::new());
+    let between_at = |(panel, framed): (f32, bool)| {
+        let at = (panel.to_bits(), framed);
+        let known = between
+            .borrow()
+            .iter()
+            .find(|(was, _)| *was == at)
+            .map(|(_, found)| *found);
+        known.unwrap_or_else(|| {
+            let page_width = settings_page_content_width(
+                cx.viewport.width,
+                width,
+                PageLayout::Stage.maximum(width),
+            );
+            let found = state
+                .page_reveal
+                .as_ref()
+                .zip(state.common.last_focus.as_ref())
+                .and_then(|(reveal, key)| {
+                    showcase_page::blocks_between(state, (page_width, panel, framed), reveal, key)
+                });
+            between.borrow_mut().push((at, found));
+            found
+        })
+    };
     // Caption over the reveal's row and its section's tallest row per panel width and frame.
     let overs: RefCell<Vec<RevealOver>> = RefCell::new(Vec::new());
     // What a list `room` tall in a `panel`-wide panel, framed or not, must show of the reveal (R3).
@@ -15940,24 +16012,7 @@ fn page(
             over
         });
         let blocks = left.and_then(|left| {
-            let known = between
-                .borrow()
-                .iter()
-                .find(|(was, _)| *was == at)
-                .map(|(_, found)| *found);
-            let found = known.unwrap_or_else(|| {
-                let page_width = settings_page_content_width(
-                    cx.viewport.width,
-                    width,
-                    PageLayout::Stage.maximum(width),
-                );
-                let found = state.common.last_focus.as_ref().and_then(|key| {
-                    showcase_page::blocks_between(state, (page_width, panel, framed), reveal, key)
-                });
-                between.borrow_mut().push((at, found));
-                found
-            });
-            let found = found?;
+            let found = between_at((panel, framed))?;
             let (between, row, control) = found.in_room(room);
             let owed = left.map_or(control, |left| left.owed_least(control));
             let joined = found.joined_in(room);
@@ -16155,8 +16210,10 @@ fn page(
         if let Some(chrome) = kept {
             let scrolled = record.as_ref().is_some_and(|record| record.top() > 0);
             let tells = bars || ahead(chrome);
-            // A reveal of a control pinned before is the seat's to keep, not the chrome's (R5).
-            let reveals = state.page_reveal.is_some() && !state.reveals_pinned(record.as_ref());
+            // A reveal of a control pinned before, or one a press left, is the seat's to keep (R5).
+            let reveals = state.page_reveal.is_some()
+                && !state.reveals_pinned(record.as_ref())
+                && !state.reveal_left_by_press();
             // A PRESS'S STATUS NEVER CHANGES THE PAGE'S CHROME: its bar takes a side of the list,
             // or the toolbar's place, as the press's place lets it ([`scroll::BarSide`]). Chosen
             // again under it, a 178x152 window at 2x listed its toolbar, the switch pressed at
@@ -16463,8 +16520,15 @@ fn page(
             rows_at(chrome, most).map(|(there, pinned, _)| (there, pinned))?
         };
         let (given, slack) = bar_takes(chrome, most);
+        #[cfg(test)]
+        if let Some((laid, [list])) = seated
+            && reuses_checked()
+        {
+            let reused = there.drawn_as(laid, state) && list.builds_alike_in(there.room());
+            reuse_checked("overrun_at", (laid, list), (there, reused), (chrome, most));
+        }
         let list = seated.and_then(|(laid, lists)| match lists {
-            [list] if there.stops_as(laid) => Some((laid, list)),
+            [list] if there.drawn_as(laid, state) => Some((laid, list)),
             _ => None,
         });
         let told = match list {
@@ -16525,8 +16589,36 @@ fn page(
             }
             None
         };
-    // The screen a seat in `chrome` under the bar at `most` would leave, told as its overrun is,
-    // once a render.
+    // The plan a seat in `chrome` under `most` seats, unseated: `seated`'s where drawn alike there.
+    let seat_plan = |chrome: PageChrome,
+                     seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>,
+                     most: Option<f32>| {
+        let there = if seated.is_some_and(|(_, lists)| lists.len() == 1) {
+            measured(chrome, most, false)?.0
+        } else {
+            rows_at(chrome, most)?.0
+        };
+        let (given, _) = bar_takes(chrome, most);
+        #[cfg(test)]
+        if let Some((laid, [list])) = seated
+            && reuses_checked()
+        {
+            let reused = there.drawn_as(laid, state) && list.builds_alike_in(there.room());
+            reuse_checked("seated_told", (laid, list), (there, reused), (chrome, most));
+        }
+        let list = seated.and_then(|(laid, lists)| match lists {
+            [list] if there.drawn_as(laid, state) && list.builds_alike_in(there.room()) => {
+                Some(list)
+            }
+            _ => None,
+        });
+        let plan = match list {
+            Some(list) => list.planned(there.room(), given),
+            None => rows_at(chrome, most)?.2.planned(there.room(), given),
+        };
+        Some((there, plan))
+    };
+    // The screen a seat in `chrome` under `most` leaves, told as its overrun is, once a render.
     let screens: RefCell<Vec<ToldScreen>> = RefCell::new(Vec::new());
     let seated_told = |chrome: PageChrome,
                        seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>,
@@ -16540,20 +16632,7 @@ fn page(
         if known.is_some() {
             return known;
         }
-        let there = if seated.is_some_and(|(_, lists)| lists.len() == 1) {
-            measured(chrome, most, false)?.0
-        } else {
-            rows_at(chrome, most)?.0
-        };
-        let (given, _) = bar_takes(chrome, most);
-        let list = seated.and_then(|(laid, lists)| match lists {
-            [list] if there.stops_as(laid) && list.builds_alike_in(there.room()) => Some(list),
-            _ => None,
-        });
-        let plan = match list {
-            Some(list) => list.planned(there.room(), given),
-            None => rows_at(chrome, most)?.2.planned(there.room(), given),
-        };
+        let (there, plan) = seat_plan(chrome, seated, most)?;
         let mut plan = plan.0.clone();
         plan.pin_keyboard(there.keyboard_pin());
         let told = state.seated_under(plan, record.clone());
@@ -16690,19 +16769,101 @@ fn page(
         let given = bar_at(most) - bar_at(Some(0.0));
         let rooms = (given > 0.01 && read(&|state| state.landing_fits(given, false)))
             .then(|| laid(chrome, most).zip(laid(chrome, Some(0.0))));
+        // A test holds the list laid out now, standing for the least's, to the least's own list.
+        #[cfg(test)]
+        if let Some(Some((now, least))) = rooms
+            && least != now
+            && reuses_checked()
+            && let Some((.., Some(list))) = unseen(|| measured(chrome, most, true))
+        {
+            let alike = least.stops_as(now, state);
+            reuse_checked(
+                "least_from",
+                (now, &list),
+                (least, alike),
+                (chrome, Some(0.0)),
+            );
+        }
+        // A test build's control tells the keyboard's span as 301c728680: on the list laid out now.
+        #[cfg(test)]
+        let by_now = LEAST_TOLD_BY_NOW.with(Cell::get);
+        #[cfg(not(test))]
+        let by_now = false;
+        let alike = |least: showcase_page::ListRoom, now: showcase_page::ListRoom| {
+            #[cfg(test)]
+            if by_now {
+                return least.held_as(now);
+            }
+            least.stops_as(now, state)
+        };
+        // Unlike stops tell the keyboard's span on the least's rows: apart, else its seat's plan.
+        let told_fits = |least: showcase_page::ListRoom| {
+            let apart = || {
+                let rows_apart = || {
+                    let page_width = || {
+                        settings_page_content_width(
+                            cx.viewport.width,
+                            width,
+                            PageLayout::Stage.maximum(width),
+                        )
+                    };
+                    state
+                        .page_reveal
+                        .as_ref()
+                        .zip(state.common.last_focus.as_ref())
+                        .is_some_and(|keys| {
+                            showcase_page::rows_apart(state, page_width, least, keys)
+                        })
+                };
+                let footer = || {
+                    state.common.last_focus.as_ref().map_or([0.0; 2], |key| {
+                        showcase_page::footer_reach(state, least.panel_framed(), key)
+                    })
+                };
+                // The render's Between first: shared with R3, it is mostly read, not built.
+                !state.showcase.sheet_open
+                    && (between_at(least.panel_framed())
+                        .is_some_and(|found| found.apart_in(least, footer))
+                        || rows_apart())
+            };
+            !state.keyboard_listed_whole(settled.as_ref())
+                || !apart()
+                    && seat_plan(chrome, seated, Some(0.0)).is_some_and(|(_, plan)| {
+                        read(&|state| state.landing_fits_on(Some(&plan.0), 0.0, true))
+                    })
+        };
         let fits = |keyboard: bool| {
             rooms.is_some_and(|measured| {
                 measured.is_none_or(|(now, least)| {
-                    least != now
-                        && read(&|state| {
-                            state.landing_fits(
-                                least.stops() - now.stops(),
-                                keyboard && least.stops_as(now),
-                            )
-                        })
+                    if least == now {
+                        return false;
+                    }
+                    let kept = keyboard && alike(least, now);
+                    read(&|state| state.landing_fits(least.stops() - now.stops(), kept))
+                        && (!keyboard || kept || by_now || told_fits(least))
                 })
             })
         };
+        // A test holds what the least tells where its stops lay out unlike to its own list's word.
+        #[cfg(test)]
+        if let Some(Some((now, least))) = rooms
+            && least != now
+            && reuses_checked()
+            && !least.stops_as(now, state)
+            && let Some((.., Some(own))) = unseen(|| measured(chrome, Some(0.0), true))
+            && unseen(|| {
+                let plan = own.planned(least.room(), least.extra());
+                fits(true) != read(&|state| state.landing_fits_on(Some(&plan.0), 0.0, true))
+            })
+        {
+            REUSES_CHECKED.with(|checked| {
+                if let Some(seen) = checked.borrow_mut().as_mut() {
+                    seen.push(format!(
+                        "told at least_from: {least:?} for {now:?} in {chrome:?}"
+                    ));
+                }
+            });
+        }
         if !fits(true) {
             return LeastFrom::Turned { alone: fits(false) };
         }
@@ -18381,6 +18542,10 @@ thread_local! {
     /// The chrome this thread's renders seat the page in, whatever the page would choose (a
     /// test holds a frame's chrome to measure its screens).
     pub(crate) static PAGE_CHROME_HELD: Cell<Option<PageChrome>> = const { Cell::new(None) };
+    /// Where set, each list reused though it plans otherwise, or laid out again though alike.
+    pub(crate) static REUSES_CHECKED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// Whether a least bar's keyboard span is told on the list laid out now (a control).
+    pub(crate) static LEAST_TOLD_BY_NOW: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's renders stack a compact window's statuses under
     /// the page rather than dock them in the toolbar.
     pub(crate) static STATUS_UNDOCKED: Cell<bool> = const { Cell::new(false) };

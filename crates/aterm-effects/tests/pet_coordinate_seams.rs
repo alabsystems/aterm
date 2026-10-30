@@ -1986,7 +1986,12 @@ fn caught(h: &mut Host, caught: &str) -> Shot {
             }
             h.run(Duration::from_millis(500));
             h.term.process(b"\r\n$ ");
-            (|p: &PetFrame| p.lift > 0.3, 60)
+            // Between the lines, not by lift: under the lettered row the landing seat sinks
+            // the feet (`head_law`), so a low arc keeps the lift under the ground line.
+            (
+                |p: &PetFrame| p.action == PetAction::Leap && (p.row - p.row.round()).abs() > 0.3,
+                60,
+            )
         }
     };
     for _ in 0..frames {

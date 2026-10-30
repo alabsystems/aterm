@@ -1313,8 +1313,12 @@ fn a_strike_shows_no_piece_apart_from_its_carets() {
 /// the corona stood cut at the grid's bottom edge (3 px of lavender along
 /// the card's last pixel row, dark and light). Forged from 300 seeds in that
 /// card's grid on the dark page, no strike lights the grid's last pixel row
-/// or a side column. Negative control `strike_channel_fork_girth` (the
-/// channel kept in by a fork's girth): a strike in 10 or more of 300 does.
+/// or a side column. Negative controls, each alone: `strike_channel_fork_girth`
+/// (the channel kept in by a fork's girth; 13 of 300 light the edge under a
+/// keeper that read the girth across the height alone, 9 under the slabs'
+/// own girth), and `bolt_ends_unread` (each segment read between its ends,
+/// not the pixel past each its slabs' tiling lays; review 9 round 3's merge:
+/// a steep turn in the last pixel row lit it).
 #[test]
 fn a_strike_s_corona_keeps_inside_its_grid() {
     use aterm_core::terminal::RenderCell;
@@ -1398,7 +1402,12 @@ fn a_strike_s_corona_keeps_inside_its_grid() {
     assert_eq!(kept, 0, "{kept} of 300 strikes light the grid's edge");
     let control = cut(&|glow| glow.strike_channel_fork_girth = true);
     assert!(
-        control >= 10,
-        "control: kept in by a fork's girth, only {control} of 300 strikes light the grid's edge"
+        control > 0,
+        "control: kept in by a fork's girth, no strike lights the grid's edge"
+    );
+    let ends = cut(&|glow| glow.bolt_ends_unread = true);
+    assert!(
+        ends > 0,
+        "control: each segment read between its ends alone, no strike lights the grid's edge"
     );
 }

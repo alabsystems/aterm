@@ -1170,6 +1170,163 @@ fn a_chosen_colour_lands_as_itself_on_dark() {
     }
 }
 
+/// A colour the user chose ([`ColourPins`]) lands as itself on paper too: every light of the
+/// landing's rim and veil keeps the colour's hue and goes no further from grey than it does (a
+/// grey stays grey). An unset accent is the pinned trail brightened, which takes a pale pin to
+/// white, and the clean-hue lift read white's hue as 0: Sparkle pinned to `#b0b0c8` landed a
+/// rose ring and veil at an Enter (the trail gallery's `sparkle-pin` `enter-bottom` on GitHub
+/// Light, review9fix round 1). Negative control ([`CursorGlow::paper_pin_unread`], a chosen
+/// colour read as a style's own): the pale pin and the greys land saturated and Laser's violet
+/// is lifted; a pin already at the clean chroma (`#d03a8c`) lands the same either way.
+#[test]
+fn a_chosen_colour_lands_as_itself_on_paper() {
+    let g = geom();
+    let born = Instant::now();
+    let caret = (2u16, 12u16);
+    let pinned_trail = ColourPins {
+        trail: true,
+        accent: false,
+    };
+    let pinned_accent = ColourPins {
+        trail: false,
+        accent: true,
+    };
+    let bright = |c: u32| crate::cursor_fx::brighten(c, 1.5) & 0x00FF_FFFF;
+    // (style, trail colour, accent, pins, the colour the landing wears, the control moves it)
+    let cases = [
+        (
+            GlowStyle::Sparkle,
+            0x00B0_B0C8u32,
+            bright(0x00B0_B0C8),
+            pinned_trail,
+            0x00B0_B0C8u32,
+            true,
+        ),
+        (
+            GlowStyle::Sparkle,
+            0x00D0_3A8C,
+            bright(0x00D0_3A8C),
+            pinned_trail,
+            0x00D0_3A8C,
+            false,
+        ),
+        (
+            GlowStyle::Laser,
+            0x0090_70B0,
+            0x0090_70B0,
+            pinned_trail,
+            0x0090_70B0,
+            true,
+        ),
+        (
+            GlowStyle::Comet,
+            0x0050_FA7B,
+            0x00FF_FFFF,
+            pinned_accent,
+            0x00FF_FFFF,
+            true,
+        ),
+        (
+            GlowStyle::Phaser,
+            0x0050_FA7B,
+            0x0060_6060,
+            pinned_accent,
+            0x0060_6060,
+            true,
+        ),
+    ];
+    let hsv = |c: u32| crate::color_math::rgb2hsv(c & 0x00FF_FFFF);
+    // Every light the landing lays at 60 ms, as `(hue, saturation)`: the rim's quads in their
+    // straight colour, the veil as it reads over the paper.
+    let lights = |style: GlowStyle, (color, accent): (u32, u32), pins: ColourPins, unread: bool| {
+        let mut c = cfg(style, true);
+        c.dark_theme = false;
+        (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+        (c.color, c.accent) = (color, accent);
+        let (cx, cy) = g.cell_center(caret.0, caret.1);
+        let glow = CursorGlow {
+            ring: Some(Ring {
+                cx,
+                cy,
+                born,
+                life: 0.30,
+                scale: 1.0,
+                caret: Some(caret),
+            }),
+            colour_pins: pins,
+            paper_pin_unread: unread,
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(60),
+            &c,
+            g,
+            Some(caret),
+            &mut out,
+            &mut halos,
+        );
+        assert!(
+            !halos.is_empty(),
+            "{style:?}: fixture: the landing lays its veil"
+        );
+        let mut seen = Vec::new();
+        for q in &out {
+            if q.alpha >= 32 {
+                let a = u32::from(q.alpha);
+                let ch = |sh: u32| ((((q.color >> sh) & 0xff) * 255 + a / 2) / a).min(255);
+                seen.push(hsv((ch(16) << 16) | (ch(8) << 8) | ch(0)));
+            }
+        }
+        let mut glass = Glass::new(g, c.theme_bg);
+        glass.add_halos(&halos);
+        for y in 0..i32::from(g.win_h) {
+            for x in 0..i32::from(g.win_w) {
+                let p = glass.at(y, x) & 0x00FF_FFFF;
+                if p != c.theme_bg {
+                    seen.push(hsv(p));
+                }
+            }
+        }
+        seen.into_iter().map(|(h, s, _)| (h, s)).collect::<Vec<_>>()
+    };
+    // How far a light strays from the worn colour: (past its saturation, off its hue).
+    let stray = |seen: &[(f32, f32)], worn: u32| {
+        let (h0, s0, _) = hsv(worn);
+        seen.iter().fold((0.0f32, 0.0f32), |(sat, hue), &(h, s)| {
+            let off = if s0 >= 0.05 && s >= 0.04 {
+                let d = (h - h0).abs();
+                d.min(360.0 - d)
+            } else {
+                0.0
+            };
+            (sat.max(s - s0), hue.max(off))
+        })
+    };
+    for (style, color, accent, pins, worn, moved) in cases {
+        let seen = lights(style, (color, accent), pins, false);
+        assert!(
+            seen.len() > 20,
+            "{style:?}: fixture: the landing lays {} lights",
+            seen.len()
+        );
+        let (sat, hue) = stray(&seen, worn);
+        assert!(
+            sat <= 0.04 && hue <= 8.0,
+            "{style:?}: the chosen #{worn:06x} lands {sat:.2} past its saturation, {hue:.0}° off \
+             its hue"
+        );
+        let (old_sat, old_hue) = stray(&lights(style, (color, accent), pins, true), worn);
+        if moved {
+            assert!(
+                old_sat > 0.1 || old_hue > 10.0,
+                "control, {style:?}: read as unchosen, #{worn:06x} still lands as itself \
+                 ({old_sat:.2} past, {old_hue:.0}° off)"
+            );
+        }
+    }
+}
+
 /// THE DARK RING SHOWS AS A RING OR NOT AT ALL (looks8 round 3): on the dark page the landing
 /// ring's rim runs on under the letters at a fifth of its light ([`RIM_UNDER_LETTERS`]), so
 /// what reads of it is the part that keeps its whole light. After an Enter at the bottom row
@@ -1392,5 +1549,285 @@ fn the_dark_ring_once_hidden_stays_hidden() {
         afresh_flickers > 0,
         "negative control: judged afresh each frame, no ring style's rim came back after a \
          hidden frame"
+    );
+}
+
+/// The one-colour Classic ring (`#d03a8c` on the reference dark) through
+/// [`crate::cursor_fx::CursorFx::tick`], the frame text handed as the GUI's
+/// split hands it (the pane's own cells at its window row `pane_at`, its
+/// width the window's, window cells for the caret): the caret rests at
+/// `from` over `before`, then lands at `land` over `after`, the page
+/// scrolled `scroll` rows by the landing. `window_edge` keeps the ring to
+/// the window's grid alone ([`crate::classic_wake::ClassicWake::ring_window_edge`]).
+/// Returns `(frames drawn, frames laid past the pane, frames whole after the
+/// GUI clips the glow to the pane)` over the 300 ms after the landing.
+#[expect(clippy::too_many_arguments, reason = "a test rig's whole scene")]
+fn mono_ring_in_pane(
+    win_rows: usize,
+    (pane_at, pane_rows): (u16, usize),
+    before: &[(u16, &str)],
+    from: (u16, u16),
+    after: &[(u16, &str)],
+    land: (u16, u16),
+    scroll: u16,
+    window_edge: bool,
+) -> (usize, usize, usize) {
+    use crate::cursor_fx::{CursorFx, CursorFxInput, GlowKnobs, GlowSpelling, resolve_glow_config};
+    const PAGE: (u32, u32) = (0x00D0_D0D0, 0x0011_1318);
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: win_rows,
+        cols: 72,
+        origin_x: 12,
+        origin_y: 2,
+        win_w: 1032,
+        win_h: (2 + win_rows * 26 + 2) as u16,
+        head: 0,
+    };
+    let glow_cfg = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: Some(0x00D0_3A8C),
+            accent: None,
+            duration_ms: 260,
+            length: 24,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Classic), true),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(GlowStyle::Classic),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: true,
+        },
+        0x0054_F97A,
+        true,
+        PAGE.0,
+        PAGE.1,
+        0.5,
+    );
+    assert!(
+        glow_cfg.classic_mono && glow_cfg.ring && glow_cfg.dark_theme,
+        "fixture: the one-colour face on dark"
+    );
+    let trail_cfg = TrailConfig {
+        enabled: false,
+        duration: Duration::from_millis(260),
+        max_len: 24,
+        color: glow_cfg.color,
+        intensity: 0.0,
+        warmth: 0.0,
+    };
+    let mut fx = CursorFx::default();
+    fx.glow.classic.ring_window_edge = window_edge;
+    let input = |now: Instant, cur: (u16, u16)| CursorFxInput {
+        now,
+        cur: Some(cur),
+        live_viewport: true,
+        cursor_style: aterm_core::terminal::CursorStyle::SteadyBlock,
+        blink_phase: true,
+        live_cursor: 0x0054_F97A,
+        cursor_color_pinned: false,
+        default_bg: PAGE.1,
+        cursor_cell_bg: None,
+        geom: g,
+        focused: true,
+        shed_envelope: 1.0,
+        trail_brightness: 1.0,
+        body_allowed: true,
+        momentum_glow: true,
+        user_tinted: true,
+        accent_pinned: false,
+    };
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let frame = |lines: &[(u16, &str)]| {
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; pane_rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(PAGE.0), rgb(PAGE.1));
+            }
+        }
+        for &(row, text) in lines {
+            for (col, ch) in text.chars().enumerate() {
+                rows[usize::from(row - pane_at)][col].ch = ch;
+            }
+        }
+        rows
+    };
+    let line_of = |lines: &[(u16, &str)], row: u16| -> Option<Vec<char>> {
+        if row < pane_at || usize::from(row - pane_at) >= pane_rows {
+            return None;
+        }
+        let mut cols: Vec<char> = lines
+            .iter()
+            .find(|l| l.0 == row)
+            .map_or(String::new(), |l| l.1.to_string())
+            .chars()
+            .collect();
+        cols.resize(g.cols, ' ');
+        Some(cols)
+    };
+    let step = |fx: &mut CursorFx, lines: &[(u16, &str)], caret: (u16, u16), now: Instant| {
+        fx.begin(true, true);
+        let row = line_of(lines, caret.0).expect("fixture: the caret is in the pane");
+        fx.glow.observe_row(caret.0, caret.1, &row, now);
+        let above = caret.0.checked_sub(1).and_then(|r| line_of(lines, r));
+        let below = line_of(lines, caret.0 + 1);
+        fx.glow
+            .observe_neighbor_rows(above.as_deref(), below.as_deref());
+        fx.glow
+            .observe_frame_text_at(Some(caret), &frame(lines), ((pane_at, 0), g.cols), now);
+        let _ = fx.tick(&input(now, caret), &glow_cfg, trail_cfg);
+    };
+    let t0 = Instant::now();
+    step(&mut fx, before, from, t0);
+    step(&mut fx, before, from, t0 + Duration::from_millis(400));
+    let enter = t0 + Duration::from_millis(432);
+    if scroll > 0 {
+        fx.scroll_translate(scroll);
+    }
+    let (y0, y1) = (
+        i32::from(g.origin_y) + i32::from(pane_at) * g.ch as i32,
+        i32::from(g.origin_y) + (i32::from(pane_at) + pane_rows as i32) * g.ch as i32,
+    );
+    let (mut drawn, mut past, mut whole) = (0usize, 0usize, 0usize);
+    for k in 0..=150u64 {
+        step(&mut fx, after, land, enter + Duration::from_millis(2 * k));
+        let quads = fx.glow.classic.ring_seen.take();
+        if quads.is_empty() {
+            continue;
+        }
+        drawn += 1;
+        past += usize::from(
+            quads
+                .iter()
+                .any(|q| i32::from(q.y) < y0 || i32::from(q.y) + i32::from(q.h) > y1),
+        );
+        // What the GUI's clip of the glow to the pane's box leaves.
+        let px: std::collections::BTreeSet<(i32, i32)> = quads
+            .iter()
+            .flat_map(|q| {
+                let (a, b) = (
+                    i32::from(q.y).max(y0),
+                    (i32::from(q.y) + i32::from(q.h)).min(y1),
+                );
+                (a..b).flat_map(move |y| {
+                    (i32::from(q.x)..i32::from(q.x) + i32::from(q.w)).map(move |x| (x, y))
+                })
+            })
+            .collect();
+        let (Some(x0), Some(x1)) = (px.iter().map(|p| p.0).min(), px.iter().map(|p| p.0).max())
+        else {
+            continue;
+        };
+        let (ya, yb) = (
+            px.iter().map(|p| p.1).min().unwrap_or(0),
+            px.iter().map(|p| p.1).max().unwrap_or(0),
+        );
+        let rim = (x0..=x1).all(|x| px.contains(&(x, ya)) && px.contains(&(x, yb)))
+            && (ya..=yb).all(|y| px.contains(&(x0, y)) && px.contains(&(x1, y)));
+        whole += usize::from(rim && x1 - x0 == yb - ya);
+    }
+    (drawn, past, whole)
+}
+
+/// One case of [`the_one_colour_ring_is_whole_or_not_drawn_in_a_split_s_pane`]:
+/// its label, the pane `(top row, rows)`, the lines before the jump, the
+/// caret it jumps from, the lines after, the cell it lands on, and the rows
+/// the landing scrolled.
+type PaneCase<'a> = (
+    &'a str,
+    (u16, usize),
+    &'a [(u16, &'a str)],
+    (u16, u16),
+    &'a [(u16, &'a str)],
+    (u16, u16),
+    u16,
+);
+
+/// looks9's review of Q4: THE ONE-COLOUR RING IS WHOLE OR NOT DRAWN IN A
+/// SPLIT'S PANE. Kept inside the window's grid alone, an Enter onto a top
+/// pane's last row (a `PS1=$'\n$ '` prompt scrolling the pane two rows) laid
+/// the ring across the divider for its whole life, where the GUI clips the
+/// glow to the pane and left it three bars; a `clear` in a bottom pane laid
+/// it across the pane's top edge. In both, every drawn frame lies inside
+/// the pane and is whole after the clip; a landing in a pane's middle still
+/// shows its ring whole. Negative control (`ring_window_edge`): kept to the
+/// window's grid, the ring is laid past the pane's edge.
+#[test]
+fn the_one_colour_ring_is_whole_or_not_drawn_in_a_split_s_pane() {
+    let last: u16 = 13;
+    let enter_before = [
+        (last - 2, "$ ls"),
+        (last - 1, "Cargo.toml  src"),
+        (last, "$ true"),
+    ];
+    let enter_after = [
+        (last - 4, "$ ls"),
+        (last - 3, "Cargo.toml  src"),
+        (last - 2, "$ true"),
+        (last, "$ "),
+    ];
+    let (top, bottom_last): (u16, u16) = (14, 27);
+    let clear_before = [(bottom_last - 1, "$ make"), (bottom_last, "$ clear")];
+    let clear_after = [(top, "$ ")];
+    let cases: [PaneCase<'_>; 2] = [
+        (
+            "an Enter onto a top pane's last row",
+            (0, 14),
+            &enter_before,
+            (last, 6),
+            &enter_after,
+            (last, 2),
+            2,
+        ),
+        (
+            "a clear in a bottom pane",
+            (top, 14),
+            &clear_before,
+            (bottom_last, 7),
+            &clear_after,
+            (top, 2),
+            0,
+        ),
+    ];
+    for (label, pane, before, from, after, land, scroll) in cases {
+        let (drawn, past, whole) =
+            mono_ring_in_pane(28, pane, before, from, after, land, scroll, false);
+        assert_eq!(
+            past, 0,
+            "{label}: {past} of {drawn} drawn frames lie past the pane"
+        );
+        assert_eq!(
+            whole,
+            drawn,
+            "{label}: {} of {drawn} drawn frames are cut by the pane's clip",
+            drawn - whole
+        );
+        let (old_drawn, old_past, _) =
+            mono_ring_in_pane(28, pane, before, from, after, land, scroll, true);
+        assert!(
+            old_past > 0,
+            "control: {label}: kept to the window's grid, none of {old_drawn} frames lies past the pane"
+        );
+    }
+    // A landing in the bottom pane's middle beside a `$` still rings.
+    let mid = [(top + 5, "$ ")];
+    let (drawn, past, whole) = mono_ring_in_pane(
+        28,
+        (top, 14),
+        &mid,
+        (top + 5, 30),
+        &mid,
+        (top + 5, 2),
+        0,
+        false,
+    );
+    assert!(
+        drawn >= 20 && past == 0 && whole == drawn,
+        "a landing in a pane's middle: drawn {drawn}, past {past}, whole {whole}"
     );
 }

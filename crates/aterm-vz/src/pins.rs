@@ -195,8 +195,7 @@ fn placed(tool: &Tool, lookup: &Lookup, sha256: &str) -> Result<PathBuf, Error> 
         return Err(missing());
     };
     let stamp = root.join(PIN_STAMP);
-    let pinned = std::fs::read_to_string(&stamp)
-        .ok()
+    let pinned = crate::read_small_text(&stamp, 64 * 1024)
         .and_then(|text| aterm_json::from_str::<aterm_json::Value>(&text).ok())
         .is_some_and(|s| {
             let field = |key: &str| s.get(key).and_then(aterm_json::Value::as_str);
@@ -221,7 +220,25 @@ fn placed(tool: &Tool, lookup: &Lookup, sha256: &str) -> Result<PathBuf, Error> 
 /// finds a row in place: the reclaim's idle rule reads the stamp's time. Best effort: a
 /// cache the lane cannot write is still read.
 fn mark_used(stamp: &Path) {
-    if let Ok(file) = std::fs::File::options().append(true).open(stamp) {
+    #[cfg(unix)]
+    let open = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(stamp)
+    };
+    #[cfg(not(unix))]
+    let open = std::fs::symlink_metadata(stamp).and_then(|m| {
+        if m.is_file() {
+            std::fs::File::options().append(true).open(stamp)
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        }
+    });
+    if let Ok(file) = open
+        && file.metadata().is_ok_and(|m| m.is_file())
+    {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
 }

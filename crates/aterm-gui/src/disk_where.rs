@@ -186,13 +186,12 @@ fn survey(ask: &Ask) -> Found {
                         ..Budget::SHIPPED
                     },
                 );
-                let (hogs, spent) = rows(
-                    &found.found,
+                found_rows(
+                    &found,
                     &home,
                     || Instant::now() >= deadline,
                     |dir| aterm_agent::harness::disk::target::total_bytes_until(dir, deadline),
-                );
-                (hogs, spent || found.cut.is_some())
+                )
             }
             None => {
                 return Found {
@@ -242,6 +241,18 @@ fn placed(path: &Path, home: &Path, table: &Table) -> bool {
         && mount_of(home, table).is_some_and(|on_home| {
             local(on_home) && mount_of(path, table).is_some_and(|m| m.on == on_home.on)
         })
+}
+
+/// The rows of a discovery ([`rows`]), and whether they are cut: the sizing ran out of time or
+/// the search itself was cut short.
+fn found_rows(
+    found: &discover::Discovered,
+    home: &Path,
+    spent: impl FnMut() -> bool,
+    size: impl FnMut(&Path) -> (u64, bool),
+) -> (Vec<Hog>, bool) {
+    let (hogs, spent) = rows(&found.found, home, spent, size);
+    (hogs, spent || found.cut.is_some())
 }
 
 fn rows(
@@ -609,5 +620,28 @@ mod tests {
         assert!(!cut);
         assert_eq!(hogs.len(), ROWS);
         assert!(hogs.windows(2).all(|w| w[0].bytes >= w[1].bytes));
+    }
+
+    /// A discovery its search budget cut short is a cut survey, whose rows may miss the largest
+    /// folders, however its sizing went.
+    #[test]
+    fn a_search_cut_short_makes_a_cut_survey() {
+        let home = Path::new("/h");
+        let cut = |why: Option<&str>| discover::Discovered {
+            found: vec![found(&home.join("p0/target"))],
+            notes: Vec::new(),
+            cut: why.map(str::to_owned),
+        };
+        let (hogs, cut_short) =
+            found_rows(&cut(Some("wall budget")), home, || false, |_| (100, false));
+        assert_eq!(
+            hogs.iter()
+                .map(|h| (h.path.as_str(), h.bytes))
+                .collect::<Vec<_>>(),
+            [("~/p0/target", 100)]
+        );
+        assert!(cut_short);
+        let (_, cut_short) = found_rows(&cut(None), home, || false, |_| (100, false));
+        assert!(!cut_short, "searched whole and sized in time");
     }
 }

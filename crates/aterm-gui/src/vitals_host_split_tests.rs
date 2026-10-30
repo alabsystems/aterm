@@ -1328,6 +1328,33 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
     );
 }
 
+/// The seam names two scenes: `calm`, and `spotlight`'s own work under calm's memory and
+/// thermal state, which its recording lacks; any other name is none.
+#[cfg(debug_assertions)]
+#[test]
+fn the_why_seam_names_calm_and_spotlight_under_calms_memory() {
+    use aterm_vitals::explain::fixtures::{Scene, calm_1510, spotlight_1032};
+    let calm = calm_1510();
+    assert_eq!(WhyFixture::scene_named("calm"), Some(calm.clone()));
+    let spotlight = WhyFixture::scene_named("spotlight").expect("a scene");
+    assert!(spotlight.mem.is_some() && spotlight.thermal.is_some());
+    assert_eq!(
+        (spotlight.mem, spotlight.thermal),
+        (calm.mem, calm.thermal),
+        "calm's memory and thermal state"
+    );
+    assert_eq!(
+        Scene {
+            mem: None,
+            thermal: None,
+            ..spotlight
+        },
+        spotlight_1032(),
+        "spotlight's own work"
+    );
+    assert_eq!(WhyFixture::scene_named("storm"), None);
+}
+
 /// THE READER READS ITS SCENE ON ITS OWN SPLIT TICKS (the seam's wiring): a
 /// scene installed on a reader whose machine has no lane reads under the
 /// scene's lane; the bars' first reading is a split tick, the next, at once

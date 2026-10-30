@@ -113,6 +113,7 @@ pub fn path(state: &Path, tab: &str) -> Option<PathBuf> {
 /// # Errors
 /// The tab names no file, or the directory or the file cannot be written.
 pub fn write(state: &Path, tab: &str, stamp: &Stamp) -> std::io::Result<()> {
+    use std::io::Write as _;
     let path = path(state, tab).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "a tab key names a file")
     })?;
@@ -120,7 +121,17 @@ pub fn write(state: &Path, tab: &str, stamp: &Stamp) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = unique(&path, "tmp");
-    let written = std::fs::write(&tmp, stamp.to_json()).and_then(|()| std::fs::rename(&tmp, &path));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let written = open
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(stamp.to_json().as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -130,7 +141,7 @@ pub fn write(state: &Path, tab: &str, stamp: &Stamp) -> std::io::Result<()> {
 /// Tab `tab`'s stamp, if one stands.
 #[must_use]
 pub fn read(state: &Path, tab: &str) -> Option<Stamp> {
-    Stamp::from_json(&std::fs::read_to_string(path(state, tab)?).ok()?)
+    Stamp::from_json(&super::accounts::read_bounded(&path(state, tab)?, 64 * 1024).ok()??)
 }
 
 /// The stamp standing for process `pid` started at `start` in tab `tab` at `now`.
@@ -145,8 +156,9 @@ pub fn take_if(state: &Path, tab: &str, ours: impl FnOnce(&Stamp) -> bool) -> Op
     let judged = read(state, tab).filter(ours)?;
     let taken = unique(&path, "taken");
     std::fs::rename(&path, &taken).ok()?;
-    let stamp = std::fs::read_to_string(&taken)
+    let stamp = super::accounts::read_bounded(&taken, 64 * 1024)
         .ok()
+        .flatten()
         .and_then(|text| Stamp::from_json(&text));
     let mine = stamp.as_ref() == Some(&judged);
     if !mine {

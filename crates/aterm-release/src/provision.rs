@@ -1618,7 +1618,7 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
     let (apple, apple_sha1) = apple_identity_check(id, false, leave(dry), None);
     found.push((crate::apple::APPLE_LABEL, apple));
     found.push((KEYCHAIN_LABEL, keychain_check(id, leave(dry))));
-    found.push(("notary", notary_check()));
+    found.push(("notary", notary_check_recording(!dry)));
     let slug = std::fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
         .and_then(|manifest| channel::update_channel_slug(&manifest))
@@ -1822,55 +1822,147 @@ fn phase(n: usize, name: &str, what: &str) {
     println!("  [{n}/5] {name} — {what}");
 }
 
-/// Store the notarytool credential if it is absent, then live-check it either way.
+/// Check or acquire the notary credential and report its live verdict to the need ledger.
 #[cfg(unix)]
 fn notary_acquire(may_change: bool) -> Check {
-    match notary_check() {
-        live @ (Check::Pass(_) | Check::Skip(_) | Check::Owner { .. } | Check::CouldNotRun(_)) => {
-            live
-        }
-        live if !may_change => live,
-        _ => match crate::apple::ensure_notary(may_change) {
-            crate::apple::Outcome::Ready { .. } => notary_check(),
+    let result = notary_acquire_with(may_change, notary_probe, crate::apple::ensure_notary);
+    if may_change {
+        report_notary_need(result.need);
+    }
+    result.check
+}
+
+#[cfg(unix)]
+fn notary_acquire_with(
+    may_change: bool,
+    mut probe: impl FnMut() -> NotaryProbe,
+    ensure: impl FnOnce(bool) -> crate::apple::Outcome,
+) -> NotaryProbe {
+    let initial = probe();
+    match initial.need {
+        NotaryNeed::Raise if may_change => match ensure(may_change) {
+            crate::apple::Outcome::Ready { .. } => probe(),
             crate::apple::Outcome::Waiting { what, next }
-            | crate::apple::Outcome::Todo { what, next } => Check::Todo { what, next },
-            crate::apple::Outcome::Blocked { what, fix } => Check::Fail { what, fix },
-            crate::apple::Outcome::Skipped(why) => Check::Skip(why),
+            | crate::apple::Outcome::Todo { what, next } => NotaryProbe {
+                check: Check::Todo { what, next },
+                need: initial.need,
+            },
+            crate::apple::Outcome::Blocked { what, fix } => NotaryProbe {
+                check: Check::Fail { what, fix },
+                need: initial.need,
+            },
+            crate::apple::Outcome::Skipped(why) => NotaryProbe {
+                check: Check::Skip(why),
+                need: NotaryNeed::Unchanged,
+            },
         },
+        _ => initial,
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotaryNeed {
+    Unchanged,
+    Raise,
+    Satisfied,
+}
+
+#[cfg(unix)]
+struct NotaryProbe {
+    check: Check,
+    need: NotaryNeed,
+}
+
+/// Record the consumer's live verdict only on a real provision/release run. A dry audit reads
+/// the provider without changing the credential-request ledger.
+#[cfg(unix)]
+fn notary_check_recording(record: bool) -> Check {
+    let result = notary_probe();
+    if record {
+        report_notary_need(result.need);
+    }
+    result.check
+}
+
+#[cfg(unix)]
+fn report_notary_need(action: NotaryNeed) {
+    if action == NotaryNeed::Unchanged {
+        return;
+    }
+    let result =
+        aterm_secrets::client::Paths::live().and_then(|paths| settle_notary_need(&paths, action));
+    match result {
+        Ok(Some(line)) => step("notary need", &line),
+        Ok(None) => {}
+        Err(error) => step(
+            "notary need",
+            &format!("could not record the request: {error}"),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn settle_notary_need(
+    paths: &aterm_secrets::client::Paths,
+    action: NotaryNeed,
+) -> aterm_secrets::Result<Option<String>> {
+    use aterm_secrets::need::{self, Purpose, Want};
+    match action {
+        NotaryNeed::Unchanged => Ok(None),
+        NotaryNeed::Raise => {
+            need::raise(paths, Want::Notary, Purpose::ReleaseNotary).map(|need| Some(need.line))
+        }
+        NotaryNeed::Satisfied => need::satisfied(paths, &Want::Notary, Purpose::ReleaseNotary)
+            .map(|need| need.map(|need| need.line)),
     }
 }
 
 /// Live-tested, not presence-tested.
 #[cfg(unix)]
-fn notary_check() -> Check {
+fn notary_probe() -> NotaryProbe {
     if !cfg!(target_os = "macos") {
-        return Check::Skip("cuts run on macOS (Tier APPLE); no keychain on this host".into());
+        return NotaryProbe {
+            check: Check::Skip("cuts run on macOS (Tier APPLE); no keychain on this host".into()),
+            need: NotaryNeed::Unchanged,
+        };
     }
     let profile = crate::apple::NOTARY_PROFILE;
     match Command::new(aterm_uds::os_path!("xcrun"))
         .args(["notarytool", "history", "--keychain-profile", profile])
         .output()
     {
-        Ok(out) => notary_verdict(
+        Ok(out) => notary_probe_verdict(
             profile,
             out.status.success(),
             &String::from_utf8_lossy(&out.stdout),
             &String::from_utf8_lossy(&out.stderr),
         ),
-        Err(e) => Check::Fail {
-            what: format!("could not run xcrun notarytool: {e}"),
-            fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
+        Err(e) => NotaryProbe {
+            check: Check::Fail {
+                what: format!("could not run xcrun notarytool: {e}"),
+                fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
+            },
+            need: NotaryNeed::Unchanged,
         },
     }
 }
 
 /// What `notarytool history` answered.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> Check {
+    notary_probe_verdict(profile, success, stdout, stderr).check
+}
+
+#[cfg(unix)]
+fn notary_probe_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> NotaryProbe {
     if success {
-        return Check::Pass(format!(
-            "notarytool profile '{profile}' answers (live-checked)"
-        ));
+        return NotaryProbe {
+            check: Check::Pass(format!(
+                "notarytool profile '{profile}' answers (live-checked)"
+            )),
+            need: NotaryNeed::Satisfied,
+        };
     }
     let lines: Vec<&str> = stderr
         .lines()
@@ -1884,18 +1976,21 @@ fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> C
     if let Some(at) = said("status code: 403").or_else(|| said("http 403"))
         && lower.iter().any(|l| l.contains("agreement"))
     {
-        return Check::Owner {
-            what: format!(
-                "Apple's developer agreement for team {} is missing or expired — notarytool \
+        return NotaryProbe {
+            check: Check::Owner {
+                what: format!(
+                    "Apple's developer agreement for team {} is missing or expired — notarytool \
                  answers: {}",
-                pins::APPLE_TEAM_ID,
-                lines[at]
-            ),
-            fix: format!(
-                "the team's Account Holder accepts the current agreements at \
+                    pins::APPLE_TEAM_ID,
+                    lines[at]
+                ),
+                fix: format!(
+                    "the team's Account Holder accepts the current agreements at \
                  https://developer.apple.com/account (no credential fixes this: \
                  store-credentials leaves the 403 as it is), then `{SHIP} release` goes on"
-            ),
+                ),
+            },
+            need: NotaryNeed::Unchanged,
         };
     }
     let transport = [
@@ -1912,17 +2007,23 @@ fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> C
             .iter()
             .any(|l| transport.iter().any(|t| l.contains(t)))
     {
-        return Check::CouldNotRun(format!(
-            "Apple's notary service did not answer notarytool profile '{profile}': {first}"
-        ));
+        return NotaryProbe {
+            check: Check::CouldNotRun(format!(
+                "Apple's notary service did not answer notarytool profile '{profile}': {first}"
+            )),
+            need: NotaryNeed::Unchanged,
+        };
     }
-    Check::Owner {
-        what: format!("notarytool profile '{profile}' did not authenticate: {first}"),
-        fix: format!(
-            "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
+    NotaryProbe {
+        check: Check::Owner {
+            what: format!("notarytool profile '{profile}' did not authenticate: {first}"),
+            fix: format!(
+                "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
              --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
-            pins::APPLE_TEAM_ID
-        ),
+                pins::APPLE_TEAM_ID
+            ),
+        },
+        need: NotaryNeed::Raise,
     }
 }
 
@@ -2112,21 +2213,6 @@ fn channel_token_verdict(
         };
     }
     Check::Pass(format!("{where_it_lives}  0600, owner-only"))
-}
-
-/// Developer ID Application identities for `team_id` in a `find-identity` listing.
-#[cfg(unix)]
-pub(crate) fn devid_identities(listing: &str, team_id: &str) -> Vec<String> {
-    let team_tag = format!("({team_id})");
-    listing
-        .lines()
-        .filter(|l| l.contains("Developer ID Application:") && l.contains(&team_tag))
-        .filter_map(|l| {
-            l.split_whitespace()
-                .find(|t| aterm_codec::hex::is_hex(t, 40))
-        })
-        .map(str::to_string)
-        .collect()
 }
 
 #[cfg(unix)]
@@ -2399,6 +2485,123 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn notary_credential_failures_raise_the_typed_need_and_live_success_closes_it() {
+        use aterm_secrets::need::{self, Purpose, Want};
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let paths = aterm_secrets::client::Paths::for_home(dir.path());
+        let source = dir.path().join("notary.vault");
+        aterm_secrets::client::test_create_unbound(
+            &paths,
+            source.to_str().unwrap(),
+            None,
+            Some("m1"),
+        )
+        .unwrap();
+        need::test_alab_policy(&paths);
+        let refused = notary_probe_verdict(
+            "notary",
+            false,
+            "",
+            "No Keychain password item found for profile: notary.",
+        );
+        assert_eq!(refused.need, NotaryNeed::Raise);
+        settle_notary_need(&paths, refused.need).unwrap();
+        let requests = need::peek(&paths).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].want, Want::Notary);
+        assert_eq!(requests[0].purpose, Purpose::ReleaseNotary);
+        assert!(!requests[0].state.ended());
+
+        for failure in [
+            "HTTP 403: the developer agreement is missing",
+            "The network connection timed out",
+        ] {
+            let probe = notary_probe_verdict("notary", false, "", failure);
+            assert_eq!(probe.need, NotaryNeed::Unchanged);
+            assert!(settle_notary_need(&paths, probe.need).unwrap().is_none());
+        }
+        let ready = notary_probe_verdict("notary", true, "No submission history.", "");
+        assert_eq!(ready.need, NotaryNeed::Satisfied);
+        settle_notary_need(&paths, ready.need).unwrap();
+        assert!(need::peek(&paths).unwrap()[0].state.ended());
+    }
+
+    #[test]
+    fn notary_acquire_stores_missing_credential_when_mutable_and_rechecks_live() {
+        let mut probes = 0usize;
+        let mut ensured = 0usize;
+        let acquired = notary_acquire_with(
+            true,
+            || {
+                probes += 1;
+                if probes == 1 {
+                    notary_probe_verdict(
+                        "notary",
+                        false,
+                        "",
+                        "No Keychain password item found for profile: notary.",
+                    )
+                } else {
+                    notary_probe_verdict("notary", true, "No submission history.", "")
+                }
+            },
+            |may_change| {
+                assert!(may_change);
+                ensured += 1;
+                crate::apple::Outcome::Ready {
+                    ids: Vec::new(),
+                    note: None,
+                }
+            },
+        );
+        assert_eq!(ensured, 1);
+        assert_eq!(probes, 2);
+        assert_eq!(acquired.need, NotaryNeed::Satisfied);
+        assert!(matches!(acquired.check, Check::Pass(_)));
+
+        let check_only = notary_acquire_with(
+            false,
+            || {
+                notary_probe_verdict(
+                    "notary",
+                    false,
+                    "",
+                    "No Keychain password item found for profile: notary.",
+                )
+            },
+            |_| panic!("--check must not invoke ensure_notary"),
+        );
+        assert_eq!(check_only.need, NotaryNeed::Raise);
+        assert!(matches!(check_only.check, Check::Owner { .. }));
+
+        for unacquirable in [
+            notary_probe_verdict(
+                "notary",
+                false,
+                "",
+                "HTTP 403: the developer agreement is missing",
+            ),
+            notary_probe_verdict("notary", false, "", "The network connection timed out"),
+            NotaryProbe {
+                check: Check::Fail {
+                    what: "could not run xcrun notarytool".into(),
+                    fix: "install CLT".into(),
+                },
+                need: NotaryNeed::Unchanged,
+            },
+        ] {
+            let mut item = Some(unacquirable);
+            let outcome = notary_acquire_with(
+                true,
+                || item.take().expect("probed once"),
+                |_| panic!("non-credential failure must not invoke ensure_notary"),
+            );
+            assert_eq!(outcome.need, NotaryNeed::Unchanged);
+        }
+    }
     use aterm_update_core::roster::{Machine, SUPPORTED_SCHEMA};
 
     fn seed() -> atpkg_keys::master::MasterSeed {
@@ -2604,13 +2807,13 @@ mod tests {
             "     4 valid identities found\n",
         );
         assert_eq!(
-            devid_identities(listing, "TEAMIDXXXX"),
+            crate::release_keychain::devid_identities(listing, "TEAMIDXXXX"),
             vec![
                 "1111111111111111111111111111111111111111".to_string(),
                 "4444444444444444444444444444444444444444".to_string(),
             ]
         );
-        assert!(devid_identities("", "TEAMIDXXXX").is_empty());
+        assert!(crate::release_keychain::devid_identities("", "TEAMIDXXXX").is_empty());
     }
 
     /// A fresh Ed25519 keypair as base64 PKCS#8 (the shape `signing_key` carries) and the

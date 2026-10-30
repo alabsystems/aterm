@@ -5172,9 +5172,9 @@ pub(crate) fn on_workers<T: Sync + std::fmt::Debug>(
     on_n_workers(SWEEP_WORKERS, items, what, job);
 }
 
-/// Sweep jobs running now in this process, and the wake for a job waiting for a core ([`Core`]).
-static SWEEP_JOBS: (std::sync::Mutex<usize>, std::sync::Condvar) =
-    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+/// Running and completed sweep jobs, and the wake for a job waiting for a core ([`Core`]).
+static SWEEP_JOBS: (std::sync::Mutex<(usize, u64)>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
 
 thread_local! {
     /// Whether this thread runs a sweep job on a [`Core`].
@@ -5191,17 +5191,22 @@ impl Core {
         let mut now = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let asked = std::time::Instant::now();
-        while *now >= cores {
+        let mut progressed = std::time::Instant::now();
+        let mut completed = now.1;
+        while now.0 >= cores {
+            if now.1 != completed {
+                completed = now.1;
+                progressed = std::time::Instant::now();
+            }
             // Jobs end in well under a minute: none ending in one is a hang.
-            let left = std::time::Duration::from_secs(60).saturating_sub(asked.elapsed());
+            let left = std::time::Duration::from_secs(60).saturating_sub(progressed.elapsed());
             assert!(!left.is_zero(), "no sweep job freed a core in a minute");
             now = freed
                 .wait_timeout(now, left)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
-        *now += 1;
+        now.0 += 1;
         ON_A_CORE.with(|on| on.set(true));
         Self
     }
@@ -5211,9 +5216,12 @@ impl Drop for Core {
     fn drop(&mut self) {
         ON_A_CORE.with(|on| on.set(false));
         let (running, freed) = &SWEEP_JOBS;
-        *running
+        let mut now = running
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        now.0 -= 1;
+        now.1 = now.1.wrapping_add(1);
+        drop(now);
         freed.notify_one();
     }
 }

@@ -119,20 +119,39 @@ fn handover_bundle_until(
         return Err(none());
     }
     let identity = read_identity(paths)?.ok_or_else(none)?;
-    if let Some(log) = super::log_entries::trusted_local_log(paths, &config)? {
+    if super::steward::local_recipient_denied_in_roster(paths) {
+        return Err(none());
+    }
+    if let Some(why) = super::admit::roster_keeps_out(paths, None, allowed.binding(), [0; 32]) {
+        return Err(Error::new(why));
+    }
+    let check_log = |log: &crate::membership_log::Log| -> crate::Result<()> {
         let me = identity.recipient();
+        let roster = super::log_entries::local_swarm_roster_for_log(paths, log);
         if log.recipient_is_removed(&me)
             || log.audience_left_out_recipient(&crate::membership_log::EpochAudience::Everyone, &me)
-            || log.membership().members().iter().any(|(actor, m)| {
-                m.binding.recipient() == me
-                    && log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
-            })
+            || super::log_entries::recipient_denied_by_roster_or_log(roster.as_ref(), log, &me)
         {
             return Err(none());
         }
-        if let Some(why) = super::admit::kept_out(&log, allowed.binding()) {
+        // A removed Mac's "Allow again" restores it only by the log's restoring `Admit`, which
+        // F10's files do not carry: here no press lets it in.
+        if let Some(why) = super::admit::kept_out(log, allowed.binding(), false) {
             return Err(Error::new(why));
         }
+        if let Some(already) = log.membership().get(&allowed.binding().actor())
+            && roster
+                .as_ref()
+                .is_some_and(|r| super::log_entries::member_denied_by_roster(r, already))
+        {
+            return Err(Error::new(
+                "the vault removed this Mac, and an Allow does not let a removed Mac back in",
+            ));
+        }
+        Ok(())
+    };
+    if let Some(log) = super::log_entries::trusted_local_log(paths, &config)? {
+        check_log(&log)?;
     }
     let mut everyone: Vec<Entry> = Vec::new();
     let mut from_log = false;
@@ -158,8 +177,12 @@ fn handover_bundle_until(
         if let Some((log, _)) =
             super::log_entries::readable_log(paths, &config, &envelope, &identity)?
         {
+            check_log(&log)?;
             let opened = log.open_audience_entries(&identity)?.ok_or_else(none)?;
-            if !opened.unwrapped_keys.is_empty() {
+            if opened
+                .fully_unwrapped_audiences
+                .contains(&crate::membership_log::EpochAudience::Everyone)
+            {
                 from_log = true;
                 if let Some(map) = opened.by_audience.get(&Audience::Everyone) {
                     everyone.extend(
@@ -204,8 +227,12 @@ fn handover_bundle_until(
         && Some(records_digest) == state.records_digest
         && let Some(log) = store.log()
     {
+        check_log(log)?;
         let opened = log.open_audience_entries(&identity)?.ok_or_else(none)?;
-        if opened.unwrapped_keys.is_empty() {
+        if !opened
+            .fully_unwrapped_audiences
+            .contains(&crate::membership_log::EpochAudience::Everyone)
+        {
             return Err(none());
         }
         if let Some(map) = opened.by_audience.get(&Audience::Everyone) {
@@ -271,6 +298,7 @@ pub fn post_allowed(paths: &Paths, allowed: &Allowed) -> crate::Result<()> {
         host: allowed.name().to_owned(),
         code: super::join_code(&recipient),
         time: None,
+        lan: false,
         allowed: Some(allowed.to_text()),
         proof: None,
     }

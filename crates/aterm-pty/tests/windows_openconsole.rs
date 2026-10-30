@@ -46,6 +46,9 @@ struct Tab {
 
 impl Tab {
     fn spawn(argv: &[&str]) -> Self {
+        // A bundled host the tab starts must answer: a missed 250 ms window would put the tab
+        // on the inbox host under load and fail the rows that require OpenConsole.
+        aterm_pty::set_health_window_for_test(HANG_DETECTOR);
         let (spawn_cap, sandbox_cap) = caps();
         let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
         let shell = aterm_pty::spawn_shell_with_pid(

@@ -29,24 +29,33 @@ mod imp {
     });
 
     fn sync(state: &mut State) -> Result<(), i32> {
+        sync_with(state, |want| {
+            if cfg!(test) {
+                // A test process never reaches the window server: the inert arm answers 0, so
+                // only the count moves.
+                return 0;
+            }
+            // SAFETY: plain Carbon calls with no arguments or pointers; the OS refcounts them, and
+            // the lock keeps this process's contribution balanced at 0 or 1.
+            unsafe {
+                if want {
+                    EnableSecureEventInput()
+                } else {
+                    DisableSecureEventInput()
+                }
+            }
+        })
+    }
+
+    /// Asks `carbon` to enable (`true`) or disable secure input where the wish and focus disagree
+    /// with what this process holds, and records the change only when its status is 0: a refused
+    /// change is not recorded, so the next focus or config change asks again.
+    fn sync_with(state: &mut State, carbon: impl FnOnce(bool) -> i32) -> Result<(), i32> {
         let want = state.desired && state.app_active;
         if want == state.engaged {
             return Ok(());
         }
-        if cfg!(test) {
-            // A test process never reaches the window server: the inert arm keeps only the count.
-            state.engaged = want;
-            return Ok(());
-        }
-        // SAFETY: plain Carbon calls with no arguments or pointers; the OS refcounts them, and the
-        // lock keeps this process's contribution balanced at 0 or 1.
-        let status = unsafe {
-            if want {
-                EnableSecureEventInput()
-            } else {
-                DisableSecureEventInput()
-            }
-        };
+        let status = carbon(want);
         if status != 0 {
             return Err(status);
         }
@@ -70,6 +79,52 @@ mod imp {
                 "secure keyboard entry: focus-gated transition failed (OSStatus {status}); \
                  will retry on the next focus or config change"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{State, sync_with};
+
+        /// A change Carbon refuses is not recorded, so the next sync asks again: a refused
+        /// enable is not held and a refused release keeps the hold; a settled state asks nothing.
+        #[test]
+        fn a_refused_change_is_not_held_and_the_next_sync_asks_again() {
+            let mut s = State {
+                desired: true,
+                app_active: true,
+                engaged: false,
+            };
+            assert_eq!(
+                sync_with(&mut s, |want| {
+                    assert!(want);
+                    -25
+                }),
+                Err(-25)
+            );
+            assert!(!s.engaged, "a refused enable is not held");
+            assert_eq!(
+                sync_with(&mut s, |want| {
+                    assert!(want);
+                    0
+                }),
+                Ok(()),
+                "asked again"
+            );
+            assert!(s.engaged);
+            assert_eq!(
+                sync_with(&mut s, |_| panic!("settled: nothing to ask")),
+                Ok(())
+            );
+            s.desired = false;
+            assert_eq!(
+                sync_with(&mut s, |want| {
+                    assert!(!want);
+                    -1
+                }),
+                Err(-1)
+            );
+            assert!(s.engaged, "a refused disable keeps the hold");
         }
     }
 }

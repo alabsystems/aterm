@@ -186,13 +186,19 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// keeps from answering for 3 s is waited for rather than reported as unanswerable.
 const IO_TIMEOUT_SEAM: &str = "ATERM_FABRIC_IO_TIMEOUT_MS";
 
-/// [`IO_TIMEOUT`], or the [`IO_TIMEOUT_SEAM`] a development build was given.
+/// [`IO_TIMEOUT`], or the [`IO_TIMEOUT_SEAM`] a development build was given. The unit tests'
+/// brokers and instances run in-process, so a socket one of them answers late is a loaded
+/// machine, not a peer gone silent: unseamed, theirs wait the hang detector.
 pub(crate) fn io_timeout() -> Duration {
+    #[cfg(not(test))]
+    const UNSEAMED: Duration = IO_TIMEOUT;
+    #[cfg(test)]
+    const UNSEAMED: Duration = aterm_spec::wait::MUST_HAPPEN;
     static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(IO_TIMEOUT_SEAM)
             .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
-            .map_or(IO_TIMEOUT, Duration::from_millis)
+            .map_or(UNSEAMED, Duration::from_millis)
     })
 }
 
@@ -5582,7 +5588,9 @@ mod tests {
         let broker = crate::test_broker(dir.join("t.log")).expect("a broker");
         let sock = dir.join("t.sock");
         let mut server = broker.serve(&sock).expect("serves");
-        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), IO_TIMEOUT).expect("dial");
+        let (mut conn, _) =
+            transport::connect(&sock.to_string_lossy(), aterm_spec::wait::MUST_HAPPEN)
+                .expect("dial");
         let records = [
             (
                 "/f/f1/in/n-a/s-x/h-jsmith/note",

@@ -4402,7 +4402,8 @@ pub(crate) fn output_bounded_within(
     bounded(cmd, false, within)
 }
 
-fn probe_timeout() -> std::time::Duration {
+/// [`PROBE_TIMEOUT`]; a unit test's probes wait the hang detector, or the bound its thread set.
+pub(crate) fn probe_timeout() -> std::time::Duration {
     #[cfg(all(test, unix))]
     return PROBE_TIMEOUT_IN_TEST
         .with(std::cell::Cell::get)

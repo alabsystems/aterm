@@ -595,6 +595,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         opens_cut: false,
         turn_said: None,
         opened_by: None,
+        opened_words: None,
         message_drawn: true,
         submits: None,
         inputs_before: None,

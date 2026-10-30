@@ -593,7 +593,7 @@ pub fn writer_here(paths: &Paths) -> bool {
     let Ok(Some(bootstrap)) = Bootstrap::cached(paths) else {
         return false;
     };
-    let Ok(journal) = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()) else {
+    let Ok(journal) = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()) else {
         return false;
     };
     matches!(
@@ -1236,7 +1236,8 @@ impl Bootstrap {
         {
             return Ok(Some(witness.clone()));
         }
-        let Some(entry_id) = log.historical_seat_entry(request.binding()) else {
+        let binding = request.binding();
+        let Some(entry_id) = log.historical_seat_entry(binding) else {
             return Ok(None);
         };
         let Some(mut chain) = log.ancestor_chain(&entry_id) else {
@@ -1245,27 +1246,60 @@ impl Bootstrap {
         if chain.is_empty() {
             return Ok(None);
         }
-        let chain_holds_seat = {
-            let mut iter = chain.iter().cloned();
-            iter.next()
+        let check_chain = |records: &[crate::membership_log::Record]| -> (bool, bool) {
+            let mut iter = records.iter().cloned();
+            let Some(mut sub) = iter
+                .next()
                 .and_then(|g| crate::membership_log::Log::new(g).ok())
-                .is_some_and(|mut sub| {
-                    for rec in iter {
-                        if sub.insert(rec).is_err() {
-                            return false;
-                        }
-                    }
-                    sub.has_historical_seat(request.binding())
-                })
+            else {
+                return (false, false);
+            };
+            for rec in iter {
+                if sub.insert(rec).is_err() {
+                    return (false, false);
+                }
+            }
+            let seat_ok = sub.has_historical_seat(binding);
+            let audience_ok = !sub.audience_left_out(
+                &crate::membership_log::EpochAudience::Commons,
+                &binding.actor(),
+            ) && !sub.audience_left_out(
+                &crate::membership_log::EpochAudience::Everyone,
+                &binding.actor(),
+            ) && !sub.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Commons,
+                &binding.recipient(),
+            ) && !sub.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &binding.recipient(),
+            );
+            (seat_ok, audience_ok)
         };
-        if !chain_holds_seat {
+        let (seat_ok, audience_ok) = check_chain(&chain);
+        if !seat_ok || !audience_ok {
             let mut targets = vec![entry_id];
             for rec in log.records().skip(1) {
-                if matches!(rec.body(), crate::membership_log::Body::Remove { .. }) {
-                    targets.push(*rec.id());
+                match rec.body() {
+                    crate::membership_log::Body::Remove { .. } if !seat_ok => {
+                        targets.push(*rec.id());
+                    }
+                    crate::membership_log::Body::Wrap { recipient, .. }
+                        if *recipient == binding.recipient() =>
+                    {
+                        targets.push(*rec.id());
+                    }
+                    _ => {}
                 }
             }
             chain = log.ancestor_closure(&targets);
+            if seat_ok && !check_chain(&chain).0 {
+                for rec in log.records().skip(1) {
+                    if matches!(rec.body(), crate::membership_log::Body::Remove { .. }) {
+                        targets.push(*rec.id());
+                    }
+                }
+                chain = log.ancestor_closure(&targets);
+            }
         }
         let encoded = crate::membership_log::encode_records(&chain);
         if let Ok(mut cache) = WITNESS_CACHE.lock() {
@@ -1326,6 +1360,9 @@ impl Bootstrap {
         if journal.trust() != self.trust() {
             return Err(Error::new("Commons access has another trust context"));
         }
+        if client::local_recipient_denied_in_roster(&self.paths) {
+            return Ok(None);
+        }
         let maybe_access = if let Some((log, heads_digest)) =
             client::trusted_commons_log(&self.paths, self.trust())?
         {
@@ -1333,8 +1370,27 @@ impl Bootstrap {
             let req = self.request()?;
             if log.wraps_to(&me)
                 || log.removes(&me)
+                || log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &me,
+                )
+                || log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Commons,
+                    &me,
+                )
                 || log.membership().removal(&req.binding().actor()).is_some()
                 || log.has_historical_seat(req.binding())
+                || log.records().skip(1).any(|r| {
+                    matches!(
+                        r.body(),
+                        crate::membership_log::Body::Admit { entrant, .. }
+                            if entrant.request.binding() == req.binding()
+                                || entrant.request.binding().recipient() == me
+                    ) || matches!(
+                        r.body(),
+                        crate::membership_log::Body::Wrap { recipient, .. } if *recipient == me
+                    )
+                })
             {
                 super::roster::current_from_loaded_log(
                     &self.paths,

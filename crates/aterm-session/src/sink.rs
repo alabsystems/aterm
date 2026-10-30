@@ -572,11 +572,76 @@ struct Shared {
 
 struct Spill {
     buf: VecDeque<u8>,
+    #[cfg(unix)]
+    runs: VecDeque<(usize, Landing)>,
     chunk_written: usize,
     draining: bool,
     #[cfg(unix)]
     arrange_pending: bool,
     failed: bool,
+}
+
+impl Spill {
+    fn clear(&mut self) {
+        self.buf.clear();
+        #[cfg(unix)]
+        self.runs.clear();
+        self.chunk_written = 0;
+    }
+
+    #[cfg(unix)]
+    fn push_back(&mut self, bytes: &[u8], landing: Landing) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.buf.extend(bytes.iter().copied());
+        if let Some((last_len, last_landing)) = self.runs.back_mut()
+            && *last_landing == landing
+        {
+            *last_len = last_len.saturating_add(bytes.len());
+        } else {
+            self.runs.push_back((bytes.len(), landing));
+        }
+    }
+
+    #[cfg(unix)]
+    fn push_front(&mut self, bytes: &[u8], landing: Landing) {
+        if bytes.is_empty() {
+            return;
+        }
+        for b in bytes.iter().rev() {
+            self.buf.push_front(*b);
+        }
+        if let Some((first_len, first_landing)) = self.runs.front_mut()
+            && *first_landing == landing
+        {
+            *first_len = first_len.saturating_add(bytes.len());
+        } else {
+            self.runs.push_front((bytes.len(), landing));
+        }
+    }
+
+    #[cfg(unix)]
+    fn pop_front(&mut self, count: usize) {
+        let len = self.buf.len();
+        let take = if count <= len { count } else { len };
+        for _ in 0..take {
+            let _ = self.buf.pop_front();
+        }
+        let mut rem = take;
+        while rem > 0 {
+            let Some((front_len, _)) = self.runs.front_mut() else {
+                break;
+            };
+            if *front_len <= rem {
+                rem = rem.saturating_sub(*front_len);
+                let _ = self.runs.pop_front();
+            } else {
+                *front_len = front_len.saturating_sub(rem);
+                break;
+            }
+        }
+    }
 }
 
 impl SinkWriter {
@@ -807,8 +872,7 @@ impl SinkWriter {
                 self.shared.restarts.fetch_add(1, Ordering::AcqRel);
             }
             let unsent = s.buf.len().saturating_sub(s.chunk_written);
-            s.buf.clear();
-            s.chunk_written = 0;
+            s.clear();
             self.shared.spilled_bytes.store(0, Ordering::Release);
             self.shared
                 .order_state
@@ -869,8 +933,7 @@ impl SinkWriter {
             if !s.buf.is_empty() {
                 s.failed = true;
             }
-            s.buf.clear();
-            s.chunk_written = 0;
+            s.clear();
             self.shared.spilled_bytes.store(0, Ordering::Release);
             self.shared
                 .order_state
@@ -1141,7 +1204,7 @@ impl SinkWriter {
 
         let mut spill_guard = spill_guard;
         let mut poke = false;
-        let result = match self.shared.ledgered_nonparking(self.master, bytes, false) {
+        let result = match self.shared.ledgered_nonparking(self.master, bytes, None) {
             aterm_pty::NonParkWrite::Wrote(n) if n == bytes.len() => ImmediateWrite::Full,
             aterm_pty::NonParkWrite::Wrote(n) if n > 0 && short == ShortWrite::Queue => {
                 match bytes.get(n..).and_then(|rest| {
@@ -1220,7 +1283,7 @@ impl SinkWriter {
             return Ok(WriteReceipt::new(0, None));
         }
         self.reserve_input_attempt();
-        self.write_frame_after_reserve(bytes, None)
+        self.write_frame_after_reserve(bytes, None, Landing::Driven)
     }
 
     /// [`Self::write_frame_with_receipt`] for one bulk frame, reporting progress into `meter` and honouring its stop.
@@ -1239,7 +1302,7 @@ impl SinkWriter {
             .store(BulkState::Writing as u8, Ordering::Release);
         let since = self.shared.discard_epoch();
         self.reserve_input_attempt();
-        let result = self.write_frame_after_reserve(bytes, Some(meter));
+        let result = self.write_frame_after_reserve(bytes, Some(meter), Landing::Driven);
         let sent = meter.sent.load(Ordering::Relaxed);
         meter.finish(match &result {
             Err(_) => BulkState::Failed,
@@ -1257,16 +1320,19 @@ impl SinkWriter {
         &self,
         bytes: &[u8],
         meter: Option<&BulkMeter>,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         if self.shared.is_severed() {
             return Err(Shared::severed_error().into());
         }
         let since = self.shared.discard_epoch();
-        aterm_pty::settle_input(self.master);
+        if landing == Landing::Driven {
+            aterm_pty::settle_input(self.master);
+        }
         if !self.shared.spill_is_empty() {
             match self
                 .shared
-                .spill_append(self.master, bytes, Room::Wait(meter), since)?
+                .spill_append(self.master, bytes, landing, Room::Wait(meter), since)?
             {
                 Spilled::Accepted(order) => {
                     BulkMeter::note_spilled(meter, bytes.len());
@@ -1287,17 +1353,17 @@ impl SinkWriter {
             drop(guard);
             match self
                 .shared
-                .spill_append(self.master, bytes, Room::Wait(meter), since)?
+                .spill_append(self.master, bytes, landing, Room::Wait(meter), since)?
             {
                 Spilled::Accepted(order) => {
                     BulkMeter::note_spilled(meter, bytes.len());
                     return Ok(WriteReceipt::new(bytes.len(), Some(order)));
                 }
                 Spilled::Stopped => return Ok(WriteReceipt::new(0, None)),
-                Spilled::NoDrainer => return self.write_frame_locked(bytes, meter, since),
+                Spilled::NoDrainer => return self.write_frame_locked(bytes, meter, since, landing),
             }
         };
-        self.write_frame_body_locked(guard, bytes, order, meter, since)
+        self.write_frame_body_locked(guard, bytes, order, meter, since, landing)
     }
 
     fn write_frame_body_locked(
@@ -1307,6 +1373,7 @@ impl SinkWriter {
         order: AcceptedOrder,
         meter: Option<&BulkMeter>,
         since: u64,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         let Some(meter) = meter else {
             let mut off = 0;
@@ -1314,7 +1381,7 @@ impl SinkWriter {
                 let Some(rest) = bytes.get(off..) else { break };
                 match self
                     .shared
-                    .write_stamped_blocking(self.master, rest, since, None)
+                    .write_stamped_blocking(self.master, rest, since, None, landing)
                 {
                     Ok(0) => break,
                     Ok(n) => off = off.saturating_add(n),
@@ -1326,12 +1393,12 @@ impl SinkWriter {
         };
         let written = write_metered(bytes, meter, |rest| {
             self.shared
-                .write_stamped_blocking(self.master, rest, since, Some(meter))
+                .write_stamped_blocking(self.master, rest, since, Some(meter), landing)
         })
         .map(|end| {
             let accepted = end
                 .accepted
-                .saturating_add(self.deliver_owed_locked(&end.owed, since));
+                .saturating_add(self.deliver_owed_locked(&end.owed, since, landing));
             meter.note_sent(accepted);
             accepted
         });
@@ -1342,16 +1409,16 @@ impl SinkWriter {
         }
     }
 
-    fn deliver_owed_locked(&self, owed: &[u8], since: u64) -> usize {
+    fn deliver_owed_locked(&self, owed: &[u8], since: u64, landing: Landing) -> usize {
         if owed.is_empty() {
             return 0;
         }
-        if self.shared.prepend_owed(self.master, owed, since) {
+        if landing == Landing::Driven && self.shared.prepend_owed(self.master, owed, since) {
             return owed.len();
         }
         deliver_owed_through(owed, |rest| {
             self.shared
-                .write_stamped_blocking(self.master, rest, since, None)
+                .write_stamped_blocking(self.master, rest, since, None, landing)
         })
     }
 
@@ -1360,6 +1427,7 @@ impl SinkWriter {
         bytes: &[u8],
         meter: Option<&BulkMeter>,
         since: u64,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         loop {
             let guard = self
@@ -1369,10 +1437,13 @@ impl SinkWriter {
                 .unwrap_or_else(|poison| poison.into_inner());
             let Some(order) = self.shared.direct_order_if_spill_empty()? else {
                 drop(guard);
-                match self
-                    .shared
-                    .spill_append(self.master, bytes, Room::Wait(meter), since)?
-                {
+                match self.shared.spill_append(
+                    self.master,
+                    bytes,
+                    landing,
+                    Room::Wait(meter),
+                    since,
+                )? {
                     Spilled::Accepted(order) => {
                         BulkMeter::note_spilled(meter, bytes.len());
                         return Ok(WriteReceipt::new(bytes.len(), Some(order)));
@@ -1381,7 +1452,7 @@ impl SinkWriter {
                     Spilled::NoDrainer => continue,
                 }
             };
-            return self.write_frame_body_locked(guard, bytes, order, meter, since);
+            return self.write_frame_body_locked(guard, bytes, order, meter, since, landing);
         }
     }
 
@@ -1425,7 +1496,7 @@ impl SinkWriter {
             return Ok(0);
         }
         self.reserve_attempt();
-        self.write_frame_nonparking_after_reserve(bytes, Landing::Answer)
+        aterm_pty::as_reply(|| self.write_frame_nonparking_after_reserve(bytes, Landing::Answer))
             .map(WriteReceipt::accepted)
             .map_err(WriteReceiptError::into_error)
     }
@@ -1438,7 +1509,7 @@ impl SinkWriter {
     ) -> Result<WriteReceipt, WriteReceiptError> {
         // Bulk takes the blocking path so `SPILL_CAP` applies (see `NONPARK_MAX`).
         if bytes.len() > Self::NONPARK_MAX {
-            return self.write_frame_after_reserve(bytes, None);
+            return self.write_frame_after_reserve(bytes, None, landing);
         }
         self.write_frame_unparked(bytes, WhenFull::Park, landing)
     }
@@ -1447,9 +1518,9 @@ impl SinkWriter {
     fn write_frame_nonparking_after_reserve(
         &self,
         bytes: &[u8],
-        _landing: Landing,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
-        self.write_frame_after_reserve(bytes, None)
+        self.write_frame_after_reserve(bytes, None, landing)
     }
 
     /// The UI thread's egress.
@@ -1488,14 +1559,14 @@ impl SinkWriter {
         let spilled = self.shared.spill_len();
         if spilled >= Shared::SPILL_CAP {
             return match when_full {
-                WhenFull::Park => self.write_frame_after_reserve(bytes, None),
+                WhenFull::Park => self.write_frame_after_reserve(bytes, None, landing),
                 WhenFull::Refuse => Err(WriteReceiptError::refused(0, None)),
             };
         }
         if spilled != 0
             && let Spilled::Accepted(order) =
                 self.shared
-                    .spill_append(self.master, bytes, Room::NoWait, since)?
+                    .spill_append(self.master, bytes, landing, Room::NoWait, since)?
         {
             return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         }
@@ -1514,11 +1585,11 @@ impl SinkWriter {
         let Some(guard) = acquired else {
             // Another writer is mid-frame (or the drainer is writing): queueing
             // behind the current holder preserves order without waiting on it.
-            return self.spill_or_when_full(bytes, since, when_full);
+            return self.spill_or_when_full(bytes, since, when_full, landing);
         };
         let Some(order) = self.shared.direct_order_if_spill_empty()? else {
             drop(guard);
-            return self.spill_or_when_full(bytes, since, when_full);
+            return self.spill_or_when_full(bytes, since, when_full, landing);
         };
         let whole_frame = self.shared.master_nonblocking.load(Ordering::Relaxed);
         let mut off = 0;
@@ -1528,7 +1599,9 @@ impl SinkWriter {
                 match aterm_pty::poll_writable(self.master, 0) {
                     Ok(true) => {}
                     Ok(false) => {
-                        return self.spill_tail_locked(guard, bytes, off, order, since, when_full);
+                        return self.spill_tail_locked(
+                            guard, bytes, off, order, since, when_full, landing,
+                        );
                     }
                     Err(e) => {
                         drop(guard);
@@ -1547,7 +1620,7 @@ impl SinkWriter {
             let Some(unit) = unit else {
                 break;
             };
-            let wrote = self.shared.ledgered_nonparking(self.master, unit, false);
+            let wrote = self.shared.ledgered_nonparking(self.master, unit, None);
             match wrote {
                 aterm_pty::NonParkWrite::Closed => break, // peer closed mid-frame
                 aterm_pty::NonParkWrite::Wrote(n) => {
@@ -1555,7 +1628,8 @@ impl SinkWriter {
                     off = off.saturating_add(if n <= room { n } else { room });
                 }
                 aterm_pty::NonParkWrite::WouldBlock => {
-                    return self.spill_tail_locked(guard, bytes, off, order, since, when_full);
+                    return self
+                        .spill_tail_locked(guard, bytes, off, order, since, when_full, landing);
                 }
                 aterm_pty::NonParkWrite::Fatal(e) => {
                     drop(guard);
@@ -1579,14 +1653,15 @@ impl SinkWriter {
         bytes: &[u8],
         since: u64,
         when_full: WhenFull,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         match self
             .shared
-            .spill_append(self.master, bytes, Room::NoWait, since)?
+            .spill_append(self.master, bytes, landing, Room::NoWait, since)?
         {
             Spilled::Accepted(order) => Ok(WriteReceipt::new(bytes.len(), Some(order))),
             Spilled::NoDrainer | Spilled::Stopped => match when_full {
-                WhenFull::Park => self.write_frame_locked(bytes, None, since),
+                WhenFull::Park => self.write_frame_locked(bytes, None, since, landing),
                 WhenFull::Refuse => Err(WriteReceiptError::no_drainer(0, None)),
             },
         }
@@ -1610,6 +1685,7 @@ impl SinkWriter {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     fn spill_tail_locked(
         &self,
         guard: std::sync::MutexGuard<'_, ()>,
@@ -1618,28 +1694,29 @@ impl SinkWriter {
         order: AcceptedOrder,
         since: u64,
         when_full: WhenFull,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         let Some(tail) = bytes.get(off..) else {
             drop(guard);
             if off > 0 {
-                let _ = self.shared.fire_input_hook();
+                let _ = self.shared.fire_input_hook_for(landing);
             }
             return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         };
         if self
             .shared
-            .spill_prepend(self.master, tail, since, Room::NoWait)
+            .spill_prepend(self.master, tail, landing, since, Room::NoWait)
         {
             drop(guard);
             if off > 0 {
-                let _ = self.shared.fire_input_hook();
+                let _ = self.shared.fire_input_hook_for(landing);
             }
             return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         }
         if when_full == WhenFull::Refuse {
             drop(guard);
             if off > 0 {
-                let _ = self.shared.fire_input_hook();
+                let _ = self.shared.fire_input_hook_for(landing);
             }
             return Err(WriteReceiptError::no_drainer(
                 off,
@@ -1651,12 +1728,12 @@ impl SinkWriter {
             let Some(rest) = bytes.get(off..) else { break };
             match self
                 .shared
-                .write_stamped_blocking(self.master, rest, since, None)
+                .write_stamped_blocking(self.master, rest, since, None, landing)
             {
                 Ok(0) => {
                     drop(guard);
                     if off > 0 {
-                        let _ = self.shared.fire_input_hook();
+                        let _ = self.shared.fire_input_hook_for(landing);
                     }
                     return Ok(WriteReceipt::new(off, (off > 0).then_some(order)));
                 }
@@ -1667,7 +1744,7 @@ impl SinkWriter {
                 Err(e) => {
                     drop(guard);
                     if off > 0 {
-                        let _ = self.shared.fire_input_hook();
+                        let _ = self.shared.fire_input_hook_for(landing);
                     }
                     return Err(WriteReceiptError::after_write(e, off, order));
                 }
@@ -1675,7 +1752,7 @@ impl SinkWriter {
         }
         drop(guard);
         if off > 0 {
-            let _ = self.shared.fire_input_hook();
+            let _ = self.shared.fire_input_hook_for(landing);
         }
         Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
     }
@@ -1759,6 +1836,8 @@ impl Shared {
             cached_tty_swallows: AtomicU8::new(0),
             spill: Mutex::new(Spill {
                 buf: VecDeque::new(),
+                #[cfg(unix)]
+                runs: VecDeque::new(),
                 chunk_written: 0,
                 draining: false,
                 #[cfg(unix)]
@@ -1841,26 +1920,28 @@ impl Shared {
             .begin(len);
     }
 
-    fn ledger_end(&self, n: usize, fire_hook: bool) {
+    fn ledger_end(&self, n: usize, hook: Option<Landing>) {
         let at = Instant::now();
         self.ledger
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .end(n, at);
-        if fire_hook && n > 0 {
-            let _ = self.fire_input_hook();
+        if let Some(landing) = hook
+            && n > 0
+        {
+            let _ = self.fire_input_hook_for(landing);
         }
     }
 
     fn ledgered<R>(
         &self,
         bytes: &[u8],
-        fire_hook: bool,
+        hook: Option<Landing>,
         write: impl FnOnce(&[u8]) -> (R, usize),
     ) -> R {
         self.ledger_begin(bytes.len());
         let (result, accepted) = write(bytes);
-        self.ledger_end(accepted, fire_hook);
+        self.ledger_end(accepted, hook);
         result
     }
 
@@ -1869,9 +1950,9 @@ impl Shared {
         &self,
         fd: i32,
         bytes: &[u8],
-        fire_hook: bool,
+        hook: Option<Landing>,
     ) -> aterm_pty::NonParkWrite {
-        self.ledgered(bytes, fire_hook, |bytes| {
+        self.ledgered(bytes, hook, |bytes| {
             let wrote = aterm_pty::write_some_nonparking(fd, bytes);
             let accepted = match &wrote {
                 aterm_pty::NonParkWrite::Wrote(n) => *n,
@@ -1917,12 +1998,13 @@ impl Shared {
         bytes: &[u8],
         since: u64,
         stop: Option<&BulkMeter>,
+        landing: Landing,
     ) -> io::Result<usize> {
         loop {
             if self.discarded_since(since) {
                 return Ok(0);
             }
-            let wrote = self.ledgered_nonparking(fd, bytes, true);
+            let wrote = self.ledgered_nonparking(fd, bytes, Some(landing));
             match wrote {
                 aterm_pty::NonParkWrite::Wrote(n) => return Ok(n),
                 aterm_pty::NonParkWrite::Closed => return Ok(0),
@@ -1948,13 +2030,14 @@ impl Shared {
         bytes: &[u8],
         since: u64,
         stop: Option<&BulkMeter>,
+        landing: Landing,
     ) -> io::Result<usize> {
-        self.write_stamped_through(bytes, since, stop, |bytes, stop| {
+        self.write_stamped_through_for(bytes, since, stop, landing, |bytes, stop| {
             aterm_pty::write_some_stoppable(fd, bytes, stop)
         })
     }
 
-    #[cfg(any(not(unix), test))]
+    #[cfg(test)]
     fn write_stamped_through(
         &self,
         bytes: &[u8],
@@ -1962,10 +2045,22 @@ impl Shared {
         stop: Option<&BulkMeter>,
         blocking_write: impl FnOnce(&[u8], Option<&AtomicBool>) -> io::Result<usize>,
     ) -> io::Result<usize> {
+        self.write_stamped_through_for(bytes, since, stop, Landing::Driven, blocking_write)
+    }
+
+    #[cfg(any(not(unix), test))]
+    fn write_stamped_through_for(
+        &self,
+        bytes: &[u8],
+        since: u64,
+        stop: Option<&BulkMeter>,
+        landing: Landing,
+        blocking_write: impl FnOnce(&[u8], Option<&AtomicBool>) -> io::Result<usize>,
+    ) -> io::Result<usize> {
         if self.discarded_since(since) {
             return Ok(0);
         }
-        self.ledgered(bytes, true, |bytes| {
+        self.ledgered(bytes, Some(landing), |bytes| {
             let wrote = blocking_write(bytes, stop.map(|meter| &meter.stop));
             let accepted = wrote.as_ref().map_or(0, |n| *n);
             (wrote, accepted)
@@ -1973,7 +2068,14 @@ impl Shared {
     }
 
     #[cfg(unix)]
-    fn drain_write(&self, fd: i32, chunk: &[u8], off: usize, since: u64) -> usize {
+    fn drain_write(
+        &self,
+        fd: i32,
+        chunk: &[u8],
+        off: usize,
+        since: u64,
+        landing: Landing,
+    ) -> usize {
         let Some(bytes) = chunk.get(off..) else {
             return 0;
         };
@@ -1991,7 +2093,7 @@ impl Shared {
                 };
                 #[cfg(any(test, debug_assertions))]
                 self.at_seam(Seam::DrainWrite);
-                let wrote = self.ledgered_nonparking(fd, bytes, false);
+                let wrote = self.ledgered_nonparking(fd, bytes, None);
                 let n = match wrote {
                     aterm_pty::NonParkWrite::Wrote(n) => n,
                     _ => 0,
@@ -2010,7 +2112,7 @@ impl Shared {
                     // The hook after the spill mutex drops (it runs under the
                     // fd lock, as every landing write's does).
                     if n > 0 {
-                        let _ = self.fire_input_hook();
+                        let _ = self.fire_input_hook_for(landing);
                     }
                     return n;
                 }
@@ -2072,7 +2174,7 @@ impl Shared {
             }
         }
         let poke = defer && s.arrange_pending;
-        s.buf.extend(rest.iter().copied());
+        s.push_back(rest, Landing::Driven);
         self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         if !s.buf.is_empty() {
             self.order_state
@@ -2086,6 +2188,7 @@ impl Shared {
         self: &Arc<Self>,
         master: i32,
         tail: &[u8],
+        landing: Landing,
         since: u64,
         room: Room<'_>,
     ) -> bool {
@@ -2103,9 +2206,7 @@ impl Shared {
             }
         }
         let poke = defer && s.arrange_pending;
-        for b in tail.iter().rev() {
-            s.buf.push_front(*b);
-        }
+        s.push_front(tail, landing);
         self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         if !s.buf.is_empty() {
             self.order_state
@@ -2120,7 +2221,7 @@ impl Shared {
 
     #[cfg(unix)]
     fn prepend_owed(self: &Arc<Self>, master: i32, owed: &[u8], since: u64) -> bool {
-        self.spill_prepend(master, owed, since, Room::Wait(None))
+        self.spill_prepend(master, owed, Landing::Driven, since, Room::Wait(None))
     }
 
     #[cfg(not(unix))]
@@ -2133,6 +2234,7 @@ impl Shared {
         self: &Arc<Self>,
         master: i32,
         bytes: &[u8],
+        landing: Landing,
         room: Room<'_>,
         since: u64,
     ) -> io::Result<Spilled> {
@@ -2173,7 +2275,7 @@ impl Shared {
         let poke = defer && s.arrange_pending;
         let will_be_non_empty = !s.buf.is_empty() || !bytes.is_empty();
         let order = self.next_accepted_order(will_be_non_empty)?;
-        s.buf.extend(bytes.iter().copied());
+        s.push_back(bytes, landing);
         self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         drop(s);
         if poke && let Some(arranger) = self.arranger.get() {
@@ -2187,6 +2289,7 @@ impl Shared {
         self: &Arc<Self>,
         _master: i32,
         _bytes: &[u8],
+        _landing: Landing,
         _room: Room<'_>,
         _since: u64,
     ) -> io::Result<Spilled> {
@@ -2215,7 +2318,7 @@ impl Shared {
         let mut chunk: Vec<u8> = Vec::with_capacity(Self::DRAIN_CHUNK);
         loop {
             let guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-            let since: u64 = {
+            let (since, landing): (u64, Landing) = {
                 let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
                 if s.buf.is_empty() {
                     s.draining = false;
@@ -2227,25 +2330,31 @@ impl Shared {
                     self.drained.notify_all();
                     return;
                 }
+                let (limit, landing) = s
+                    .runs
+                    .front()
+                    .map_or((Self::DRAIN_CHUNK, Landing::Driven), |&(run_len, l)| {
+                        (run_len.clamp(1, Self::DRAIN_CHUNK), l)
+                    });
                 chunk.clear();
                 let (head, tail) = s.buf.as_slices();
-                let take_head = head.len().min(Self::DRAIN_CHUNK);
+                let take_head = head.len().min(limit);
                 if let Some(prefix) = head.get(..take_head) {
                     chunk.extend_from_slice(prefix);
                 }
-                let rem = Self::DRAIN_CHUNK.saturating_sub(chunk.len());
+                let rem = limit.saturating_sub(chunk.len());
                 if rem > 0 {
                     let take_tail = tail.len().min(rem);
                     if let Some(prefix) = tail.get(..take_tail) {
                         chunk.extend_from_slice(prefix);
                     }
                 }
-                self.discard_epoch()
+                (self.discard_epoch(), landing)
             };
             let mut off = 0;
             let mut dead = false;
             while off < chunk.len() {
-                match self.drain_write(fd.as_raw_fd(), &chunk, off, since) {
+                match self.drain_write(fd.as_raw_fd(), &chunk, off, since, landing) {
                     n if n > 0 => off = off.saturating_add(n),
                     _ => {
                         dead = true;
@@ -2263,7 +2372,7 @@ impl Shared {
                     continue;
                 }
                 if dead {
-                    s.buf.clear();
+                    s.clear();
                     s.draining = false;
                     s.failed = true;
                     self.spilled_bytes.store(0, Ordering::Release);
@@ -2273,11 +2382,7 @@ impl Shared {
                     self.drained.notify_all();
                     return;
                 }
-                let len = s.buf.len();
-                let take = if off <= len { off } else { len };
-                for _ in 0..take {
-                    let _ = s.buf.pop_front();
-                }
+                s.pop_front(off);
                 self.spilled_bytes.store(s.buf.len(), Ordering::Release);
                 if s.buf.is_empty() {
                     self.order_state
@@ -2310,7 +2415,7 @@ mod tests {
 
     #[test]
     fn the_input_hook_says_whether_anything_but_an_answer_landed() {
-        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let sink = SinkWriter::new(writer.as_raw_fd());
         let fired = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&fired);
@@ -2341,6 +2446,44 @@ mod tests {
         assert!(
             !sink.take_input_hook_driven(),
             "an answer still marks nothing"
+        );
+
+        let mut drained = [0u8; 13];
+        reader.read_exact(&mut drained).expect("drain small writes");
+        sink.rearm_input_hook();
+        let bulk_answer = vec![b'r'; SinkWriter::NONPARK_MAX + 1];
+        assert_eq!(
+            sink.write_reply(&bulk_answer).expect("bulk answer"),
+            bulk_answer.len()
+        );
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            3,
+            "a bulk answer fires the rearmed hook"
+        );
+        assert!(
+            !sink.take_input_hook_driven(),
+            "a bulk answer over NONPARK_MAX still marks nothing"
+        );
+        let mut got_bulk = vec![0u8; bulk_answer.len()];
+        reader.read_exact(&mut got_bulk).expect("drain bulk answer");
+
+        sink.rearm_input_hook();
+        let fence = sink.try_fence_egress().expect("fence");
+        assert_eq!(sink.write_reply(b"\x1b[0n").expect("spilled answer"), 4);
+        drop(fence);
+        assert!(
+            sink.wait_egress_drained_to_kernel(),
+            "spilled answer drained"
+        );
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            4,
+            "a spilled answer fires the rearmed hook once drained"
+        );
+        assert!(
+            !sink.take_input_hook_driven(),
+            "a spilled answer drained by the drainer still marks nothing"
         );
         drop(writer);
     }
@@ -2577,7 +2720,7 @@ mod tests {
         }
 
         let receipt = sink
-            .write_frame_locked(b"A", None, sink.shared.discard_epoch())
+            .write_frame_locked(b"A", None, sink.shared.discard_epoch(), Landing::Driven)
             .expect("fallback queues behind the racing spill");
         assert_eq!(receipt.accepted(), 1);
         assert_eq!(receipt.order(), Some(AcceptedOrder(2)));

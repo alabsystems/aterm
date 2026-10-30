@@ -679,20 +679,203 @@ pub struct Discovered {
     pub cut: Option<String>,
 }
 
+/// An automatic watch's place among physical build directories. This is a selection hint,
+/// never retained ownership or permission to read a path outside the current roots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cursor {
+    after: Option<(u64, u128)>,
+    scope: Option<[u8; 32]>,
+    cycle: Option<Cycle>,
+    pending: Option<PendingPage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cycle {
+    // Completion records a bounded round of observations. Fresh row witnesses continue to
+    // authorize every removal; target contents can change between these observations.
+    inventory: [u8; 32],
+    end: Option<(u64, u128)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPage {
+    cycle: Cycle,
+    complete: bool,
+}
+
+struct Snapshot(aterm_digest::Sha256);
+
+impl Snapshot {
+    fn new() -> Self {
+        Self(aterm_digest::Sha256::new())
+    }
+
+    fn feed(&mut self, value: &impl std::fmt::Debug) -> bool {
+        use std::fmt::Write as _;
+        write!(self, "{value:?}\0").is_ok()
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.0.finalize()
+    }
+}
+
+impl std::fmt::Write for Snapshot {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0.update(value.as_bytes());
+        Ok(())
+    }
+}
+
+impl Cursor {
+    /// Begin with the lowest physical identity; later pages wrap back after the highest.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            after: None,
+            scope: None,
+            cycle: None,
+            pending: None,
+        }
+    }
+
+    fn rank(self, id: (u64, u128)) -> (bool, (u64, u128)) {
+        (self.after.is_some_and(|after| id <= after), id)
+    }
+
+    /// Invalidate exhaustion progress while keeping the physical selection position.
+    pub fn reset_cycle(&mut self) {
+        self.cycle = None;
+        self.pending = None;
+    }
+
+    pub(crate) fn scope(&mut self, value: &impl std::fmt::Debug) {
+        let mut snapshot = Snapshot::new();
+        let scope = snapshot.feed(value).then(|| snapshot.finish());
+        if scope.is_none() || scope != self.scope {
+            self.reset_cycle();
+            self.scope = scope;
+        }
+    }
+
+    /// Commit only a page whose granted apply work exhausted without stopping. The return
+    /// value closes selection backlog for this cycle; it confers no removal authority.
+    pub(crate) fn finish_page(&mut self, exhausted: bool) -> bool {
+        let pending = self.pending.take();
+        if exhausted && let Some(pending) = pending {
+            self.cycle = (!pending.complete).then_some(pending.cycle);
+            pending.complete
+        } else {
+            self.reset_cycle();
+            false
+        }
+    }
+}
+
+struct Selection {
+    cursor: Cursor,
+    limit: usize,
+    found: BTreeMap<(u64, u128), Found>,
+    overflow: bool,
+    end: Option<(u64, u128)>,
+}
+
+impl Selection {
+    fn add(&mut self, id: (u64, u128), found: Found) {
+        if self
+            .end
+            .is_none_or(|end| self.cursor.rank(id) > self.cursor.rank(end))
+        {
+            self.end = Some(id);
+        }
+        if let Some(before) = self.found.get_mut(&id) {
+            before.origin = std::mem::take(&mut before.origin).merge(found.origin);
+            return;
+        }
+        if self.found.len() >= self.limit {
+            self.overflow = true;
+            let Some(worst) = self
+                .found
+                .keys()
+                .copied()
+                .max_by_key(|id| self.cursor.rank(*id))
+            else {
+                return;
+            };
+            if self.cursor.rank(id) >= self.cursor.rank(worst) {
+                return;
+            }
+            self.found.remove(&worst);
+        }
+        self.found.insert(id, found);
+    }
+
+    fn finish(self) -> (Vec<Found>, Option<(u64, u128)>) {
+        let mut found: Vec<_> = self.found.into_iter().collect();
+        found.sort_by_key(|(id, _)| self.cursor.rank(*id));
+        let next = found.last().map(|(id, _)| *id);
+        (found.into_iter().map(|(_, found)| found).collect(), next)
+    }
+}
+
 /// Discovers all Cargo build directories reachable from `roots` within `budget`.
 #[must_use]
 pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
+    discover_on(roots, budget, None).0
+}
+
+/// Select the next bounded page for an automatic watch, continuing the same bounded traversal
+/// after its selection fills so later aliases still merge their origins. Selection overflow
+/// is reported as partial coverage. Entry, time and per-directory traversal bounds still apply;
+/// a cursor does not make an incomplete traversal complete or retain an earlier observation.
+#[must_use]
+pub fn discover_page(roots: &Roots, budget: Budget, cursor: &mut Cursor) -> Discovered {
+    if cursor.pending.is_some() {
+        cursor.reset_cycle();
+    }
+    let (found, next, pending) = discover_on(roots, budget, Some(*cursor));
+    if let Some(next) = next {
+        cursor.after = Some(next);
+    }
+    if pending.is_none() {
+        cursor.reset_cycle();
+    }
+    cursor.pending = pending;
+    found
+}
+
+fn discover_on(
+    roots: &Roots,
+    budget: Budget,
+    cursor: Option<Cursor>,
+) -> (Discovered, Option<(u64, u128)>, Option<PendingPage>) {
     let mut w = match Walk::new(roots, budget) {
         Ok(w) => w,
         Err(why) => {
             let why = format!("nothing was searched: {why}");
-            return Discovered {
-                found: Vec::new(),
-                notes: vec![format!("cargo-targets: {why}")],
-                cut: Some(why),
-            };
+            return (
+                Discovered {
+                    found: Vec::new(),
+                    notes: vec![format!("cargo-targets: {why}")],
+                    cut: Some(why),
+                },
+                None,
+                None,
+            );
         }
     };
+    w.selection = cursor.map(|cursor| Selection {
+        cursor,
+        limit: budget.found.min(MAX_FOUND),
+        found: BTreeMap::new(),
+        overflow: false,
+        end: None,
+    });
+    if let Some(cursor) = cursor {
+        w.inventory_ok = w
+            .inventory
+            .feed(&("aterm-disk-cycle-v1", roots, cursor.scope));
+    }
     for dir in &roots.agent_target_dirs {
         if dir.is_absolute()
             && let Ok(real) = std::fs::canonicalize(dir)
@@ -749,19 +932,55 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
     if let Some(tmp) = &roots.claude_tmp {
         w.claude_scratch(tmp);
     }
+    let inventory = (cursor.is_some() && w.cut.is_none() && !w.directory_cut && w.inventory_ok)
+        .then(|| w.inventory.finish());
+    let (found, next, overflow, pending) = match w.selection {
+        Some(selection) => {
+            let pending = inventory.map(|inventory| {
+                let cycle = selection
+                    .cursor
+                    .cycle
+                    .filter(|cycle| cycle.inventory == inventory)
+                    .unwrap_or(Cycle {
+                        inventory,
+                        end: selection.end,
+                    });
+                let complete = cycle
+                    .end
+                    .is_none_or(|end| selection.found.contains_key(&end));
+                PendingPage { cycle, complete }
+            });
+            let overflow = selection.overflow;
+            let (found, next) = selection.finish();
+            (found, next, overflow, pending)
+        }
+        None => (w.found, None, false, None),
+    };
     let mut notes = w.notes;
-    let cut = w.cut.clone();
+    let mut cut = w.cut.clone().or_else(|| {
+        w.directory_cut
+            .then(|| format!("a directory had more than {MAX_CHILDREN} entries"))
+    });
+    if !w.inventory_ok {
+        let why = "the current selection inventory could not be observed".to_owned();
+        notes.push(format!("cargo-targets: {why}"));
+        cut.get_or_insert(why);
+    }
     if let Some(why) = w.cut {
         notes.push(format!(
             "cargo-targets: the search for build directories stopped short ({why}); the {} found are surveyed",
-            w.found.len()
+            found.len()
         ));
     }
-    Discovered {
-        found: w.found,
-        notes,
-        cut,
+    if overflow {
+        let why = format!(
+            "the page selected {} build directories; others await a later pass",
+            found.len()
+        );
+        notes.push(format!("cargo-targets: {why}"));
+        cut.get_or_insert(why);
     }
+    (Discovered { found, notes, cut }, next, pending)
 }
 
 fn marked(dir: &Path) -> bool {
@@ -995,8 +1214,12 @@ struct Walk {
     budget: Budget,
     entries: usize,
     cut: Option<String>,
+    directory_cut: bool,
     seen: BTreeMap<(u64, u128), usize>,
     found: Vec<Found>,
+    selection: Option<Selection>,
+    inventory: Snapshot,
+    inventory_ok: bool,
     device: Option<u64>,
     home: Option<PathBuf>,
     #[cfg(windows)]
@@ -1017,8 +1240,12 @@ impl Walk {
             budget,
             entries: 0,
             cut: None,
+            directory_cut: false,
             seen: BTreeMap::new(),
             found: Vec::new(),
+            selection: None,
+            inventory: Snapshot::new(),
+            inventory_ok: true,
             device: roots.device,
             home: roots
                 .home
@@ -1054,7 +1281,13 @@ impl Walk {
             self.cut = Some("it ran out of time".to_owned());
         } else if self.entries > self.budget.entries {
             self.cut = Some(format!("it read {} entries", self.budget.entries));
-        } else if self.found.len() >= self.budget.found {
+        } else if self
+            .selection
+            .as_ref()
+            .map_or(self.found.len() >= self.budget.found, |selection| {
+                selection.limit == 0
+            })
+        {
             self.cut = Some(format!("it found {}", self.budget.found));
         }
         self.cut.is_some()
@@ -1138,11 +1371,12 @@ impl Walk {
             return Vec::new();
         }
         read_into(dir);
-        let Ok(rd) = std::fs::read_dir(dir) else {
+        let Ok(mut rd) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
         let mut reparse_folders = Vec::new();
         let mut out: Vec<(OsString, PathBuf, std::fs::FileType)> = rd
+            .by_ref()
             .take(MAX_CHILDREN)
             .flatten()
             .filter(|e| !self.is_mount(&e.path()))
@@ -1162,6 +1396,14 @@ impl Walk {
                 }
             })
             .collect();
+        if rd.next().is_some() && !self.directory_cut {
+            self.directory_cut = true;
+            self.notes.push(format!(
+                "cargo-targets: {} has more than {MAX_CHILDREN} entries; only its bounded prefix was searched",
+                dir.display()
+            ));
+        }
+        drop(rd);
         for folder in reparse_folders {
             if in_sync_root(&folder) {
                 self.sync_root(&folder);
@@ -1202,6 +1444,18 @@ impl Walk {
             },
             _ => origin.clone(),
         };
+        if let Some(selection) = &mut self.selection {
+            match std::fs::metadata(&path)
+                .and_then(|metadata| Ok((metadata.created().ok(), metadata.modified()?)))
+            {
+                Ok(generation) => {
+                    self.inventory_ok &= self.inventory.feed(&(id, &path, &origin, generation))
+                }
+                Err(_) => self.inventory_ok = false,
+            }
+            selection.add(id, Found { path, origin });
+            return;
+        }
         match self.seen.get(&id) {
             Some(&i) => {
                 if let Some(f) = self.found.get_mut(i) {
@@ -1904,7 +2158,7 @@ pub fn unused(owner: &Owner, path: &Path, processes: Processes<'_>) -> Result<()
     unused_under(&dirs, processes)
 }
 
-/// Verifies that no running process has an open cwd, executable, or descriptor under `dirs`.
+/// Verifies that no running process has an executable, mapping, cwd or descriptor under `dirs`.
 pub fn unused_under(dirs: &[PathBuf], processes: Processes<'_>) -> Result<(), String> {
     scan_says_unused(&processes(dirs, &[std::process::id()]), |_| true)
 }
@@ -1926,6 +2180,7 @@ pub fn scan_says_unused(
             match u.how {
                 "cwd" => "working directory",
                 "exe" => "executable",
+                "map" => "mapped file",
                 _ => "open file",
             }
         ));

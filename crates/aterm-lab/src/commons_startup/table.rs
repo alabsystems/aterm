@@ -19,11 +19,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) type Rows = BTreeMap<Digest, Value>;
+pub(crate) type Rows = BTreeMap<Digest, Value>;
 
-pub(super) struct Table(Descriptor);
+pub(crate) struct Table(Descriptor);
 
 impl Table {
+    pub(crate) fn application(paths: &Paths, application: &str, role: &str) -> Result<Self, Fail> {
+        let bootstrap = Bootstrap::required(paths).map_err(fail)?;
+        Descriptor::application(bootstrap.trust(), application, role, 1)
+            .map(Self)
+            .map_err(fail)
+    }
+
+    pub(crate) fn publish(&self, paths: &Paths) -> Result<(), Fail> {
+        let bootstrap = Bootstrap::required(paths).map_err(fail)?;
+        let session = Session::open(&bootstrap).map_err(fail)?;
+        Directory::new(paths, bootstrap.trust())
+            .publish(&session, &self.0)
+            .map_err(fail)?;
+        Ok(())
+    }
+
     pub(super) fn declare(paths: &[Paths; 2], out: &Path) -> Result<Self, Fail> {
         let bootstrap = Bootstrap::required(&paths[0]).map_err(fail)?;
         let descriptor =
@@ -58,12 +74,12 @@ impl Table {
         Ok(table)
     }
 
-    pub(super) fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         aterm_codec::hex::encode_lower(&self.0.scope.digest())
     }
 
     /// Append only to an existing store. The recipient never declares or joins it here.
-    pub(super) fn write(&self, paths: &Paths, key: &str) -> Result<(Digest, Value), Fail> {
+    pub(crate) fn write(&self, paths: &Paths, key: &str) -> Result<(Digest, Value), Fail> {
         let bootstrap = Bootstrap::required(paths).map_err(fail)?;
         let session = Session::open(&bootstrap).map_err(fail)?;
         let directory = Directory::new(paths, bootstrap.trust());
@@ -82,7 +98,11 @@ impl Table {
         Ok((receipt.id, value))
     }
 
-    fn observe(&self, paths: &Paths, config: &Path) -> Result<(Rows, BTreeSet<Digest>), Fail> {
+    pub(crate) fn observe(
+        &self,
+        paths: &Paths,
+        config: &Path,
+    ) -> Result<(Rows, BTreeSet<Digest>), Fail> {
         let bootstrap = Bootstrap::required(paths).map_err(fail)?;
         let session = Session::observe(&bootstrap).map_err(fail)?;
         let directory = Directory::new(paths, bootstrap.trust());

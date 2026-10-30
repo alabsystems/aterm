@@ -131,6 +131,14 @@ pub struct MomentumGlowConfig {
     /// Whether the light-page glow wears its hue's vivid ink (Sparkle's paper gold) rather than
     /// the walk toward white every other glow keeps ([`light_glow_ink`]).
     pub light_vivid: bool,
+    /// Whether `hue` is a colour the user CHOSE (a pinned cursor colour, or the trail colour a
+    /// style wears): a light page's glow then wears that colour itself, walked toward white only
+    /// as far as the theme's text asks ([`chosen_glow_ink`]), its hue kept and its chroma only
+    /// falling, never its hue's vivid ink.
+    pub chosen_hue: bool,
+    /// Whether `base` is a colour the user CHOSE: the block caret's charge then keeps its hue
+    /// and never raises its chroma ([`chosen_charge`]), on either page.
+    pub chosen_base: bool,
 }
 
 /// One tick's outputs.
@@ -156,7 +164,7 @@ impl MomentumGlowFrame {
 /// Cached light-page glow ink and text-alpha ceiling for `(hue, theme_fg, theme_bg)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LightInkMemo {
-    key: (u32, u32, u32, bool),
+    key: (u32, u32, u32, bool, bool),
     ink: u32,
     text_alpha: f32,
 }
@@ -349,10 +357,12 @@ impl MomentumGlow {
         let fill = if cfg.dark_theme {
             let tint = ramp(a, true);
             emit_halo((cr, cc), a, s, tint, geom, cfg, out);
-            if cfg.block {
-                Some(mix_rgb(cfg.base, tint, 0.55 * s))
-            } else {
+            if !cfg.block {
                 None
+            } else if cfg.chosen_base {
+                Some(chosen_charge(cfg.base, s, true))
+            } else {
+                Some(mix_rgb(cfg.base, tint, 0.55 * s))
             }
         } else {
             let key = (
@@ -360,11 +370,16 @@ impl MomentumGlow {
                 cfg.theme_fg & 0x00FF_FFFF,
                 cfg.theme_bg & 0x00FF_FFFF,
                 cfg.light_vivid,
+                cfg.chosen_hue,
             );
             let light_ink = match self.light_ink_memo {
                 Some(memo) if memo.key == key => (memo.ink, memo.text_alpha),
                 _ => {
-                    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg, cfg.light_vivid);
+                    let ink = if cfg.chosen_hue {
+                        chosen_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg)
+                    } else {
+                        light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg, cfg.light_vivid)
+                    };
                     let text_alpha = light_glow_text_alpha(ink, cfg.theme_fg, cfg.theme_bg);
                     self.light_ink_memo = Some(LightInkMemo {
                         key,
@@ -375,10 +390,12 @@ impl MomentumGlow {
                 }
             };
             emit_light_halo((cr, cc), a, s, light_ink, geom, cfg, under);
-            if cfg.block {
-                Some(crate::color_math::light_charge_in_hue(cfg.base, s))
-            } else {
+            if !cfg.block {
                 None
+            } else if cfg.chosen_base {
+                Some(chosen_charge(cfg.base, s, false))
+            } else {
+                Some(crate::color_math::light_charge_in_hue(cfg.base, s))
             }
         };
 
@@ -395,7 +412,8 @@ impl MomentumGlow {
                 };
                 (u64::from(cfg.hue & 0x00FF_FFFF) << 16
                     | 1 << 63
-                    | u64::from(cfg.light_vivid) << 62)
+                    | u64::from(cfg.light_vivid) << 62
+                    | u64::from(cfg.chosen_hue) << 61)
                     ^ span.rotate_left(37)
             })
             | 1;
@@ -735,6 +753,34 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
     lo_rgb
 }
 
+/// The light glow's ink for a colour the user CHOSE ([`MomentumGlowConfig::chosen_hue`]): the
+/// colour itself, walked toward white only as far as laid opaque on the page it leaves the
+/// theme's text [`LIGHT_GLOW_INK_BAR`] over it. Every channel's distance from white scales down
+/// together, so its hue stays the colour's and its chroma only falls. [`light_glow_ink`] starts
+/// from its hue's vivid ink instead: beside Sparkle pinned to `#b0b0c8` (chroma 0.094) the
+/// paper halo was laid up to `#c1c1ee`, chroma 0.176 (review9fix round 2's judge).
+#[inline]
+const fn chosen_glow_ink(chosen: u32, theme_fg: u32, theme_bg: u32) -> u32 {
+    use crate::cursor_glow::{ink_over_floor_from, light_floor_at};
+    let floor = light_floor_at(theme_fg & 0x00FF_FFFF, LIGHT_GLOW_INK_BAR);
+    ink_over_floor_from(chosen & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF, u8::MAX, floor)
+}
+
+/// A block caret's charge at `s` `0..=1` where its colour is one the user CHOSE
+/// ([`MomentumGlowConfig::chosen_base`]): on a dark page lifted toward white, as far as the
+/// momentum tint's mix reaches, rather than mixed toward the tint's amber; on a light page
+/// darkened in its own hue ([`crate::color_math::light_chosen_fill`]) rather than concentrated.
+/// Either way its channels move together, so its hue stays the colour's and its chroma never
+/// rises.
+#[inline]
+const fn chosen_charge(chosen: u32, s: f32, dark_theme: bool) -> u32 {
+    if dark_theme {
+        mix_rgb(chosen & 0x00FF_FFFF, 0x00FF_FFFF, 0.55 * s)
+    } else {
+        crate::color_math::light_chosen_fill(chosen, s)
+    }
+}
+
 /// The margin past the body bar [`light_glow_ink`]'s vivid lift keeps when stacked, for the
 /// renderer's rounding.
 const LIGHT_GLOW_STACK_GUARD: f32 = 0.02;
@@ -884,6 +930,8 @@ mod tests {
             block: true,
             glyph_span: None,
             light_vivid: false,
+            chosen_hue: false,
+            chosen_base: false,
         }
     }
 

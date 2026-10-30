@@ -193,7 +193,11 @@ fn a_workers_result_is_read_and_a_turn_opens_it_again() {
         "{out:?}"
     );
 
-    ctl_ok(&inst, &[&sel, "turn", "timeout=60000", "true"]);
+    // The submit must show: a one-minute hang detector, not the verb's 2 s window.
+    ctl_ok(
+        &inst,
+        &[&sel, "turn", "timeout=60000", "submit_window=60000", "true"],
+    );
     let record = ctl_ok(&inst, &[&sel, "task"]);
     assert_eq!(field(&record, "state"), Some("working"), "{record}");
     assert_eq!(field(&record, "why"), Some("turn"), "{record}");

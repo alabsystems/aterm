@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Open-file and working-directory path holder inspection across macOS, Linux, and Windows.
+//! Executable, mapped-file, descriptor and working-directory holder inspection.
 use std::io;
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 use std::path::Path;
 use std::path::PathBuf;
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", all(test, unix)))]
+#[path = "holders_mappings.rs"]
+mod mappings;
 
 /// One process using a path under one of the directories scanned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +490,10 @@ mod mac {
         if let Some(found) = hit("cwd", cwd) {
             return Ok(Some(found));
         }
+        // A remover may ignore its own lock descriptors; they must not hide a mapping.
+        if let Some(found) = super::mappings::mac_uses(pid, dirs).map_err(fail)? {
+            return Ok(Some(found));
+        }
         let mut unreadable = false;
         let fds = list_fds(n).map_err(fail)?;
         #[cfg(test)]
@@ -568,6 +576,10 @@ fn linux_uses(proc_dir: &Path, pid: u32, dirs: &[PathBuf]) -> Result<Option<Path
             }
             Err(_) => return Err(()),
         }
+    }
+    // The cache remover's own lock descriptors may be discounted by its consumer.
+    if let Some(found) = mappings::linux_uses(proc_dir, pid, dirs)? {
+        return Ok(Some(found));
     }
     let rd = match std::fs::read_dir(proc_dir.join("fd")) {
         Ok(rd) => rd,
@@ -1827,6 +1839,93 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const HANG: Duration = Duration::from_secs(60);
+
+    struct MappedFile {
+        address: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl MappedFile {
+        fn new(path: &std::path::Path) -> Self {
+            use std::os::fd::AsRawFd as _;
+            let file = std::fs::File::open(path).expect("inert mapping input");
+            let len = usize::try_from(file.metadata().expect("input metadata").len())
+                .expect("mapping size");
+            // SAFETY: the live file descriptor names at least `len` bytes, offset zero is
+            // aligned, and the private read-only mapping outlives no access made here.
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED, "map the inert input");
+            drop(file);
+            Self { address, len }
+        }
+    }
+
+    impl Drop for MappedFile {
+        fn drop(&mut self) {
+            // SAFETY: this object owns the successful mapping, whose unchanged address and
+            // length are passed once; nothing reads it after this destructor.
+            let _ = unsafe { libc::munmap(self.address, self.len) };
+        }
+    }
+
+    #[test]
+    fn a_mapped_file_with_its_descriptor_closed_keeps_the_directory_in_use() {
+        let world = aterm_tempfile::tempdir().expect("private mapping fixture");
+        let dir = world.path().canonicalize().expect("canonical fixture");
+        let path = dir.join("inert mapped input with spaces");
+        std::fs::write(&path, [0x5au8; 4096]).expect("inert mapping input");
+        let mapping = MappedFile::new(&path);
+        // SAFETY: the successful read-only mapping still covers the input's first byte.
+        assert_eq!(
+            unsafe { std::ptr::read(mapping.address.cast::<u8>()) },
+            0x5a
+        );
+        let me = std::process::id();
+        assert!(
+            super::open_files(me)
+                .expect("own descriptors")
+                .iter()
+                .all(|file| placed(file, std::slice::from_ref(&dir)).is_none()),
+            "the original descriptor is closed"
+        );
+        let scan = super::scan_path_users_of(&[me], std::slice::from_ref(&dir), &[])
+            .expect("own path uses");
+        assert!(scan.unreadable.is_empty(), "{scan:?}");
+        assert!(
+            scan.users
+                .iter()
+                .any(|user| user.pid == me && user.how == "map"),
+            "the mapping alone must retain the cache: {scan:?}"
+        );
+        let lock = dir.join("own cache lock");
+        std::fs::write(&lock, b"inert lock custody").expect("own lock fixture");
+        let custody = std::fs::File::open(&lock).expect("own lock custody");
+        let scan = super::scan_path_users_of(&[me], std::slice::from_ref(&dir), &[])
+            .expect("own path uses with lock custody");
+        assert!(
+            scan.users
+                .iter()
+                .any(|user| user.pid == me && user.how == "map"),
+            "ignorable own lock descriptors must not hide a mapping: {scan:?}"
+        );
+        drop(custody);
+        drop(mapping);
+        let scan = super::scan_path_users_of(&[me], std::slice::from_ref(&dir), &[])
+            .expect("own path uses after unmapping");
+        assert!(
+            scan.users.is_empty() && scan.unreadable.is_empty(),
+            "{scan:?}"
+        );
+    }
 
     /// A new directory of this run's own: never one an earlier run with this pid kept, which may hold a copy that never showed it ran.
     fn fresh(name: &str) -> PathBuf {

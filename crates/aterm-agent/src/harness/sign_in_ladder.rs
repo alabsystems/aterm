@@ -319,6 +319,7 @@ fn run_words(renewal: super::cli::Renewal, code: Option<i32>) -> String {
     use super::cli::Renewal;
     match renewal {
         Renewal::Renewed => "signed in".to_owned(),
+        Renewal::OtherRenewed => "another configured account signed in".to_owned(),
         Renewal::AuthFailed => match code {
             Some(code) => format!("claude auth login exited {code} with no login made"),
             None => "claude auth login ended with no login made".to_owned(),
@@ -500,6 +501,11 @@ impl Ladder {
             },
         );
         wait
+    }
+
+    /// Whether a retry step is retained, even after its deadline has passed.
+    pub(super) fn has_backoff(&self, label: &str) -> bool {
+        self.backoff.contains_key(label)
     }
 
     /// Notes that `label` signed in: its backoff ends.

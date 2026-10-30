@@ -1687,8 +1687,12 @@ impl<C: Ctl> Session<'_, C> {
     ) -> crate::harness::repo_work::RepoRead {
         use crate::harness::repo_work::RepoRead;
         let tail = reading.said_tail.as_deref();
+        // Land's go-ahead rides the Repo leg ([`TurnEndState::go_ahead_owed`]): a reply that
+        // parks on one is probed as a done claim is.
+        let parks = reading.autopilot == Autopilot::Land && reading.go_ahead().is_some();
         if !(super::super::policy::turn_end::says_done(tail)
-            || reading.finished_record == Some(true))
+            || reading.finished_record == Some(true)
+            || parks)
         {
             return RepoRead::Clean;
         }
@@ -2209,7 +2213,7 @@ impl<C: Ctl> Session<'_, C> {
         r.autopilot = Autopilot::Cruise;
         let mut action = self.turn_end_decision(&r, &opts.policy, now, "pass:cruise", trace);
         let mut cfg = std::borrow::Cow::Borrowed(&opts.policy);
-        if r.asked().is_some()
+        if (r.asked().is_some() || r.go_ahead().is_some())
             && session_word_can_decide(&action)
             && let Some(policy) = self.prose_policy(opts)?
         {
@@ -2813,7 +2817,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn sync_exception(&mut self, seq: u64, backing_out: bool, review: &mut dyn Review) {
         use super::super::policy::exception::{LOGIN_BACKED_OUT, LOGIN_BACKING_OUT};
         self.stuck_over(seq, "the screen reached a point", review);
-        let Some(now) = self.exception_now.clone() else {
+        if self.exception_now.is_none() {
             let cause = self.exception_open.as_ref().and_then(|(open, since)| {
                 if open.kind != super::super::policy::outlook::ExceptionKind::Login {
                     None
@@ -2824,6 +2828,17 @@ impl<C: Ctl> Session<'_, C> {
                 }
             });
             self.exception_ended(seq, cause, review);
+            return;
+        }
+        self.raise_exception(seq, review);
+    }
+
+    /// Publish the standing exception [`Self::exception_now`] names, once a change: journaled
+    /// `EXCEPTION seq=<n> kind=… when=…` and put on the host, ending one of another kind first. A
+    /// point's [`Self::sync_exception`] runs it, and so does a break that tells the person now
+    /// (a spent go-ahead, [`Self::cruise_carry`]).
+    pub(super) fn raise_exception(&mut self, seq: u64, review: &mut dyn Review) {
+        let Some(now) = self.exception_now.clone() else {
             return;
         };
         match &self.exception_open {

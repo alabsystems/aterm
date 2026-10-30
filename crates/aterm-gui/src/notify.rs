@@ -258,11 +258,11 @@ fn deliver(
     // A bundle's voice is aterm's own: posted in-process as the bundle, or
     // not at all. A center that would not take the notice, or none to post
     // through, is one log line, never a subprocess.
-    match way_for(center, running_bundled(), alerts, &ASKED, &wanted) {
-        Route::Center => {
-            if !wanted() {
-                return;
-            }
+    match post_for(
+        way_for(center, running_bundled(), alerts, &ASKED, &wanted),
+        &wanted,
+    ) {
+        Some(Post::Center) => {
             let posted = center.post(&crate::notice_center::Notice {
                 title,
                 body,
@@ -271,28 +271,59 @@ fn deliver(
             if !posted {
                 aterm_log::warn!("notices: one not posted: the center would not take it");
             }
-            return;
         }
+        // A bare binary: the OS's osascript, by its absolute path (an aterm the Dock started has
+        // launchd's PATH), and the script is one `-e` argv entry, never a shell string.
+        Some(Post::Osascript) => {
+            let _ = aterm_uds::spawnfd::command(aterm_uds::os_path!("osascript"))
+                .arg("-e")
+                .arg(osascript_script(title, body))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        None => {}
+    }
+}
+
+/// How [`deliver`] posts a notice.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Post {
+    /// In-process, through the bundle's notification center.
+    Center,
+    /// Through the OS's osascript (a bare binary's only voice).
+    Osascript,
+}
+
+/// The post a notice routed `way` gets: the center's for [`Route::Center`] and osascript's for
+/// [`Route::Osascript`], each only while `wanted`; any other way is one log line and no post.
+#[cfg(target_os = "macos")]
+fn post_for(way: Route, wanted: impl Fn() -> bool) -> Option<Post> {
+    match way {
+        Route::Center => wanted().then_some(Post::Center),
+        Route::Osascript => wanted().then_some(Post::Osascript),
         Route::Withheld => {
             aterm_log::info!(
                 "notices: one not posted: aterm's notifications are off in System Settings \
                  \u{25B8} Notifications"
             );
-            return;
+            None
         }
         Route::Ask | Route::Unasked => {
             aterm_log::info!(
                 "notices: one not posted: macOS has not let aterm post as itself yet (Notify Me \
                  When I'm Needed asks)"
             );
-            return;
+            None
         }
         Route::Lapsed => {
             aterm_log::info!(
                 "notices: one not posted: the queued intent ended, aterm's own notices were \
                  turned off or its tab came into view"
             );
-            return;
+            None
         }
         Route::Centerless if crate::signing_identity::running_bundle_id().is_none() => {
             aterm_log::info!(
@@ -301,36 +332,27 @@ fn deliver(
                  it has none to post as; moved to /Applications or ~/Applications and opened \
                  there, it posts as itself"
             );
-            return;
+            None
         }
         Route::Centerless => {
             aterm_log::info!(
                 "notices: one not posted: macOS gave this aterm.app no notification center (an \
                  earlier notices: line says why), and an app posts only as itself"
             );
-            return;
+            None
         }
-        Route::Osascript => {}
     }
+}
 
-    // A bare binary: the OS's osascript, by its absolute path (an aterm the Dock started has
-    // launchd's PATH). Body and title land in an AppleScript string literal, so both are
-    // escaped, and the script is one `-e` argv entry, never a shell string.
-    let script = format!(
+/// The osascript script that posts `body` under `title`: both land in an AppleScript string
+/// literal, so both are escaped.
+#[cfg(target_os = "macos")]
+fn osascript_script(title: &str, body: &str) -> String {
+    format!(
         "display notification \"{}\" with title \"{}\"",
         applescript_escape(body),
         applescript_escape(title),
-    );
-    if !wanted() {
-        return;
-    }
-    let _ = aterm_uds::spawnfd::command(aterm_uds::os_path!("osascript"))
-        .arg("-e")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -509,13 +531,21 @@ fn deliver(
     if cfg!(test) || crate::menu::process_is_headless() {
         return;
     }
+    let (title, body) = balloon_text(title, body);
+    win_balloon::deliver(title, body, silent, session, wanted);
+}
+
+/// A notice's balloon title and text: a missing title is `aterm`, and a notice with no body
+/// shows its title as the text under `aterm`, since a balloon with empty text is removed, never
+/// shown.
+#[cfg(any(test, windows))]
+fn balloon_text<'a>(title: Option<&'a str>, body: &'a str) -> (&'a str, &'a str) {
     let title = title.unwrap_or("aterm");
-    let (title, body) = if body.is_empty() {
+    if body.is_empty() {
         ("aterm", title)
     } else {
         (title, body)
-    };
-    win_balloon::deliver(title, body, silent, session, wanted);
+    }
 }
 
 #[cfg(any(test, windows))]
@@ -1447,8 +1477,8 @@ mod live_policy_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        NotifyMsg, applescript_escape, balloon_clicked, delivers, fold_controls, fold_to_utf16,
-        markup_escape, windows_info_flags,
+        NotifyMsg, applescript_escape, balloon_clicked, balloon_text, delivers, fold_controls,
+        fold_to_utf16, markup_escape, windows_info_flags,
     };
     use std::collections::HashSet;
 
@@ -1536,6 +1566,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What a route posts: the center's notice for a granted center and osascript's for a bare
+    /// binary, each only while the notice is still wanted, and on every other way nothing, so a
+    /// bundle never spawns osascript. The script says the body, then the title, each escaped.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_notice_posts_only_through_the_center_or_a_bare_binarys_osascript_while_wanted() {
+        use super::{Post, Route, osascript_script, post_for};
+        for way in [
+            Route::Center,
+            Route::Ask,
+            Route::Withheld,
+            Route::Unasked,
+            Route::Lapsed,
+            Route::Centerless,
+            Route::Osascript,
+        ] {
+            let posts = match way {
+                Route::Center => Some(Post::Center),
+                Route::Osascript => Some(Post::Osascript),
+                _ => None,
+            };
+            assert_eq!(post_for(way, || true), posts, "{way:?}");
+            assert_eq!(post_for(way, || false), None, "no longer wanted: {way:?}");
+        }
+        assert_eq!(
+            osascript_script("Title", "Body"),
+            r#"display notification "Body" with title "Title""#
+        );
+        assert_eq!(
+            osascript_script("a\"b", "c\\"),
+            r#"display notification "c\\" with title "a\"b""#
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2023,6 +2087,19 @@ mod tests {
         ] {
             assert!(!balloon_clicked(other), "{other:#x}");
         }
+    }
+
+    /// A notice with a title and no body shows its title as the balloon's text, under `aterm`:
+    /// a balloon with empty text never shows.
+    #[test]
+    fn a_title_only_notice_shows_its_title_as_the_balloons_text() {
+        assert_eq!(balloon_text(Some("Build"), "done"), ("Build", "done"));
+        assert_eq!(balloon_text(None, "done"), ("aterm", "done"));
+        assert_eq!(
+            balloon_text(Some("Build done"), ""),
+            ("aterm", "Build done")
+        );
+        assert_eq!(balloon_text(None, ""), ("aterm", "aterm"));
     }
 
     #[test]

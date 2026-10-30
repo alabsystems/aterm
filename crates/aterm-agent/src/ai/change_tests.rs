@@ -94,6 +94,30 @@ fn the_uncommitted_change_and_untracked_files_are_sent_and_secrets_held_back() {
     held.sort();
     assert_eq!(held, [".env", ".ssh/id_ed25519"]);
     assert_eq!(c.files, 2);
+    let under_rules = vec![crate::supervise::policy::approval::SecretRule::Under(
+        PathBuf::from("/home/alice/.secrets"),
+    )];
+    assert!(
+        looks_secret(
+            Path::new("/home/alice"),
+            "sub/../.secrets/key.txt",
+            &under_rules
+        ),
+        "dotdot traversal within a repository into SecretRule::Under is normalized before matching"
+    );
+    assert!(
+        looks_secret(
+            Path::new("/home/alice/work"),
+            "sub/../../.secrets/key.txt",
+            &under_rules
+        ),
+        "dotdot traversal escaping a repository into SecretRule::Under is normalized before matching"
+    );
+    let base_rules = vec![crate::supervise::policy::approval::SecretRule::Basename(
+        ".env".into(),
+    )];
+    assert!(looks_secret(&r.root, "sub/.env/", &base_rules));
+    assert!(looks_secret(&r.root, r"sub\.env", &base_rules));
 }
 
 #[test]

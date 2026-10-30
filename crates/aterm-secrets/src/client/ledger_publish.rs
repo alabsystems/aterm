@@ -200,7 +200,7 @@ pub(super) fn candidate_server_urls(
     if let Source::Url(url) = &config.source {
         push_unique_endpoint(&mut urls, url);
     }
-    if let Ok(Some((entry, _))) = entry::read_reserved_entry_and_admin(paths, config, POLICY_ENTRY)
+    if let Ok(Some(entry)) = entry::read_reserved_entry(paths, config, POLICY_ENTRY)
         && let Ok(text) = std::str::from_utf8(entry.value().as_slice())
         && let Ok(policy) = SwarmPolicy::from_toml(text)
     {
@@ -293,7 +293,8 @@ pub fn read_server_heads(paths: &Paths, extra_urls: &[String]) -> crate::Result<
     }
 
     for url in candidate_server_urls(paths, &config, extra_urls) {
-        if let Ok(Fetched::Body(bytes)) = transport::fetch_within(&url, None, SERVER_HEAD_DEADLINE)
+        if let Ok(Fetched::Body(bytes)) =
+            transport::fetch_within(&url, None, servers_within(SERVER_HEAD_DEADLINE))
             && let Ok(head) = decode_verified_head(url, bytes, &config, &pin, &identity)
         {
             out.push(head);
@@ -402,24 +403,48 @@ pub(super) fn reconcile_merged_metadata(
                             .node_id
                             .as_ref()
                             .is_none_or(|n| !merged_roster.deny_nodes.contains(n))
-                        && merged_roster
-                            .member_by_recipient(&member.recipient)
-                            .is_none()
+                        && member
+                            .node_key
+                            .as_ref()
+                            .is_none_or(|n| !merged_roster.deny_nodes.contains(n))
                     {
-                        merged_roster.members.push(member);
+                        if let Some(existing) = merged_roster
+                            .members
+                            .iter_mut()
+                            .find(|m| m.recipient == member.recipient)
+                        {
+                            if existing.node_key.is_none() {
+                                existing.node_key = member.node_key;
+                            }
+                            if existing.node_id.is_none() {
+                                existing.node_id = member.node_id;
+                            }
+                        } else {
+                            merged_roster.members.push(member);
+                        }
                     }
                 }
             }
         }
     }
     if any_roster {
-        merged_roster.members.retain(|m| {
-            !revoked_recipients.contains(&m.recipient)
-                && !merged_roster.deny_labels.contains(&m.label)
-                && m.node_id
-                    .as_ref()
-                    .is_none_or(|n| !merged_roster.deny_nodes.contains(n))
-        });
+        merged_roster.canonicalize();
+        let candidates = std::mem::take(&mut merged_roster.members);
+        merged_roster.members = candidates
+            .into_iter()
+            .filter(|m| {
+                !revoked_recipients.contains(&m.recipient)
+                    && !merged_roster.is_label_denied(&m.label)
+                    && !m.aliases.iter().any(|a| merged_roster.is_label_denied(a))
+                    && !merged_roster.is_label_denied(&m.vault_name)
+                    && m.node_id
+                        .as_deref()
+                        .is_none_or(|n| !merged_roster.is_node_denied(n))
+                    && m.node_key
+                        .as_deref()
+                        .is_none_or(|n| !merged_roster.is_node_denied(n))
+            })
+            .collect();
         // Ensure deterministic unique labels across merged branches (`§3.4 rule 5`: recompute
         // conflicting labels rather than allowing two approvers to hand out one label).
         let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();
@@ -435,7 +460,7 @@ pub(super) fn reconcile_merged_metadata(
                     deny_labels: merged_roster.deny_labels.clone(),
                     deny_nodes: merged_roster.deny_nodes.clone(),
                 };
-                assign_newcomer(
+                let new_label = assign_newcomer(
                     &mut temp,
                     doc,
                     &policy,
@@ -448,15 +473,30 @@ pub(super) fn reconcile_merged_metadata(
                         now_ms: member.admitted_ms,
                     },
                 );
-                if let Some(last) = temp.members.last() {
-                    seen_labels.insert(last.label.clone());
+                if let Some(reassigned) = temp
+                    .members
+                    .iter_mut()
+                    .find(|m| m.recipient == member.recipient)
+                {
+                    if reassigned.node_id.is_none() {
+                        reassigned.node_id = member.node_id;
+                    }
+                    if reassigned.node_key.is_none() {
+                        reassigned.node_key = member.node_key;
+                    }
+                    if reassigned.hint.is_none() {
+                        reassigned.hint = member.hint;
+                    }
                 }
+                seen_labels.insert(new_label);
                 deduped_members = temp.members;
             }
         }
         merged_roster.members = deduped_members;
         for (recipient, vault_name) in &newly_admitted {
-            if merged_roster.member_by_recipient(recipient).is_none() {
+            if merged_roster.member_by_recipient(recipient).is_none()
+                && !merged_roster.is_label_denied(vault_name)
+            {
                 assign_newcomer(
                     &mut merged_roster,
                     doc,
@@ -479,10 +519,6 @@ pub(super) fn reconcile_merged_metadata(
         )
         .map_err(|e| Error::new(e.to_string()))?;
     }
-
-    // Complete any half-done revoke cascade (e.g. account-pool warm slots of a Mac revoked on one
-    // branch while reallocated on another).
-    let _ = retirement::repair_half_done_revokes(doc)?;
 
     // Preserve the highest `aterm-swarm-lease` epoch across all branches.
     let cur_for_lease = doc.clone();
@@ -513,6 +549,10 @@ pub(super) fn reconcile_merged_metadata(
             .map_err(|e| Error::new(e.to_string()))?;
         }
     }
+
+    // Complete any half-done revoke cascade (e.g. account-pool warm slots or steward lease of a
+    // Mac revoked on one branch while reallocated or renewed on another).
+    let _ = retirement::repair_half_done_revokes(doc)?;
     Ok(())
 }
 
@@ -752,12 +792,18 @@ pub(super) fn publish_to_servers_for_admin(
     urls: &[String],
     bytes: &[u8],
 ) -> crate::Result<Vec<(String, crate::Result<()>)>> {
-    let _lock = super::configured_admin(paths, expected)?;
+    // Publishes from this Mac PUT one at a time, so every server hears two of them in the order
+    // they began (`publish_lock`). The state lock, which every secrets command on this Mac takes,
+    // covers only the check that the configuration is still the one `bytes` were sealed for and
+    // goes before any PUT: held across them, a server that takes a PUT and never answers held
+    // every such command for the PUT's exchange deadline.
+    let _publishing = super::publish_lock(paths)?;
+    drop(super::configured_admin(paths, expected)?);
     // Every PUT runs at once. Each one has its own exchange deadline, and the list holds up to
     // `discover::MAX_CANDIDATES` browsed servers that nothing has verified. Run one after
-    // another, a server that accepts and never answers would hold this lock, and with it every
-    // secrets command on this Mac, for one deadline per server. Run at once, it holds the lock
-    // for one deadline, as the single PUT to `config.source` did before F6.
+    // another, a server that accepts and never answers would hold the publish for one deadline
+    // per server. Run at once, it holds it for one deadline, as the single PUT to
+    // `config.source` did before F6.
     let put = |url: &String| transport::publish(&Source::Url(url.clone()), bytes);
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = urls
@@ -785,8 +831,8 @@ pub(super) fn publish_to_servers_for_admin(
     Ok(results)
 }
 
-/// PUT `bytes` to every server URL in `urls` (holding `paths`'s admin lock) and return each
-/// server's result.
+/// PUT `bytes` to every server URL in `urls` (holding `paths`'s publish lock, and its state lock
+/// only to check that the vault configuration is unchanged) and return each server's result.
 ///
 /// # Errors
 /// Local vault configuration or admin lock cannot be acquired.

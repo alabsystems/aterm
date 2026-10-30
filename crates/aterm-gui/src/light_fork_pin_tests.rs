@@ -206,6 +206,14 @@ struct Drawn {
     light_owned: bool,
     /// Whether a yield ever cut a frame's glass (`CursorGlow::last_yield`).
     yielded: bool,
+    /// The step whose glass a publish cut, and the caps the yield's memo holds
+    /// (`CursorGlow::yield_held`).
+    yield_held: (bool, usize),
+    /// Whether the ribbon's last lit plan drew by the bed's glass (`Ribbon::glass_drew`), and
+    /// laid it a span of the under stream (`Ribbon::glass_span`).
+    glass_drew: (bool, bool),
+    /// The light pages' palettes the ribbon holds (`Ribbon::palettes_held`).
+    palettes: usize,
     /// The light the glow's last tick began under, which a held park's flush draws by
     /// (`CursorGlow::tick_light`).
     tick_light: Light,
@@ -319,7 +327,9 @@ fn fill_breaks(twin: &[Drawn], drawn: &[Drawn]) -> Vec<String> {
 /// - 1.4: no Prism Glass solve unit ran (`prism_glass_solves == 0`,
 ///   `rainbow_kitty::prism_glass::take_solves`).
 /// - 1.5: the bed draws by main's table, not the glass ([`BedInkLut::glass_lit`]), and the
-///   frame leaves no light words (`EffectsPipeline::light_words`: the bed's glass, the palettes).
+///   frame leaves no light words (`EffectsPipeline::light_words`: the bed's glass, the palettes),
+///   the ribbon holds no palette (`Ribbon::palettes_held`) and no plan of its drew by the glass
+///   (`Ribbon::glass_drew`).
 /// - 1.6: no ribbon slab was laid as the light wedge
 ///   (`aterm_render::test_counters::take_wedge_slabs`).
 /// - 1.7: no ribbon slab was laid as the light glass
@@ -329,8 +339,10 @@ fn fill_breaks(twin: &[Drawn], drawn: &[Drawn]) -> Vec<String> {
 /// - 1.8: the ribbon folded no glass envelope, priced no glass slab and stepped no glass
 ///   cadence (`glass_exits == 0`, `rainbow_kitty::ribbon::take_glass_exits`).
 /// - 1.9: no glass was laid light-owned, the letter guard's to leave and the yield's to cut,
-///   by the yield's record (`CursorGlow::glass_laid`) or the ink ledger's own
-///   (`CursorGlow::light_owned_noted`), and no yield cut a frame (`CursorGlow::last_yield`).
+///   by the yield's record (`CursorGlow::glass_laid`), the ink ledger's own
+///   (`CursorGlow::light_owned_noted`) or the ribbon's span (`Ribbon::glass_span`), no yield cut
+///   a frame (`CursorGlow::last_yield`), and no publish spent a step's glass nor the yield
+///   memoised a cap (`CursorGlow::yield_held`).
 /// - 1.10: the ribbon holds no `left_at` and no hand's row of a multi-row set
 ///   (`Ribbon::glass_wraps`, `Ribbon::wrap_hand`).
 /// - 1.11: the Settings preview's light, which no frame of the app's carries, is asserted
@@ -389,6 +401,21 @@ fn light_symbols_absent(drawn: &Drawn, out: &mut Vec<&'static str>) {
     }
     if drawn.yielded {
         out.push("yield");
+    }
+    if drawn.yield_held.0 {
+        out.push("yield_spent");
+    }
+    if drawn.yield_held.1 != 0 {
+        out.push("yield memo");
+    }
+    if drawn.glass_drew.0 {
+        out.push("glass_drew");
+    }
+    if drawn.glass_drew.1 {
+        out.push("glass_span");
+    }
+    if drawn.palettes != 0 {
+        out.push("palettes");
     }
     if drawn.tick_light != Light::OFF {
         out.push("tick_light");
@@ -482,6 +509,22 @@ fn read(app: &App, wid: WindowId, t0: Instant, now: Instant) -> Drawn {
         light_words: ws.fx.light_words(t0).words().len(),
         light_owned: !ws.fx.cursor().glow.glass_laid().is_empty(),
         yielded: ws.fx.cursor().glow.last_yield().is_some(),
+        yield_held: {
+            let (spent, memo) = ws.fx.cursor().glow.yield_held();
+            (spent.is_some(), memo)
+        },
+        glass_drew: ws
+            .fx
+            .cursor()
+            .glow
+            .v2_ribbon()
+            .map_or((false, false), |rib| {
+                (rib.glass_drew().is_some(), rib.glass_span().is_some())
+            }),
+        palettes: ws.fx.cursor().glow.v2_ribbon().map_or(
+            0,
+            aterm_effects::rainbow_kitty::ribbon::Ribbon::palettes_held,
+        ),
         tick_light: ws.fx.cursor().glow.tick_light(),
         engine_lights: ws.fx.cursor().engine_lights(),
         v2_light: ws.fx.cursor().glow.v2_light(),
@@ -517,6 +560,21 @@ fn run_with(
     entry: Entry,
     extra: &str,
 ) -> (TrailRig, Vec<Drawn>) {
+    run_at(ground, page, stand, entry, extra, None, "")
+}
+
+/// [`run_with`] with the window previewing the live level `live` (the dump's `live <level>`;
+/// `None`: `prism_glass::LIVE`), each typed letter echoed after `ink` (an SGR the echo carries
+/// first; empty: the theme's own ink).
+fn run_at(
+    ground: Ground,
+    page: Page,
+    stand: Stand,
+    entry: Entry,
+    extra: &str,
+    live: Option<Live>,
+    ink: &str,
+) -> (TrailRig, Vec<Drawn>) {
     let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
     let t0 = rig.t0();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -545,6 +603,7 @@ fn run_with(
         }),
     }
     rig.grid(8, 40, t0).expect("the grid");
+    rig.live(live);
     if let Stand::SplitPane = stand {
         rig.split(t0).expect("the split");
         rig.focus_pane(1, t0).expect("the new pane takes the focus");
@@ -631,7 +690,7 @@ fn run_with(
     {
         let k = 700 + 90 * i as u64;
         rig.key(key, at(k)).expect("the key lands");
-        rig.pty(echo.as_bytes(), at(k + 2));
+        rig.pty(format!("{ink}{echo}").as_bytes(), at(k + 2));
         frame(&mut rig, at(k + 16));
         frame(&mut rig, at(k + 50));
     }
@@ -804,6 +863,65 @@ fn the_light_reads_carry_a_light_schemes_light() {
     ] {
         assert!(broke.contains(read), "{read} carried the light: {broke:?}");
     }
+}
+
+/// The glass reads' wiring (§15.2 1.12 leans on the pin): on a light configured scheme at the
+/// glass level, typed in an app's red, each read the pin holds absent on every dark ground that
+/// the glass's code draws by breaks, so each is read from the code that draws by it, not wired
+/// to an object no frame touches. Default Light's tables ship, so its glass draws from the first
+/// frame; a page with none (Iceberg Light, a pack theme) starts its palette's solve instead,
+/// which the ribbon holds. A read only another stand or page lights (a split's pane light, a
+/// wrapped composer's rows) is held by its own run.
+#[test]
+fn the_glass_reads_carry_the_glass() {
+    const RED: &str = "\x1b[38;2;196;38;46m";
+    let broke = |ground: Ground| -> std::collections::BTreeSet<&'static str> {
+        let (_, drawn) = run_at(
+            ground,
+            Page::Plain,
+            Stand::Instance,
+            Entry::Present,
+            "",
+            Some(Live::Glass),
+            RED,
+        );
+        drawn.iter().flat_map(breaks).collect()
+    };
+    let shipped = broke(Ground::Builtin(LIGHT_INSTANCE));
+    for read in [
+        "light_arms_drawn",
+        "frame_light",
+        "latch",
+        "window_light",
+        "bed glass",
+        "light_words",
+        "ribbon_wedge_into",
+        "ribbon_glass_into",
+        "glass plan",
+        "glass exits",
+        "glass_px",
+        "glass_drew",
+        "glass_span",
+        "light_owned",
+        "ledger light_owned",
+        "yield",
+        "yield_spent",
+        "yield memo",
+    ] {
+        assert!(
+            shipped.contains(read),
+            "{read} carried the glass: {shipped:?}"
+        );
+    }
+    let iceberg = aterm_theme_pack::find("Iceberg Light").expect("a pack light theme");
+    let solving = broke(Ground::Pack {
+        id: iceberg.id,
+        text: iceberg.text,
+    });
+    assert!(
+        solving.contains("palettes"),
+        "the ribbon holds the solve: {solving:?}"
+    );
 }
 
 /// The pin's negative control (§15.1 P0.9): on a dark ground, a frame forced onto the light
@@ -1024,4 +1142,43 @@ fn forcing_dark_theme_false_on_a_dark_ground_fails_the_pin() {
         }),
         ["ledger light_owned"]
     );
+    for (drawn, name) in [
+        (
+            Drawn {
+                yield_held: (true, 0),
+                ..live
+            },
+            "yield_spent",
+        ),
+        (
+            Drawn {
+                yield_held: (false, 1),
+                ..live
+            },
+            "yield memo",
+        ),
+        (
+            Drawn {
+                glass_drew: (true, false),
+                ..live
+            },
+            "glass_drew",
+        ),
+        (
+            Drawn {
+                glass_drew: (false, true),
+                ..live
+            },
+            "glass_span",
+        ),
+        (
+            Drawn {
+                palettes: 1,
+                ..live
+            },
+            "palettes",
+        ),
+    ] {
+        assert_eq!(breaks(&drawn), [name]);
+    }
 }

@@ -13,6 +13,8 @@
 //! asb drain  <endpoint> <group> <filter> [--max N] [--idle MS] [--peek]
 //! asb ack    <endpoint> <group> <offset> <subject> handled|refused|deferred
 //! asb commit <endpoint> <group> <upto>                      durably commit a consumer group
+//! asb federate <src> <dst> (--rules-file P | --group G --filter F) [--once | --interval-ms N]
+//!                                                           mirror subtrees across brokers exactly once
 //! asb mint   <grant> --secret-env NAME | --secret-file PATH mint a capability line
 //! asb repair <log>                                          truncate at the first corrupt record
 //! asb stats  <log>                                          inspect log offsets, retention, subjects, and bindings
@@ -279,6 +281,12 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
        asb drain  <endpoint> <group> <filter> [--max N] [--idle MS] [--peek] <transport> <cap>
        asb ack    <endpoint> <group> <offset> <subject> handled|refused|deferred [--id N] <transport> <cap>
        asb commit <endpoint> <group> <upto> <transport> <cap>
+       asb federate <src-endpoint> <dst-endpoint>
+                  (--rules-file PATH | --group G --filter F [--rewrite SPEC] [--exclude P]...)
+                  [--id N] [--max N] [--once | --interval-ms N] [--cut-file PATH]
+                  <transport> [--dst-tcp] [--dst-handshake]
+                  [--dst-key-env NAME | --dst-key-file PATH]
+                  <cap> [--dst-cap-file PATH]...
        asb mint   <grant> --secret-env NAME | --secret-file PATH [--legacy-unbound]
        asb attenuate <child-grant> --cap-file PATH [--secret-env NAME | --secret-file PATH]
        asb repair <log> [--at-rest-key-env NAME | --at-rest-key-file PATH]
@@ -1075,6 +1083,11 @@ struct Cli {
     /// `--cap-file` is repeatable: a connection's keyring holds up to `MAX_KEYRING`
     /// grants, and reading one subtree while committing under another is the intended shape.
     cap_files: Vec<String>,
+    /// `--dst-cap-file` is repeatable on `asb federate` when the destination broker holds a
+    /// distinct capability keyring from `--cap-file`.
+    dst_cap_files: Vec<String>,
+    /// `--exclude PREFIX` is repeatable on `asb federate` inline rules.
+    excludes: Vec<String>,
     /// `--listen <scheme>:<addr>` is repeatable (`REQUIREMENTS` R2): multiple listeners
     /// share one broker, log, guard, dedup table, and will table.
     listens: Vec<String>,
@@ -1092,8 +1105,15 @@ const VALUE_FLAGS: &[&str] = &[
     "--max",
     "--idle",
     "--group",
+    "--filter",
+    "--rewrite",
+    "--rules-file",
+    "--interval-ms",
+    "--cut-file",
     "--key-env",
     "--key-file",
+    "--dst-key-env",
+    "--dst-key-file",
     "--at-rest-key-env",
     "--at-rest-key-file",
     "--host-key-file",
@@ -1115,6 +1135,9 @@ const VALUE_FLAGS: &[&str] = &[
 const BOOL_FLAGS: &[&str] = &[
     "--tcp",
     "--handshake",
+    "--dst-tcp",
+    "--dst-handshake",
+    "--once",
     "--peek",
     "--bt",
     "--legacy-unbound",
@@ -1138,6 +1161,10 @@ const COMMON_FLAGS: &[&str] = &[
 /// of the command, so a secret must never appear there.
 const ARGV_SECRETS: &[(&str, &str)] = &[
     ("--key", "pass it with --key-env NAME or --key-file PATH"),
+    (
+        "--dst-key",
+        "pass it with --dst-key-env NAME or --dst-key-file PATH",
+    ),
     (
         "--at-rest-key",
         "pass it with --at-rest-key-env NAME or --at-rest-key-file PATH",
@@ -1236,6 +1263,8 @@ fn parse() -> Result<Cli, u8> {
     let mut bools: HashSet<String> = HashSet::new();
     let mut kv: HashMap<String, String> = HashMap::new();
     let mut cap_files: Vec<String> = Vec::new();
+    let mut dst_cap_files: Vec<String> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
     let mut listens: Vec<String> = Vec::new();
     let mut peer_files: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
@@ -1266,6 +1295,8 @@ fn parse() -> Result<Cli, u8> {
             )));
         }
         if flag == "--cap-file"
+            || flag == "--dst-cap-file"
+            || flag == "--exclude"
             || flag == "--listen"
             || flag == "--allow-peer-file"
             || VALUE_FLAGS.contains(&flag)
@@ -1279,6 +1310,10 @@ fn parse() -> Result<Cli, u8> {
             };
             if flag == "--cap-file" {
                 cap_files.push(v);
+            } else if flag == "--dst-cap-file" {
+                dst_cap_files.push(v);
+            } else if flag == "--exclude" {
+                excludes.push(v);
             } else if flag == "--listen" {
                 listens.push(v);
             } else if flag == "--allow-peer-file" {
@@ -1305,6 +1340,8 @@ fn parse() -> Result<Cli, u8> {
         kv,
         transport: std::cell::OnceCell::new(),
         cap_files,
+        dst_cap_files,
+        excludes,
         listens,
         peer_files,
     })
@@ -1343,6 +1380,12 @@ impl Cli {
         }
         if !self.cap_files.is_empty() {
             given.push("--cap-file");
+        }
+        if !self.dst_cap_files.is_empty() {
+            given.push("--dst-cap-file");
+        }
+        if !self.excludes.is_empty() {
+            given.push("--exclude");
         }
         if !self.listens.is_empty() {
             given.push("--listen");
@@ -3723,6 +3766,405 @@ fn cmd_commit(cli: &Cli) -> Result<(), AsbErr> {
     )?)
 }
 
+const FEDERATE_FILE_MAX: u64 = 64 << 10;
+
+fn read_bounded_utf8(flag: &str, path: &str, max_bytes: u64) -> Result<String, String> {
+    use std::io::Read;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Err(format!("{flag} {path}: {e}")),
+    };
+    let mut text = String::new();
+    match f
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+    {
+        Ok(n) if (n as u64) > max_bytes => {
+            Err(format!("{flag} {path}: longer than {max_bytes} bytes"))
+        }
+        Ok(_) => Ok(text),
+        Err(e) => Err(format!("{flag} {path}: {e}")),
+    }
+}
+
+fn read_federate_rules_file(path: &str) -> Result<Vec<astream_broker::FederationRule>, String> {
+    let text = read_bounded_utf8("--rules-file", path, FEDERATE_FILE_MAX)?;
+    match astream_broker::parse_federation_rules(&text) {
+        Ok(rules) => Ok(rules),
+        Err(e) => Err(format!("--rules-file {path}: {e}")),
+    }
+}
+
+fn read_cut_file_if_present(path: &str) -> Result<astream_broker::FederatedCut, u8> {
+    use std::io::Read;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(astream_broker::FederatedCut::new());
+        }
+        Err(e) => return Err(fail_exit(2, &format!("--cut-file {path}: {e}"))),
+    };
+    let mut text = String::new();
+    match f
+        .take(FEDERATE_FILE_MAX.saturating_add(1))
+        .read_to_string(&mut text)
+    {
+        Ok(n) if (n as u64) > FEDERATE_FILE_MAX => Err(fail_exit(
+            2,
+            &format!("--cut-file {path}: longer than {FEDERATE_FILE_MAX} bytes"),
+        )),
+        Ok(_) => match astream_broker::FederatedCut::decode_text(&text) {
+            Ok(cut) => Ok(cut),
+            Err(e) => Err(usage_error(&format!("--cut-file {path}: {e}"))),
+        },
+        Err(e) => Err(fail_exit(2, &format!("--cut-file {path}: {e}"))),
+    }
+}
+
+fn stage_cut_file(tmp: &str, path: &str, text: &str) -> io::Result<()> {
+    let _ = remove_file_str(tmp);
+    let mut f = open_with_options(
+        std::fs::OpenOptions::new().write(true).create_new(true),
+        tmp,
+    )?;
+    f.write_all(text.as_bytes())?;
+    astream_sys::full_sync(&f)?;
+    drop(f);
+    rename_str(tmp, path)
+}
+
+fn write_cut_file_atomic(path: &str, cut: &astream_broker::FederatedCut) -> io::Result<()> {
+    let text = cut.encode_text();
+    let tmp = format!("{path}.{}.new", std::process::id());
+    if let Err(e) = stage_cut_file(&tmp, path, &text) {
+        let _ = remove_file_str(&tmp);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("--cut-file {path}: staging {tmp}: {e}"),
+        ));
+    }
+    sync_parent_dir(path)
+}
+
+fn check_transport_supported(t: &Transport, key_flags: &str, hs_flag: &str) -> Result<(), u8> {
+    match t {
+        Transport::Unix if cfg!(not(unix)) => Err(fail_exit(
+            2,
+            "Unix-socket endpoints need a unix host; use --tcp",
+        )),
+        Transport::Sealed(_) if cfg!(not(feature = "aead")) => Err(fail_exit(
+            2,
+            &format!("{key_flags} require asb built with `--features aead`"),
+        )),
+        Transport::Handshake(_) if cfg!(not(feature = "handshake")) => Err(fail_exit(
+            2,
+            &format!("{hs_flag} requires asb built with `--features handshake`"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn resolve_dst_transport(cli: &Cli, src_transport: &Transport) -> Result<Transport, u8> {
+    let dst_key_src = match (cli.kv.get("--dst-key-env"), cli.kv.get("--dst-key-file")) {
+        (Some(_), Some(_)) => {
+            return Err(usage_error(
+                "--dst-key-env and --dst-key-file are mutually exclusive",
+            ));
+        }
+        (Some(e), None) => Some(KeySource::Env(e.clone())),
+        (None, Some(f)) => Some(KeySource::File(f.clone())),
+        (None, None) => None,
+    };
+    let dst_hs = cli.has("--dst-handshake");
+    let dst_tcp = cli.has("--dst-tcp");
+    if dst_key_src.is_none() && !dst_hs && !dst_tcp {
+        return Ok(src_transport.clone());
+    }
+    match dst_key_src {
+        Some(src) => {
+            let (what, mut raw) = load_bytes("--dst-key", &src)?;
+            let mut key = [0u8; 32];
+            let res = decode_hex(raw.trim_ascii(), &mut key);
+            raw.fill(0);
+            std::hint::black_box(&raw);
+            if let Err(e) = res {
+                return Err(fail_exit(2, &format!("{what}: {e}")));
+            }
+            if dst_hs {
+                Ok(Transport::Handshake(Box::new(key)))
+            } else {
+                Ok(Transport::Sealed(Box::new(key)))
+            }
+        }
+        None if dst_hs => Err(usage_error(
+            "--dst-handshake needs a key (--dst-key-env NAME or --dst-key-file PATH)",
+        )),
+        None => Ok(Transport::Tcp),
+    }
+}
+
+fn caps_to_grant_tags(caps: &[Cap]) -> Vec<(String, [u8; 32])> {
+    let mut out = Vec::with_capacity(caps.len().min(64));
+    for c in caps {
+        out.push((c.grant.clone(), c.tag));
+    }
+    out
+}
+
+fn format_federation_report_line(group: &str, rep: &astream_broker::FederationReport) -> String {
+    format!(
+        "federated group={group} fetched={} mirrored={} deduped={} skipped={} next={}",
+        rep.fetched, rep.mirrored, rep.deduped, rep.skipped, rep.next_cursor
+    )
+}
+
+fn cmd_federate(cli: &Cli) -> Result<(), AsbErr> {
+    let src_ep_str = cli.at(1, "src-endpoint")?;
+    let dst_ep_str = cli.at(2, "dst-endpoint")?;
+    cli.no_more_than(3)?;
+    cli.only_net(
+        "federate",
+        &[
+            "--rules-file",
+            "--group",
+            "--filter",
+            "--rewrite",
+            "--exclude",
+            "--id",
+            "--max",
+            "--once",
+            "--interval-ms",
+            "--cut-file",
+            "--dst-tcp",
+            "--dst-handshake",
+            "--dst-key-env",
+            "--dst-key-file",
+            "--dst-cap-file",
+        ],
+    )?;
+
+    let once = cli.has("--once");
+    let interval_opt = cli.num("--interval-ms")?;
+    if once && interval_opt.is_some() {
+        return Err(AsbErr::Exit(usage_error(
+            "--once and --interval-ms are mutually exclusive",
+        )));
+    }
+    let interval_ms = interval_opt.unwrap_or(250);
+    if !once && interval_ms == 0 {
+        return Err(AsbErr::Exit(usage_error(
+            "--interval-ms expects a positive number of milliseconds",
+        )));
+    }
+
+    let rules = match cli.kv.get("--rules-file") {
+        Some(path) => {
+            if cli.kv.contains_key("--group")
+                || cli.kv.contains_key("--filter")
+                || cli.kv.contains_key("--rewrite")
+                || !cli.excludes.is_empty()
+                || cli.kv.contains_key("--max")
+            {
+                return Err(AsbErr::Exit(usage_error(
+                    "--rules-file cannot be combined with inline --group/--filter/--rewrite/--exclude/--max flags",
+                )));
+            }
+            match read_federate_rules_file(path) {
+                Ok(r) => r,
+                Err(msg) => return Err(AsbErr::Exit(usage_error(&msg))),
+            }
+        }
+        None => {
+            let Some(group) = cli.kv.get("--group") else {
+                return Err(AsbErr::Exit(usage_error(
+                    "federate requires either --rules-file PATH or --group <G> --filter <F>",
+                )));
+            };
+            let Some(filter) = cli.kv.get("--filter") else {
+                return Err(AsbErr::Exit(usage_error(
+                    "federate with --group requires --filter <F>",
+                )));
+            };
+            if astream_wire::Subject::new(group).is_err() {
+                return Err(AsbErr::Exit(usage_error(&format!(
+                    "--group {group:?} is not a valid Subject"
+                ))));
+            }
+            if astream_wire::Filter::new(filter).is_err() {
+                return Err(AsbErr::Exit(usage_error(&format!(
+                    "--filter {filter:?} is not a valid Filter"
+                ))));
+            }
+            let mut rw = match cli.kv.get("--rewrite") {
+                Some(spec) => match astream_broker::parse_rewrite_spec(spec) {
+                    Ok(r) => r,
+                    Err(msg) => {
+                        return Err(AsbErr::Exit(usage_error(&format!("--rewrite: {msg}"))))
+                    }
+                },
+                None => astream_broker::SubjectRewrite::passthrough(),
+            };
+            for ex in &cli.excludes {
+                rw = match rw.with_excluded_prefix(ex) {
+                    Ok(next) => next,
+                    Err(msg) => {
+                        return Err(AsbErr::Exit(usage_error(&format!("--exclude: {msg}"))))
+                    }
+                };
+            }
+            let batch_size = match cli.num("--max")? {
+                Some(0) | Some(257..) => {
+                    return Err(AsbErr::Exit(usage_error(
+                        "--max on federate must be in 1..=256",
+                    )));
+                }
+                Some(n) => n as usize,
+                None => astream_broker::DEFAULT_FEDERATION_BATCH,
+            };
+            vec![astream_broker::FederationRule {
+                group: group.clone(),
+                filter: filter.clone(),
+                rewrite: rw,
+                producer_id: None,
+                batch_size,
+            }]
+        }
+    };
+
+    let src_transport = cli.transport()?;
+    check_transport_supported(src_transport, "--key-env/--key-file", "--handshake")?;
+    let dst_transport = resolve_dst_transport(cli, src_transport)?;
+    check_transport_supported(
+        &dst_transport,
+        "--dst-key-env/--dst-key-file",
+        "--dst-handshake",
+    )?;
+
+    let src_caps = cli.caps()?;
+    let dst_caps = if cli.dst_cap_files.is_empty() {
+        src_caps.clone()
+    } else {
+        match load_caps(&cli.dst_cap_files) {
+            Ok(c) => c,
+            Err(code) => return Err(AsbErr::Exit(code)),
+        }
+    };
+    if (!src_caps.is_empty() || !dst_caps.is_empty()) && !cfg!(feature = "cap") {
+        return Err(AsbErr::Exit(fail_exit(
+            2,
+            "--cap-file/--dst-cap-file require asb built with `--features cap`",
+        )));
+    }
+
+    let mut any_needs_default_id = false;
+    for r in &rules {
+        if r.producer_id.is_none() {
+            any_needs_default_id = true;
+        }
+    }
+    let default_producer_id = if let Some(id) = cli.num("--id")? {
+        id
+    } else if !any_needs_default_id {
+        0
+    } else if let Some(id) = bound_producer_id(&dst_caps)? {
+        id
+    } else {
+        return Err(AsbErr::Exit(usage_error(
+            "federate needs a producer id that survives a restart: pass --id N, set id=<N> per rule in --rules-file, or attach a destination grant bound to a principal",
+        )));
+    };
+
+    let mut cut_state = match cli.kv.get("--cut-file") {
+        Some(path) => Some((path.clone(), read_cut_file_if_present(path)?)),
+        None => None,
+    };
+
+    let src_ep = astream_broker::FederationEndpoint::new(&src_ep_str, src_transport.clone())
+        .with_grant_tags(caps_to_grant_tags(&src_caps));
+    let dst_ep = astream_broker::FederationEndpoint::new(&dst_ep_str, dst_transport)
+        .with_grant_tags(caps_to_grant_tags(&dst_caps));
+
+    let mut runner =
+        match astream_broker::FederationRunner::open(src_ep, dst_ep, default_producer_id, rules) {
+            Ok(r) => r,
+            Err(astream_broker::FederationError::Config(msg)) => {
+                return Err(AsbErr::Exit(usage_error(&msg)));
+            }
+            Err(e) => {
+                warn(&format!("asb: {e}"));
+                return Err(AsbErr::Exit(1));
+            }
+        };
+
+    if once {
+        let reports = match runner.drain_until_caught_up(1024) {
+            Ok(reps) => reps,
+            Err(e) => {
+                warn(&format!("asb: {e}"));
+                return Err(AsbErr::Exit(1));
+            }
+        };
+        if let Some((ref path, ref mut cut)) = cut_state {
+            runner.record_into_cut(&reports, cut);
+            write_cut_file_atomic(path, cut)?;
+        }
+        for (group, rep) in &reports {
+            let line = format_federation_report_line(group, rep);
+            if rep.mirrored > 0 || rep.committed_upto.is_some() {
+                say_durable(
+                    &line,
+                    "the federated records and source consumer-group commit ARE on the logs",
+                )?;
+            } else {
+                say(&line)?;
+            }
+        }
+        return Ok(());
+    }
+
+    let sleep_dur = Duration::from_millis(interval_ms);
+    loop {
+        match runner.sync_all_once() {
+            Ok(reports) => {
+                let mut any_fetched = false;
+                for (_group, rep) in &reports {
+                    if rep.fetched > 0 {
+                        any_fetched = true;
+                    }
+                }
+                if any_fetched {
+                    if let Some((ref path, ref mut cut)) = cut_state {
+                        runner.record_into_cut(&reports, cut);
+                        write_cut_file_atomic(path, cut)?;
+                    }
+                    for (group, rep) in &reports {
+                        if rep.fetched > 0 {
+                            let line = format_federation_report_line(group, rep);
+                            say_durable(
+                                &line,
+                                "the federated records and source consumer-group commit ARE on the logs",
+                            )?;
+                        }
+                    }
+                } else {
+                    std::thread::sleep(sleep_dur);
+                }
+            }
+            Err(astream_broker::FederationError::Io(_)) => {
+                std::thread::sleep(sleep_dur);
+                if let Err(e) = runner.reconnect_all() {
+                    warn(&format!("asb: {e}"));
+                    return Err(AsbErr::Exit(1));
+                }
+            }
+            Err(e) => {
+                warn(&format!("asb: {e}"));
+                return Err(AsbErr::Exit(1));
+            }
+        }
+    }
+}
+
 fn run() -> Result<(), AsbErr> {
     let cli = parse()?;
     match cli.pos.first().map(String::as_str) {
@@ -3739,6 +4181,7 @@ fn run() -> Result<(), AsbErr> {
         Some("drain") => cmd_drain(&cli),
         Some("ack") => cmd_ack(&cli),
         Some("commit") => cmd_commit(&cli),
+        Some("federate") => cmd_federate(&cli),
         Some(other) => Err(AsbErr::Exit(usage_error(&format!(
             "unknown verb {other:?}"
         )))),

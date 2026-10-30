@@ -1119,6 +1119,40 @@ impl App {
                     false
                 }
             }
+            Intent::AllowJoinAgain { request } => {
+                #[cfg(unix)]
+                {
+                    match self.allow_member_request_again(request) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            aterm_log::info!("message {id}: Allow again refused: {why}");
+                            false
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
+                    false
+                }
+            }
+            Intent::UndoRemovals { remover } => {
+                #[cfg(unix)]
+                {
+                    match self.undo_member_removals(&remover) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            aterm_log::info!("message {id}: Undo refused: {why}");
+                            false
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = remover;
+                    false
+                }
+            }
             Intent::RestartService { service } => self.restart_service(wid, &service),
             Intent::ShowTab { .. } => false,
             Intent::ShowSession {

@@ -140,7 +140,12 @@ const BIND_DEADLINE: Duration = Duration::from_secs(5);
 
 const ARM_DEADLINE: Duration = Duration::from_secs(5);
 
+#[cfg(not(test))]
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
+/// The unit tests' instances are in-process stand-ins, so a reply one of them sends late is a
+/// loaded machine, not an instance gone silent: their sockets wait the hang detector.
+#[cfg(test)]
+const IO_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 const TRACE_ENV: &str = "ATERM_FABRIC_TRACE";
 
@@ -4042,6 +4047,19 @@ fn session_sids(ctl: &mut Ctl) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn inbox_wait_cursor(header: &str) -> Option<u64> {
+    let mut fields = header.strip_prefix("OK inbox ")?.split_whitespace();
+    let cursor = fields.next()?.parse::<u64>().ok()?;
+    if let Some(field) = fields.next() {
+        let id = field.strip_prefix("fleet=f")?;
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) || id.parse::<u64>().ok()? == 0
+        {
+            return None;
+        }
+    }
+    fields.next().is_none().then_some(cursor)
+}
+
 fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
     let own = std::env::var("ATERM_PARENT_SESSION_ID").ok();
     let mut choice: Option<(&Instance, String)> = None;
@@ -4135,11 +4153,7 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
         )
         .map_err(|e| not_back(&e))?;
         // `OK timeout` is the await's deadline passing: an OK that delivered nothing.
-        let Some(newest) = woke
-            .header()
-            .strip_prefix("OK inbox ")
-            .and_then(|id| id.trim().parse::<u64>().ok())
-        else {
+        let Some(newest) = inbox_wait_cursor(woke.header()) else {
             return Err(not_back(&format!(
                 "the wait answered {}",
                 safe(woke.header(), 128)
@@ -5343,11 +5357,9 @@ pub const PERSON_HOLD_LIFT: &str = "the person at the window took it over (Take 
 /// What lifts another Mac's hold (`origin=remote`, the step-in).
 pub const REMOTE_HOLD_LIFT: &str = "another Mac holds it over the fleet: that Mac's `aterm ctl \
      --host <this Mac> hold <sid> off` lifts it, or the person here takes it with Take Over and \
-     hands it back, or lowers `aterm fleet allow` here; once that Mac left the fleet, `aterm \
-     fleet peers rm <its node>` (the survey's `held_from=`) lifts it too, run here where no \
-     \"*\" grant stands here (the rm ends a grant here that names the node), and under the \
-     \"*\" grant run on the fleet's issuer, once this Mac reads that book again (`aterm fleet \
-     peers` reads it now)";
+     hands it back, or runs `aterm fleet allow content` here; `aterm fleet peers rm <its node>` \
+     (the survey's `held_from=`) here also drops grants naming that node, but an all-member \
+     grant can admit a valid signed entry merged back from another member's book";
 
 /// Which hold slots an `origin=` / `hold_origin=` list names (`person`,
 /// `remote`, `fleet`, `local`, comma-joined), each read as a whole word.
@@ -9293,6 +9305,47 @@ mod tests {
             seen[4].starts_with("@s-1 await inbox since=1 kinds=note "),
             "the second wait starts past the other sender's note: {seen:#?}"
         );
+    }
+
+    #[test]
+    fn the_proof_accepts_a_combined_bus_and_direct_mail_wake() {
+        let (proved, seen) = prove_against(
+            "proof-direct",
+            &[
+                "OK 0 hold=0\n",
+                "OK 1 off=6\n",
+                "OK inbox 1 fleet=f1\n",
+                "OK 1 hold=0\nmsg 1 off=5 t=1 from=s-9@n-b kind=note trust=agent\n",
+                "OK inbox 2\n",
+                "OK 1 hold=0\nmsg 2 off=6 t=2 from=s-1@n-a kind=note trust=agent\n",
+            ],
+        );
+        assert!(proved.is_ok(), "{proved:?}: {seen:#?}");
+        assert!(
+            seen[4].starts_with("@s-1 await inbox since=1 kinds=note "),
+            "the direct metadata must not replace the bus cursor: {seen:#?}"
+        );
+    }
+
+    #[test]
+    fn inbox_wait_cursor_rejects_malformed_metadata() {
+        assert_eq!(inbox_wait_cursor("OK inbox 0"), Some(0));
+        for header in [
+            "OK timeout",
+            "OK inbox",
+            "OK inbox nope fleet=f1",
+            "OK inbox 18446744073709551616",
+            "OK inbox 1 fleet=1",
+            "OK inbox 1 fleet=f",
+            "OK inbox 1 fleet=f0",
+            "OK inbox 1 fleet=f+1",
+            "OK inbox 1 fleet=f18446744073709551616",
+            "OK inbox 1 unknown=f1",
+            "OK inbox 1 fleet=f1 fleet=f2",
+            "OK inbox 1 fleet=f1 trailing",
+        ] {
+            assert_eq!(inbox_wait_cursor(header), None, "{header}");
+        }
     }
 
     #[test]

@@ -9245,7 +9245,7 @@ impl App {
         caps: crate::seamless::WireCaps,
     ) -> Result<Vec<u64>, ParkAttempt> {
         let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
-        let window = std::time::Duration::from_secs(30);
+        let window = park_budget_for_test::deadline_budget(std::time::Duration::from_secs(30));
         self.capture_parked_screens(
             &live,
             std::time::Instant::now() + window,
@@ -9298,7 +9298,7 @@ impl App {
             &live,
         );
         let window = self.park_window_carry(target_build);
-        let budget = std::time::Duration::from_secs(30);
+        let budget = park_budget_for_test::deadline_budget(std::time::Duration::from_secs(30));
         let ParkedScreens {
             screens,
             carries,

@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every light scheme (foreach-scheme light: the built-ins and the pack themes) at the build's
+# live level (no `live` line), so the commit that moves prism_glass::LIVE compares its light
+# with main's paper arm: a style switch mid-line: typing under comet, then the config switches to
+# the rainbow kitty and typing goes on, so the ribbon ramps in.
+
+foreach-scheme light {
+  grid 16 80
+  style comet
+  hz 60
+
+  at 0 pty "\e[9;1H$ "
+  at 700 key e
+  at 702 pty "e"
+  at 800 key c
+  at 802 pty "c"
+  at 900 key h
+  at 902 pty "h"
+  at 1000 key o
+  at 1002 pty "o"
+  at 1100 key space
+  at 1102 pty " "
+  at 1200 key c
+  at 1202 pty "c"
+  at 1300 key o
+  at 1302 pty "o"
+  at 1400 key m
+  at 1402 pty "m"
+  at 1500 key e
+  at 1502 pty "e"
+  at 1600 key t
+  at 1602 pty "t"
+  at 1700 key space
+  at 1702 pty " "
+  at 1800 key f
+  at 1802 pty "f"
+  at 1900 key i
+  at 1902 pty "i"
+  at 2000 key r
+  at 2002 pty "r"
+  at 2100 key s
+  at 2102 pty "s"
+  at 2200 key t
+  at 2202 pty "t"
+  run 2300
+
+  style rainbow kitty
+
+  at 2400 key ,
+  at 2402 pty ","
+  at 2500 key space
+  at 2502 pty " "
+  at 2600 key t
+  at 2602 pty "t"
+  at 2700 key h
+  at 2702 pty "h"
+  at 2800 key e
+  at 2802 pty "e"
+  at 2900 key n
+  at 2902 pty "n"
+  at 3000 key space
+  at 3002 pty " "
+  at 3100 key t
+  at 3102 pty "t"
+  at 3200 key h
+  at 3202 pty "h"
+  at 3300 key e
+  at 3302 pty "e"
+  at 3400 key space
+  at 3402 pty " "
+  at 3500 key k
+  at 3502 pty "k"
+  at 3600 key i
+  at 3602 pty "i"
+  at 3700 key t
+  at 3702 pty "t"
+  at 3800 key t
+  at 3802 pty "t"
+  at 3900 key y
+  at 3902 pty "y"
+  at 4000 key space
+  at 4002 pty " "
+  at 4100 key r
+  at 4102 pty "r"
+  at 4200 key a
+  at 4202 pty "a"
+  at 4300 key m
+  at 4302 pty "m"
+  at 4400 key p
+  at 4402 pty "p"
+  at 4500 key s
+  at 4502 pty "s"
+  at 4600 key space
+  at 4602 pty " "
+  at 4700 key i
+  at 4702 pty "i"
+  at 4800 key n
+  at 4802 pty "n"
+  run 6400
+}

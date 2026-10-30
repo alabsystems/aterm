@@ -336,7 +336,7 @@ fn unquoted(t: &str) -> &str {
 
 const MENTION_NOUNS: &[&str] = &[
     "line", "lines", "head", "heads", "row", "rows", "block", "blocks", "label", "labels", "token",
-    "tokens", "prefix", "marker", "markers",
+    "tokens", "prefix", "marker", "markers", "item", "items",
 ];
 
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
@@ -941,7 +941,8 @@ fn wraps(need: &str, next: &str) -> bool {
         && !fence(t)
         && past_marker(t).is_none()
         && !a_head(next)
-        && t.chars()
+        && t.trim_start_matches(['"', '\'', '`', '(', '“', '‘'])
+            .chars()
             .next()
             .is_some_and(|c| c.is_lowercase() || c.is_ascii_digit())
         && !need.trim_end().ends_with(['.', '!', '?', ':'])
@@ -1196,7 +1197,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
     out
 }
 
-fn sanitized(need: &str) -> String {
+pub(super) fn sanitized(need: &str) -> String {
     let clean: String = need
         .chars()
         .map(|c| {
@@ -1216,6 +1217,12 @@ fn sanitized(need: &str) -> String {
     cut.truncate(cut.trim_end().len());
     cut.push('…');
     cut
+}
+
+/// Each need of the report `tail` as written, wrapped rows joined, before [`needs_you`] cleans
+/// and cuts it: the go-ahead reader judges a need on all of its words.
+pub(super) fn need_words(tail: &str) -> Vec<String> {
+    needs_lines(tail).needs
 }
 
 /// What the report `tail` names only a person can give, each need one line.

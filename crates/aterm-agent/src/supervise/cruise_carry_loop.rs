@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::policy::cruise_carry::{BackgroundCarries, RULE_BACKGROUND, carry_words};
-use super::super::policy::turn_end::TurnEndTiming;
+use super::super::policy::exception::Exception;
+use super::super::policy::go_ahead::{self, RULE_GO_AHEAD};
+use super::super::policy::turn_end::{
+    GO_AHEAD_REFUSED, TurnEndTiming, go_ahead_answer, irreversible_ask,
+};
 use super::approvals::Outcome;
 use super::turn_end_loop::Written;
 use super::*;
@@ -66,6 +70,9 @@ enum CarrySaid {
     Waits(Instant),
     /// The hour's typing budget (`continue_per_hour`) is spent.
     Budget,
+    /// The break parks on a go-ahead its limit of acts already answered
+    /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_spent`]): nothing more goes.
+    Refused,
 }
 
 impl CarryWatch {
@@ -238,7 +245,15 @@ impl<C: Ctl> Session<'_, C> {
     /// typing or another driver's hand, a halt, a draft or unread input, a session nobody asked
     /// anything, the memory wall, the API's route down, and the host's withhold. Off and Land type
     /// nothing here, by the mode the loop last read and again by the one read just before the
-    /// write ([`Self::autopilot_at_busy`]). Returns whether it typed.
+    /// write ([`Self::autopilot_at_busy`]). Where the break's turn parks its own reversible work
+    /// on a person's go-ahead (read as a turn end reads it,
+    /// [`super::super::policy::turn_end::TurnEndState::go_ahead_at_break`]) and answers are on,
+    /// the owner's standing go-ahead ([`RULE_GO_AHEAD`]) goes in the carry's place, on the
+    /// carry's ladder, unless a person's turn holds it
+    /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_held`]); once its bound is spent
+    /// nothing goes and the person is told now ([`Exception::refuses_go_ahead`]). With answers
+    /// off the carry goes without its sentence that the go-ahead is no need. Returns whether it
+    /// typed.
     pub(super) fn cruise_carry(
         &mut self,
         screen: &Screen,
@@ -313,31 +328,69 @@ impl<C: Ctl> Session<'_, C> {
             .as_ref()
             .and_then(|path| self.fx.read_text(path))
             .and_then(|text| super::turn_end_loop::standing_rules_in(&text));
-        let text = carry_words(rules.as_deref());
+        let reader = self.reader(&screen.rows);
+        let tail = reader.said_tail(&screen.rows);
+        let before = reader.turn_said_before(&screen.rows);
+        let opens_cut =
+            tail.is_some() && !reader.bounds_messages() && !reader.turn_whole(&screen.rows);
+        // The go-ahead goes at a break where it would at a turn end: the turn read whole (its
+        // earlier messages too), never over an irreversible ask, never within a person's hold,
+        // and never past its bound, where nothing goes and the person is told now.
+        let parked = tail
+            .as_deref()
+            .filter(|t| !irreversible_ask(Some(t)))
+            .and_then(|t| {
+                self.turn_end
+                    .go_ahead_at_break(before.as_deref(), t, opens_cut)
+            })
+            .filter(|_| !self.turn_end.go_ahead_held(now));
+        let park = parked.clone().filter(|_| cfg.answer_questions);
+        if park
+            .as_ref()
+            .is_some_and(|p| self.turn_end.go_ahead_spent(p, now))
+        {
+            self.carry_said(seq, CarrySaid::Refused, review);
+            self.exception_now = Some(Exception::refuses_go_ahead());
+            self.raise_exception(seq, review);
+            return Ok(false);
+        }
+        let (text, rule, why) = match &park {
+            Some(park) => (
+                go_ahead_answer(park, false, rules.as_deref()),
+                RULE_GO_AHEAD,
+                "the agent parked its own reversible work on a person's go-ahead at a break of \
+                 its background work (autopilot cruise)",
+            ),
+            // With answers off the carry goes, but never says the go-ahead is no need over a
+            // park the person chose to answer themselves.
+            None => (
+                go_ahead::unless_held(
+                    &carry_words(rules.as_deref()),
+                    self.turn_end.go_ahead_held(now) || parked.is_some(),
+                )
+                .into_owned(),
+                RULE_BACKGROUND,
+                "the turn ended while the agent's own background work runs (autopilot cruise)",
+            ),
+        };
         let point = self.turn_of(screen.clone());
-        let written = self.type_text_written(&point, &text, RULE_BACKGROUND, review)?;
+        let written = self.type_text_written(&point, &text, rule, review)?;
         if written != Written::Submitted {
             return Ok(false);
         }
         let typed_at = self.fx.mono();
         self.cruise_carry.typed(typed_at, screen);
         self.turn_end.background_carried(typed_at);
+        if let Some(park) = &park {
+            self.turn_end.go_ahead_typed(park, typed_at);
+        }
         let typed_ms = self.hold_ms(typed_at);
         self.break_lined(typed_ms);
         self.hold_line(seq, Some(cfg), review);
         host.break_taken();
         host.inform(&text);
-        review.say(&format!(
-            "CONTINUED seq={seq} rule={RULE_BACKGROUND} {}",
-            clip(&text)
-        ))?;
-        self.ledger_row(
-            RULE_BACKGROUND,
-            Outcome::Typed,
-            &text,
-            "the turn ended while the agent's own background work runs (autopilot cruise)",
-            seq,
-        );
+        review.say(&format!("CONTINUED seq={seq} rule={rule} {}", clip(&text)))?;
+        self.ledger_row(rule, Outcome::Typed, &text, why, seq);
         Ok(true)
     }
 
@@ -383,6 +436,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.cruise_carry.books.streak()
             ),
             CarrySaid::Budget => "held:continue_per_hour".to_string(),
+            CarrySaid::Refused => format!("held:{GO_AHEAD_REFUSED}"),
         };
         review.note(&format!("DEFERRED seq={seq} {RULE_BACKGROUND} {why}"));
     }

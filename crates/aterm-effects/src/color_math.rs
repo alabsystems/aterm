@@ -626,6 +626,43 @@ pub const fn light_body_fill(rgb: u32, heat: f32) -> u32 {
     hsv2rgb(h, s, v * (1.0 - LIGHT_DEPTH_MAX * heat))
 }
 
+/// A caret body's fill on a LIGHT page at `heat` `0..=1` where its colour is one the user CHOSE
+/// (a pinned cursor colour, or the trail colour a caret wears): [`light_body_fill`]'s depth
+/// without its concentration. Its channels are scaled down together, so its hue and saturation
+/// stay the colour's and its chroma only falls; a contrast floor after it darkens it the same
+/// way ([`floor_contrast_keeping_hue`]). Never saturated: Sparkle pinned to `#b0b0c8` charged
+/// to navy `#000079` on paper, five times the pin's chroma (review9fix round 1's judge).
+#[must_use]
+#[inline]
+pub const fn light_chosen_fill(rgb: u32, heat: f32) -> u32 {
+    const fn ch(rgb: u32, k: f32, sh: u32) -> u32 {
+        ((((rgb >> sh) & 0xff) as f32 * k).round().clamp(0.0, 255.0) as u32) << sh
+    }
+    let heat = if heat.is_finite() {
+        heat.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let rgb = rgb & 0x00FF_FFFF;
+    if heat <= 0.0 {
+        return rgb;
+    }
+    let k = 1.0 - LIGHT_DEPTH_MAX * heat;
+    ch(rgb, k, 16) | ch(rgb, k, 8) | ch(rgb, k, 0)
+}
+
+/// A caret body's fill on a LIGHT page at `heat`: [`light_chosen_fill`] for a colour the user
+/// `chosen`, else [`light_body_fill`].
+#[must_use]
+#[inline]
+pub const fn light_caret_fill(rgb: u32, heat: f32, chosen: bool) -> u32 {
+    if chosen {
+        light_chosen_fill(rgb, heat)
+    } else {
+        light_body_fill(rgb, heat)
+    }
+}
+
 /// A caret colour `rgb` charged by `k` `0..=1` on a LIGHT page.
 #[must_use]
 #[inline]

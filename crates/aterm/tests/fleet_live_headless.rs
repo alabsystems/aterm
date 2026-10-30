@@ -52,8 +52,9 @@ fn fleet_table(port: u16, allow: &str) -> String {
 
 const RETRY_MS: &str = "100";
 
-// The dev seams that set how long a verb's read of its issuer's book, a local `hold off`'s proof
-// of a holder, each listener's TLS and proofs, a `peers` read whose every listener must answer
+// The dev seams that set how long a verb's read of its issuer's book, a join's dial and
+// registration, a local `hold off`'s proof of a holder, each listener's TLS and proofs, a `peers`
+// read whose every listener must answer
 // ([`peers_answered`]) and a survey whose every peer must answer ([`survey_answered`]) wait. Each
 // issuer a verb here reads and each dialer of a listener is an aterm (or this test) on this
 // machine that serves, each holder a `hold off` proves serves or is refused at once, and so do
@@ -65,6 +66,7 @@ const RETRY_MS: &str = "100";
 // stopped aterm) are read under each verb's own wait (its `--timeout`, or the one it keeps), which
 // these seams do not reach: no [`peers_answered`] or [`survey_answered`] read meets one.
 const ISSUER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_ISSUER_WITHIN_MS";
+const JOIN_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_JOIN_WITHIN_MS";
 const PEER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_PEER_WITHIN_MS";
 const SURVEY_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_SURVEY_WITHIN_MS";
 const HOLDER_SEAM: &str = "ATERM_DEBUG_FLEET_HOLDER_WITHIN_MS";
@@ -408,6 +410,7 @@ fn fleet_with(root: &Path, args: &[&str], stdin: Option<&str>, env: &[(&str, &st
     cmd.env("ATERM_STATE_HOME", root.join("state"))
         .env(aterm_net::loopback::SEAM, "1")
         .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+        .env(JOIN_WITHIN_SEAM, HANG.as_millis().to_string())
         .envs(env.iter().copied());
     let mut child = cmd.spawn().expect("spawn aterm fleet");
     if let Some(text) = stdin {
@@ -1161,8 +1164,9 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (text, stamp) = drive_ok(&issuer.tmp, &target, &[&at, "result"]);
     assert_eq!(text, "Driven from the issuer.\n", "{stamp}");
 
-    let refused = drive_refused(&issuer.tmp, &target, &[&at, "inbox"]);
-    assert!(refused.contains("ERR denied: a drive serves"), "{refused}");
+    let (inbox, stamp) = drive_ok(&issuer.tmp, &target, &[&at, "inbox"]);
+    assert!(inbox.is_empty(), "{inbox}");
+    assert!(stamp.contains("OK 0 fleet=1 head=f0"), "{stamp}");
     let refused = drive_refused(&issuer.tmp, &target, &[&at, "close"]);
     assert!(
         refused.contains("ERR denied: a drive closes only a worker it spawned"),
@@ -1421,6 +1425,164 @@ fn open_drive(root: &Path, target: &str) -> aterm_net::fleet_member::Driven {
 }
 
 #[test]
+fn direct_fleet_mail_delivers_and_replies_without_terminal_input_and_requires_a_drive_grant() {
+    let (sender, receiver, session, target) = driven_pair(("afmi", "afmm"));
+    let at = format!("@{session}");
+    let mut subscription = headless_boot::subscribed(&receiver, &[&at, "mail"]);
+    let stream = subscription.stdout.take().expect("subscription stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stream)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| line.starts_with("MAIL "))
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let (posted, _) = drive_ok(
+        &sender.tmp,
+        &target,
+        &[
+            &at,
+            "post",
+            "key=one",
+            "kind=ask",
+            "--",
+            "fleet-mail-only-question",
+        ],
+    );
+    assert_eq!(posted.trim(), "OK f1");
+    let notification = rx
+        .recv_timeout(HANG)
+        .expect("idle recipient receives a MAIL frame");
+    assert!(
+        notification.contains(" id=f1 off=- from=fleet:") && notification.ends_with(" kind=ask"),
+        "{notification}"
+    );
+    assert!(!notification.contains("fleet-mail-only-question"));
+    // A predecessor can finish a durable write after the successor cached its mailbox.
+    // Write from this separate process, without issuing a receiver-side inbox command.
+    let durable = receiver
+        .tmp
+        .join("state/fleet-mail")
+        .join(format!("{session}.toml"));
+    {
+        use aterm_toml::Value;
+        use aterm_uds::private_file::{PrivateLock, write_private};
+        let dir = durable.parent().unwrap();
+        let name = durable.file_name().unwrap().to_str().unwrap();
+        let _lock =
+            PrivateLock::take(dir, &format!("{name}.lock"), HANG, "test handoff writer").unwrap();
+        let mut mailbox: Value =
+            aterm_toml::from_str(&std::fs::read_to_string(&durable).unwrap()).unwrap();
+        let mut rows = mailbox.get("rows").unwrap().as_array().unwrap().clone();
+        let mut late = rows[0].clone();
+        let row = late.as_table_mut().unwrap();
+        row.insert("id".to_owned(), Value::Integer(2));
+        row.insert("key".to_owned(), Value::String("late-handoff".to_owned()));
+        row.insert(
+            "text".to_owned(),
+            Value::String("PRIVATE_HANDOFF_BODY".to_owned()),
+        );
+        rows.push(late);
+        let table = mailbox.as_table_mut().unwrap();
+        table.insert("next".to_owned(), Value::Integer(2));
+        table.insert("rows".to_owned(), Value::Array(rows));
+        write_private(
+            dir,
+            name,
+            aterm_toml::to_string(&mailbox).unwrap().as_bytes(),
+        )
+        .unwrap();
+    }
+    let late = rx
+        .recv_timeout(HANG)
+        .expect("subscriber discovers another process's late durable write");
+    assert!(late.contains(" id=f2 off=- from=fleet:"), "{late}");
+    assert!(!late.contains("PRIVATE_HANDOFF_BODY"));
+    let log = ctl_ok(&receiver, &[&at, "log"]);
+    assert!(log.contains("re=f1") && log.contains("kind=ask"), "{log}");
+    assert!(!log.contains("fleet-mail-only-question"));
+    let local = ctl_ok(&receiver, &[&at, "inbox"]);
+    assert!(
+        local.contains("msg f1 from=fleet:") && local.contains("fleet-mail-only-question"),
+        "{local}"
+    );
+    let terminal = ctl_ok(&receiver, &[&at, "text"]);
+    assert!(
+        !terminal.contains("fleet-mail-only-question"),
+        "mail reached the PTY: {terminal}"
+    );
+    let answered = ctl_ok(
+        &receiver,
+        &[
+            &at,
+            "post",
+            "re=f1",
+            "key=answer-one",
+            "kind=answer",
+            "--",
+            "fleet-mail-only-answer",
+        ],
+    );
+    assert_eq!(answered.trim(), "OK f1 reply=1");
+    let (reply, _) = drive_ok(&sender.tmp, &target, &[&at, "inbox"]);
+    assert!(
+        reply.contains("reply_text=fleet-mail-only-answer"),
+        "{reply}"
+    );
+    let (acknowledged, _) = drive_ok(&sender.tmp, &target, &[&at, "inbox", "seen", "f1"]);
+    assert_eq!(acknowledged.trim(), "OK seen=f1");
+    let (retry, _) = drive_ok(
+        &sender.tmp,
+        &target,
+        &[
+            &at,
+            "post",
+            "key=one",
+            "kind=ask",
+            "--",
+            "fleet-mail-only-question",
+        ],
+    );
+    assert_eq!(retry.trim(), "OK f1 dup=1");
+    let log = ctl_ok(&receiver, &[&at, "log"]);
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains(" mark - mail ") && line.contains("re=f1"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        std::fs::read_to_string(durable)
+            .unwrap()
+            .contains("fleet-mail-only-answer")
+    );
+    fleet_ok(&receiver.tmp, &["allow", "content"], None);
+    drive_refused(
+        &sender.tmp,
+        &target,
+        &[
+            &at,
+            "post",
+            "key=denied",
+            "kind=note",
+            "--",
+            "must-not-land",
+        ],
+    );
+    assert!(!ctl_ok(&receiver, &[&at, "inbox", "fleet"]).contains("must-not-land"));
+    let _ = subscription.kill();
+    let _ = subscription.wait();
+    reader.join().expect("subscription reader joined");
+}
+
+#[test]
 fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_away() {
     let (issuer, member, worker, target) = driven_pair(("afgi", "afgm"));
     let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
@@ -1528,7 +1690,9 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
     let all = fleet_ok(&member.tmp, &["allow", "drive", "--all"], None);
     assert!(
         all.contains("drive_from = [\"*\"]")
-            && all.contains("every member the fleet's issuer binds")
+            && all.contains(
+                "every member this Mac's membership log admits or its eligible peer books bind"
+            )
             && !all.contains("each node named"),
         "{all}"
     );
@@ -1554,11 +1718,13 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
     let said = String::from_utf8_lossy(&local.stderr);
     assert!(
         local.status.code() == Some(1)
+            && said.contains("origin=remote")
             && said.contains(&format!(
-                "`aterm fleet peers rm {third_node}` on the fleet's issuer"
+                "held by 127.0.0.1 (node {}) over the fleet",
+                &third_node[..8]
             ))
-            && !said.contains(&format!("`aterm fleet peers rm {third_node}` there")),
-        "under the \"*\" grant the refusal names only the issuer's rm: {said}"
+            && said.contains(&format!("`aterm ctl hold {worker} off`")),
+        "the third member's remote hold refuses local send and names the holder: {said}"
     );
     fleet_ok(&issuer.tmp, &["peers", "rm", &third_node], None);
     peers_answered(&member.tmp);

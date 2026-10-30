@@ -129,16 +129,20 @@ impl Watch {
     /// Sleep `d`, ending early once an interrupt came or `stop` says to, looking every [`NAP`]:
     /// `true` when it ended early.
     pub fn nap(&self, d: Duration, stop: &dyn Fn() -> bool) -> bool {
-        let end = Instant::now() + d;
+        let end = Instant::now().checked_add(d);
         loop {
             if self.caught().is_some() || stop() {
                 return true;
             }
             let now = Instant::now();
-            if now >= end {
-                return false;
+            if let Some(end) = end {
+                if now >= end {
+                    return false;
+                }
+                std::thread::sleep((end - now).min(NAP));
+            } else {
+                std::thread::sleep(NAP);
             }
-            std::thread::sleep((end - now).min(NAP));
         }
     }
 }
@@ -359,5 +363,11 @@ mod tests {
         let (status, out, _) = signal(&mut standin, libc::SIGTERM);
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status} {out}");
         assert!(!out.contains("stopped by"), "{out}");
+    }
+
+    #[test]
+    fn an_unbounded_nap_does_not_overflow_instant() {
+        let watch = Watch::enter();
+        assert!(watch.nap(Duration::MAX, &|| true));
     }
 }

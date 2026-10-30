@@ -10,7 +10,8 @@
 //! lettered cell of the frame's screen text (`.text.txt`) on the grid of its dims reply (the frame's own
 //! `<stem>.<frame>.dims.txt`, as a settings page's cursor scene card keeps, else `<stem>.dims.txt`), the
 //! caret's cell (`.cursor.txt`) and each word icon, and counts the frames whose body meets any of them: the check
-//! looks6 to looks8's judges ran by hand (`compcheck.py`, `petover.py`), now a tool.
+//! looks6 to looks8's judges ran by hand (`compcheck.py`, `petover.py`), now a tool. A frame it could not read (a
+//! failed `trail status`, or a body whose letters or caret were not read) is counted apart, never as clean.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -42,9 +43,14 @@ status without the field is counted in icons_unread). A frame counts in on_lette
 shaved when it meets one shaved by SHARE of a cell on each side (default 0.3), in on_caret when it meets the caret's
 cell and in on_icons when it meets a word icon, by either body; companion_over_letters counts the frames that do any
 of the three, with_head the frames with a head on glass and head_over those whose head does.
---list hits (the default) lists those frames, all lists every frame read.
+A frame is never counted clean on what was not read: a status whose read failed (an empty sidecar, its ERR header
+in .status.txt.stderr) counts in status_unread, a body frame with no answered .text.txt in text_unread and one
+with no answered .cursor.txt in caret_unread, apart from the open redraw-stall frame, whose .read-notes.txt says
+its text and caret were deliberately not read (counted in open). --list hits (the default) lists the frames over
+the letters and the unread ones, all lists every frame read.
 
-exit: 0; 1 companion_over_letters is over --max N; 2 a usage, file or parse error
+exit: 0; 1 companion_over_letters is over --max N, or under --max a frame was unread; 2 a usage, file or parse
+error, a path that does not exist, or one that holds no frame with a trail status sidecar
 ";
 
 /// A box in window pixels, end exclusive, in `trail status`'s order: `(x0, x1, y0, y1)`.
@@ -187,6 +193,14 @@ pub struct FrameRead {
     pub icons_read: bool,
     /// Whether the status named the head (`head_body=`).
     pub head_read: bool,
+    /// Whether the `trail status` read was answered: an answered row always names `pet_body=`.
+    pub status_read: bool,
+    /// Whether the frame's screen text was read (a body frame's letters are judged only then).
+    pub text_read: bool,
+    /// Whether the frame's caret was read.
+    pub caret_read: bool,
+    /// Whether the gallery kept the frame open, its text and caret deliberately unread (`.read-notes.txt`).
+    pub open: bool,
 }
 
 impl FrameRead {
@@ -201,6 +215,24 @@ impl FrameRead {
     pub const fn over(&self) -> bool {
         self.meets.over() || self.head_meets.over()
     }
+
+    /// Whether the frame's bodies were judged against everything they could meet: its status, letters and caret
+    /// read.
+    #[must_use]
+    pub const fn judged(&self) -> bool {
+        self.status_read && (!self.bodied() || (self.text_read && self.caret_read))
+    }
+}
+
+/// Whether the reply a sidecar keeps was answered: the gallery keeps a failed read as an empty sidecar with its
+/// `ERR` header in the `.stderr` twin, and an answered counted reply's `OK` header there.
+fn answered(path: &Path, kept: &str) -> bool {
+    if !kept.trim().is_empty() {
+        return true;
+    }
+    let mut twin = path.as_os_str().to_owned();
+    twin.push(".stderr");
+    std::fs::read_to_string(PathBuf::from(twin)).is_ok_and(|h| h.starts_with("OK"))
 }
 
 /// Read the frame at `png` from its sidecars; `Ok(None)` when it has no `trail status` sidecar.
@@ -217,16 +249,21 @@ pub fn read_frame(png: &Path, shave: f64) -> Result<Option<FrameRead>, String> {
     let head_read = status_field(&status, "head_body").is_some();
     let icons = status_boxes(&status, "word_icons").map_err(at)?;
     let icons_read = icons.is_some();
+    let unread = FrameRead {
+        png: png.to_path_buf(),
+        body: None,
+        meets: Meets::default(),
+        head: None,
+        head_meets: Meets::default(),
+        icons_read,
+        head_read,
+        status_read: status_field(&status, "pet_body").is_some(),
+        text_read: false,
+        caret_read: false,
+        open: sidecar(png, ".read-notes.txt", true).is_some(),
+    };
     if body.is_none() && head.is_none() {
-        return Ok(Some(FrameRead {
-            png: png.to_path_buf(),
-            body: None,
-            meets: Meets::default(),
-            head: None,
-            head_meets: Meets::default(),
-            icons_read,
-            head_read,
-        }));
+        return Ok(Some(unread));
     }
     let dims = frame_dims(png).ok_or_else(|| {
         format!(
@@ -235,12 +272,13 @@ pub fn read_frame(png: &Path, shave: f64) -> Result<Option<FrameRead>, String> {
         )
     })?;
     let grid = grid_from_dims(&read_text(&dims)?)?;
-    let glyphs = match sidecar(png, ".text.txt", true) {
+    let (glyphs, text_read) = match sidecar(png, ".text.txt", true) {
         Some(p) => {
-            let lines: Vec<String> = read_text(&p)?.split('\n').map(str::to_string).collect();
-            screen_cells(&lines)
+            let text = read_text(&p)?;
+            let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            (screen_cells(&lines), answered(&p, &text))
         }
-        None => Vec::new(),
+        None => (Vec::new(), false),
     };
     let (caret, _) = caret_cell(None, sidecar(png, ".cursor.txt", true))?;
     let icons = icons.as_deref().unwrap_or(&[]);
@@ -250,21 +288,24 @@ pub fn read_frame(png: &Path, shave: f64) -> Result<Option<FrameRead>, String> {
         })
     };
     Ok(Some(FrameRead {
-        png: png.to_path_buf(),
         body,
         meets: meets_of(body),
         head,
         head_meets: meets_of(head),
-        icons_read,
-        head_read,
+        text_read,
+        caret_read: caret.is_some(),
+        ..unread
     }))
 }
 
 /// Every frame under `path`: the path itself when it is a frame, else each `<stem>.<frame>.png` (not a clean twin)
 /// in the tree below it, in name order.
 /// # Errors
-/// A directory that cannot be read.
+/// A path that does not exist, or a directory that cannot be read.
 pub fn frames_under(path: &Path) -> Result<Vec<PathBuf>, String> {
+    if !path.exists() {
+        return Err(format!("{}: no such path", path.display()));
+    }
     let mut out = BTreeSet::new();
     let mut todo = vec![path.to_path_buf()];
     while let Some(p) = todo.pop() {
@@ -324,6 +365,10 @@ fn frame_json(f: &FrameRead, root: &Path) -> J {
         ("caret_px", J::Int(m.caret_px)),
         ("icon_px", J::Int(m.icon_px)),
         ("icons_read", J::Bool(f.icons_read)),
+        ("status_read", J::Bool(f.status_read)),
+        ("text_read", J::Bool(f.text_read)),
+        ("caret_read", J::Bool(f.caret_read)),
+        ("open", J::Bool(f.open)),
         ("cells", cells_json(m)),
         ("head", f.head.map_or(J::Null, span_json)),
         ("head_letters", count(h.letters.len())),
@@ -385,11 +430,13 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
 
 /// The report over every frame `a` names.
 /// # Errors
-/// A path that cannot be walked, or a frame whose sidecars cannot be read.
+/// A path that does not exist or cannot be walked, one that holds no frame with a `trail status` sidecar, or a
+/// frame whose sidecars cannot be read.
 pub fn report(a: &Args) -> Result<J, String> {
     let (mut frames, mut with_body, mut on_letters, mut shaved, mut on_caret, mut on_icons) =
         (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
     let (mut over, mut icons_unread) = (0i64, 0i64);
+    let (mut status_unread, mut text_unread, mut caret_unread, mut open) = (0i64, 0i64, 0i64, 0i64);
     let (mut with_head, mut head_over, mut heads_unread) = (0i64, 0i64, 0i64);
     let mut listed = Vec::new();
     for p in &a.paths {
@@ -399,11 +446,17 @@ pub fn report(a: &Args) -> Result<J, String> {
         } else {
             root.parent().map_or_else(PathBuf::new, Path::to_path_buf)
         };
+        let before = frames;
         for png in frames_under(&root)? {
             let Some(f) = read_frame(&png, a.shave)? else {
                 continue;
             };
             frames += 1;
+            if !f.status_read {
+                status_unread += 1;
+                listed.push(frame_json(&f, &base));
+                continue;
+            }
             heads_unread += i64::from(!f.head_read);
             if !f.bodied() {
                 if a.list_all {
@@ -412,6 +465,16 @@ pub fn report(a: &Args) -> Result<J, String> {
                 continue;
             }
             with_body += 1;
+            if !f.judged() {
+                if f.open {
+                    open += 1;
+                } else {
+                    text_unread += i64::from(!f.text_read);
+                    caret_unread += i64::from(!f.caret_read);
+                }
+                listed.push(frame_json(&f, &base));
+                continue;
+            }
             icons_unread += i64::from(!f.icons_read);
             let (m, h) = (&f.meets, &f.head_meets);
             on_letters += i64::from(!m.letters.is_empty() || !h.letters.is_empty());
@@ -425,12 +488,24 @@ pub fn report(a: &Args) -> Result<J, String> {
                 listed.push(frame_json(&f, &base));
             }
         }
+        if frames == before {
+            return Err(format!(
+                "{}: no frame with a trail status sidecar",
+                root.display()
+            ));
+        }
     }
     let mut failures = Vec::new();
-    if let Some(max) = a.max
-        && over > max
-    {
-        failures.push(J::s(format!("companion_over_letters {over} > --max {max}")));
+    if let Some(max) = a.max {
+        if over > max {
+            failures.push(J::s(format!("companion_over_letters {over} > --max {max}")));
+        }
+        if status_unread + text_unread + caret_unread > 0 {
+            failures.push(J::s(format!(
+                "unread frames under --max: status_unread {status_unread}, text_unread {text_unread}, \
+                 caret_unread {caret_unread}"
+            )));
+        }
     }
     Ok(J::obj([
         ("frames", J::Int(frames)),
@@ -442,6 +517,10 @@ pub fn report(a: &Args) -> Result<J, String> {
         ("on_caret", J::Int(on_caret)),
         ("on_icons", J::Int(on_icons)),
         ("icons_unread", J::Int(icons_unread)),
+        ("status_unread", J::Int(status_unread)),
+        ("text_unread", J::Int(text_unread)),
+        ("caret_unread", J::Int(caret_unread)),
+        ("open", J::Int(open)),
         ("with_head", J::Int(with_head)),
         ("head_over", J::Int(head_over)),
         ("heads_unread", J::Int(heads_unread)),

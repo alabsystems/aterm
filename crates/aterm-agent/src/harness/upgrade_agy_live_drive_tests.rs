@@ -694,6 +694,7 @@ impl LiveRig {
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),
             land: false,
+            tell: crate::harness::upgrade_drive::Tell::Off,
             press: None,
             timings: crate::harness::Timings::FAST,
         };

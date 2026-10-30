@@ -37,10 +37,21 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
-    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: update path is not a real directory; refusing",
+                dir.display()
+            ),
+        ));
+    }
+    let uid = our_uid();
+    if meta.uid() == uid && meta.mode() & 0o7777 != 0o700 {
         #[cfg(all(test, unix))]
         CHMOD_CALLS.with(|c| c.set(c.get() + 1));
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        set_dir_mode_nofollow(dir, 0o700)?;
     }
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.file_type().is_dir() {
@@ -52,17 +63,37 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
             ),
         ));
     }
-    if aterm_types::fs_restricted::dir_safe_for_private_write(our_uid(), meta.uid(), meta.mode()) {
+    if aterm_types::fs_restricted::dir_safe_for_private_write(uid, meta.uid(), meta.mode()) {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{}: update directory must be owned by uid {} and not group/other-writable",
-                dir.display(),
-                our_uid()
+                "{}: update directory must be owned by uid {uid} and not group/other-writable",
+                dir.display()
             ),
         ))
+    }
+}
+
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn set_dir_mode_nofollow(dir: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let perms = std::fs::Permissions::from_mode(mode);
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(f) => f.set_permissions(perms),
+        Err(_)
+            if std::fs::symlink_metadata(dir)
+                .is_ok_and(|m| m.file_type().is_dir() && m.uid() == our_uid()) =>
+        {
+            std::fs::set_permissions(dir, perms)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -148,7 +179,23 @@ mod tests {
 
         let link = scratch.path().join("private.link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
+        CHMOD_CALLS.with(|c| c.set(0));
         assert!(ensure_private_dir(&link).is_err(), "a symlink is refused");
+        assert_eq!(CHMOD_CALLS.with(std::cell::Cell::get), 0);
+
+        let file = scratch.path().join("regular.file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        CHMOD_CALLS.with(|c| c.set(0));
+        assert!(
+            ensure_private_dir(&file).is_err(),
+            "a regular file is refused"
+        );
+        assert_eq!(CHMOD_CALLS.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            std::fs::symlink_metadata(&file).unwrap().mode() & 0o7777,
+            0o644
+        );
     }
 
     const OPEN_UMASK_ENV: &str = "ATUC_PRIVATEDIR_OPEN_UMASK_DIR";

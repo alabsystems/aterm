@@ -7,12 +7,9 @@
 //! that authenticates is preserved. Notarytool runs only where all of these hold, with no
 //! child process spawned by their preflight reads:
 //!
-//! - this Mac is a release host: `~/.aterm/release-ring/release-credentials.toml` (or the 0.145
-//!   `~/.aterm/release-credentials.toml` before its vault paths rotate) is there, and the release
-//!   roster names this Mac's vault name (the name it asked the vault under, never
-//!   `~/.aterm/release-ring/machine.toml`, which is the release ring every member holds and names
-//!   m22, nor `~/.aterm/machine.toml`) as a machine it has not revoked. The swarm policy's
-//!   release-host list replaces this read once that entry exists;
+//! - this member holds a private release-ring profile and key that prove one signer under
+//!   the current master-signed roster. The shared signer is independent of the physical
+//!   member's hostname; an expired, revoked, mismatched or untrusted ring runs nothing;
 //! - xcrun has a developer directory that holds `notarytool` (the Command Line Tools', or the
 //!   selected Xcode's): without one, `/usr/bin/xcrun` puts Apple's install dialog on screen;
 //! - the entry differs from the last one handled successfully ([`APPLIED`]), and from one
@@ -22,10 +19,14 @@
 
 use super::*;
 use std::ffi::OsString;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+mod signing;
+pub use signing::{SigningStatus, effective_signing_identity, signing_status, sync_signing};
+
 /// The vault entry this reads.
-pub(crate) const ENTRY: &str = "release-notary";
+pub(crate) const ENTRY: &str = crate::need::catalog::NOTARY_ENTRY;
 
 /// The record, in the vault's state folder, of the entry's digest last handled successfully
 /// while the profile authenticated (SHA-256 hex, as `state.toml`'s manifest already keeps it).
@@ -54,9 +55,8 @@ const XCODE_DEVELOPER: &str = "/Applications/Xcode.app/Contents/Developer";
 const CLT_DEVELOPER: &str = "/Library/Developer/CommandLineTools";
 
 /// What a round says while this Mac is no release host.
-const NOT_RELEASE_HOST: &str = "release-notary is left alone: this Mac is no release host \
-     (no ~/.aterm/release-ring/release-credentials.toml, or the release roster does not name \
-     this Mac's vault name)";
+const NOT_RELEASE_HOST: &str = "release-notary waits for an authorized release ring \
+     (a private matching profile/key and current master-signed roster)";
 
 /// What a round says while xcrun has nothing to run notarytool with.
 const WAITS_FOR_CLT: &str = "release-notary waits for Command Line Tools: xcrun has no \
@@ -124,6 +124,8 @@ fn parse_notary(bytes: &[u8]) -> crate::Result<Notary> {
 /// What a round reaches past its own reads: the developer directory xcrun would run
 /// notarytool from, and the two notarytool runs. A test's never run notarytool.
 pub(super) struct Tools<'a> {
+    /// A private profile/key pair authorized by the pinned release-master roster.
+    pub(super) authorized_ring: &'a dyn Fn(&Paths) -> bool,
     /// The developer directory xcrun selects, where it holds notarytool ([`developer_dir_with`]).
     pub(super) developer_dir: &'a dyn Fn() -> Option<PathBuf>,
     /// Whether the `notary` profile authenticates now (`Ok(false)`: there is none).
@@ -169,18 +171,25 @@ fn developer_dir_with(
 mod live {
     use super::*;
     use aterm_uds::spawnfd::Stdio;
-    use std::{io::Write, process::Output};
+    use std::process::Output;
+    use std::time::Instant;
 
     /// The keychain profile `notarytool store-credentials` keeps, which `ship release` names.
     const PROFILE: &str = "notary";
 
     fn history() -> crate::Result<Output> {
-        aterm_uds::spawnfd::command("/usr/bin/xcrun")
+        let mut command = aterm_uds::spawnfd::command("/usr/bin/xcrun");
+        command
             .args(["notarytool", "history", "--keychain-profile", PROFILE])
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| Error::new(format!("could not run notarytool: {error}")))
+            .stderr(Stdio::piped());
+        aterm_uds::deadline::output_until(
+            &mut command,
+            Instant::now() + crate::keychain_tools::WAIT,
+        )
+        .map_err(|_| {
+            Error::new("notarytool authentication did not complete; automatic setup will retry")
+        })
     }
 
     pub(super) fn history_is_current() -> crate::Result<bool> {
@@ -198,11 +207,9 @@ mod live {
     }
 
     pub(super) fn store(notary: &Notary) -> crate::Result<()> {
-        let mut child = aterm_uds::spawnfd::command("/usr/bin/script")
+        let mut command = aterm_uds::spawnfd::command("/usr/bin/xcrun");
+        command
             .args([
-                "-q",
-                "/dev/null",
-                "/usr/bin/xcrun",
                 "notarytool",
                 "store-credentials",
                 PROFILE,
@@ -210,25 +217,22 @@ mod live {
                 notary.apple_id.as_str(),
                 "--team-id",
                 notary.team_id.as_str(),
+                "--password",
+                notary.password.as_str(),
             ])
-            .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| Error::new(format!("could not start notarytool: {error}")))?;
-        let mut input = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::new("notarytool has no password input"))?;
-        input
-            .write_all(notary.password.as_bytes())
-            .and_then(|()| input.write_all(b"\n"))
-            .map_err(|error| Error::new(format!("could not answer notarytool: {error}")))?;
-        drop(input);
-        let status = child
-            .wait()
-            .map_err(|error| Error::new(format!("could not wait for notarytool: {error}")))?;
-        if status.success() {
+            .stderr(Stdio::null());
+        // Supplying every field and closed stdin gives notarytool no interactive prompt.
+        // The password is never formatted into an error or logged; as for security(1),
+        // argv is visible only to this user, who already owns the private credential file.
+        let output = aterm_uds::deadline::output_until(
+            &mut command,
+            Instant::now() + crate::keychain_tools::WAIT,
+        )
+        .map_err(|_| {
+            Error::new("notarytool credential storage did not complete; automatic setup will retry")
+        })?;
+        if output.status.success() {
             Ok(())
         } else {
             Err(Error::new("notarytool did not store the credential"))
@@ -287,53 +291,98 @@ fn named_roster(text: &str, home: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Whether the release roster `text` names `host` as a machine and has not revoked it. Names
-/// only: this narrows where notarytool runs, and is no trust decision (the entry itself is the
-/// vault's signed one), so the roster's signature and dates are `ship release`'s to check.
-fn roster_names(text: &str, host: &str) -> bool {
-    let Ok(aterm_toml::Value::Table(roster)) = aterm_toml::from_str::<aterm_toml::Value>(text)
-    else {
+/// Whether this member holds a private ring key/profile that proves its declared signer
+/// under the pinned release master. The physical member's hostname is not the ring identity.
+fn authorized_ring(paths: &Paths) -> bool {
+    let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
         return false;
     };
-    let strings = |value: Option<&aterm_toml::Value>| -> Vec<String> {
-        value
-            .and_then(aterm_toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(aterm_toml::Value::as_str)
-            .map(str::to_owned)
-            .collect()
-    };
-    let listed = roster
-        .get("machine")
-        .and_then(aterm_toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(aterm_toml::Value::as_table)
-        .any(|machine| machine.get("id").and_then(aterm_toml::Value::as_str) == Some(host));
-    listed && !strings(roster.get("revoked")).iter().any(|id| id == host)
+    authorized_ring_with(paths, aterm_update_core::pins::PAPER_MASTER_PUBKEYS, now)
 }
 
-/// Whether this Mac, called `host` in its vault, is a release host: its home holds the
-/// release-credentials profile, and the roster that profile names (else the one the vault puts
-/// beside it) names `host`.
-fn release_host(home: &Path, host: &str) -> bool {
-    let profile = match fsx::read_private(&home.join(RELEASE_PROFILE), MAX_READ) {
-        Ok(Some(profile)) => profile,
+fn authorized_ring_with(paths: &Paths, anchors: &[&str], now: i64) -> bool {
+    authorized_ring_check(paths, anchors, now, true)
+}
+
+fn authorized_ring_readonly(paths: &Paths) -> bool {
+    let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
+        return false;
+    };
+    authorized_ring_check(
+        paths,
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        now,
+        false,
+    )
+}
+
+fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: bool) -> bool {
+    let _guard = if advance {
+        let Ok(guard) = StateLock::take_at(paths, &paths.dir.join("release-ring.lock")) else {
+            return false;
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    let home = &paths.home;
+    let (profile, key_path) = match fsx::read_private(&home.join(RELEASE_PROFILE), MAX_READ) {
+        Ok(Some(profile)) => (profile, home.join(".aterm/release-ring/machine.key")),
         Ok(None) => match fsx::read_private(&home.join(LEGACY_RELEASE_PROFILE), MAX_READ) {
-            Ok(Some(profile)) => profile,
+            Ok(Some(profile)) => (profile, home.join(".aterm/machine.key")),
             Ok(None) | Err(_) => return false,
         },
         Err(_) => return false,
     };
+    let Ok(Some(key)) = fsx::read_private(&key_path, MAX_READ) else {
+        return false;
+    };
     let named = profile.as_str().and_then(|text| named_roster(text, home));
-    drop(profile);
-    named
+    let Some((roster_path, roster)) = named
         .into_iter()
         .chain([home.join(VAULT_ROSTER), home.join(LEGACY_VAULT_ROSTER)])
-        .find_map(|roster| fsx::read_owned(&roster, MAX_READ).ok().flatten())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .is_some_and(|text| roster_names(&text, host))
+        .find_map(|path| {
+            fsx::read_owned(&path, MAX_READ)
+                .ok()
+                .flatten()
+                .map(|raw| (path, raw))
+        })
+    else {
+        return false;
+    };
+    let mut sig_path = roster_path.into_os_string();
+    sig_path.push(".sig");
+    let Ok(Some(signature)) = fsx::read_owned(Path::new(&sig_path), 64) else {
+        return false;
+    };
+    let floor_path = paths.dir.join("release-ring-roster-floor");
+    let floor = match fsx::read_private(&floor_path, 32) {
+        Ok(Some(bytes)) => match bytes.as_str().and_then(|s| s.trim().parse::<u64>().ok()) {
+            Some(floor) => floor,
+            None => return false,
+        },
+        Ok(None) => 0,
+        Err(_) => return false,
+    };
+    let Ok(signer) = crate::release_ring::authorize_with(
+        profile.as_slice(),
+        key.as_slice(),
+        roster,
+        &signature,
+        anchors,
+        floor,
+        now,
+    ) else {
+        return false;
+    };
+    !advance
+        || signer.roster_seq == floor
+        || fsx::write_atomic(
+            &floor_path,
+            format!("{}\n", signer.roster_seq).as_bytes(),
+            0o600,
+        )
+        .is_ok()
 }
 
 /// The entry digest last handled successfully ([`APPLIED`]).
@@ -345,7 +394,7 @@ fn applied(paths: &Paths) -> Option<String> {
 /// Handle the current signed entry, preserving an already working profile: its line and the
 /// successfully handled entry's digest. `None` when the entry cannot be read as the vault
 /// applied it just now (another apply under way): the next round looks again. The password
-/// goes only to the PTY's stdin and never to argv, output, logs or errors.
+/// is passed directly to the bounded tool and never copied to output, logs or errors.
 fn materialize_with(
     paths: &Paths,
     tools: &mut Tools<'_>,
@@ -373,7 +422,7 @@ fn materialize_with(
 /// What one round's look at the entry decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Step {
-    /// No entry, its digest was handled successfully, or this subscriber tried it and failed:
+    /// No entry, its digest was handled successfully, or this subscriber is backing off:
     /// nothing to do.
     Quiet,
     /// The entry waits: why.
@@ -382,11 +431,12 @@ pub(super) enum Step {
     Ran(Result<&'static str, String>),
 }
 
-/// The subscriber's notary rounds: the entry it tried and failed with (tried again only once
-/// the entry changes, or by the next subscriber, as after an update), and the last line said.
+/// The subscriber's notary rounds: the failed entry and its bounded retry backoff, and the
+/// last line said. Transient failures recover without requiring a process restart.
 #[derive(Debug, Default)]
 pub(super) struct NotaryRounds {
-    tried: Option<String>,
+    signing: signing::Rounds,
+    tried: Option<(String, Instant)>,
     said: Option<Step>,
 }
 
@@ -394,9 +444,11 @@ impl NotaryRounds {
     /// A healthy round's look ([`Self::step`] with the live tools), saying a line when what it
     /// decided changed, and each failure.
     pub(super) fn after_round(&mut self, paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
+        self.signing.after_round(paths, config, log);
         let mut history = LIVE_HISTORY;
         let mut store = LIVE_STORE;
         let mut tools = Tools {
+            authorized_ring: &authorized_ring,
             developer_dir: &LIVE_DEVELOPER_DIR,
             history: &mut history,
             store: &mut store,
@@ -414,21 +466,24 @@ impl NotaryRounds {
     }
 
     /// One round: no work without a `release-notary` entry, or for its last successfully
-    /// handled digest or this subscriber's last failed attempt. Otherwise a release host and
+    /// handled digest or this subscriber's recent failed attempt. Otherwise a release host and
     /// developer directory are checked with file reads before notarytool runs. A successfully
-    /// handled entry's digest is kept in [`APPLIED`]; a failed attempt is kept for this
-    /// subscriber's life.
-    pub(super) fn step(&mut self, paths: &Paths, config: &Config, tools: &mut Tools<'_>) -> Step {
+    /// handled entry's digest is kept in [`APPLIED`]; a failed attempt backs off for a minute.
+    pub(super) fn step(&mut self, paths: &Paths, _config: &Config, tools: &mut Tools<'_>) -> Step {
         let Ok(state) = load_state(paths) else {
             return Step::Quiet;
         };
         let Some(digest) = state.manifest.files.get(ENTRY) else {
             return Step::Quiet;
         };
-        if applied(paths).as_ref() == Some(digest) || self.tried.as_ref() == Some(digest) {
+        if applied(paths).as_ref() == Some(digest)
+            || self.tried.as_ref().is_some_and(|(failed, at)| {
+                failed == digest && at.elapsed() < Duration::from_secs(60)
+            })
+        {
             return Step::Quiet;
         }
-        if !release_host(&paths.home, &config.host) {
+        if !(tools.authorized_ring)(paths) {
             return Step::Waits(NOT_RELEASE_HOST);
         }
         if (tools.developer_dir)().is_none() {
@@ -441,10 +496,7 @@ impl NotaryRounds {
                     format!("{stored}\n").as_bytes(),
                     0o600,
                 ) {
-                    // Suppress this digest for the rest of this subscriber's life even if
-                    // its record could not be kept. A new subscriber or changed entry can
-                    // check again; a profile that still authenticates needs no replacement.
-                    self.tried = Some(stored);
+                    self.tried = Some((stored, Instant::now()));
                     return Step::Ran(Err(format!(
                         "{line}, but its record could not be kept: {error}"
                     )));
@@ -453,7 +505,7 @@ impl NotaryRounds {
             }
             Ok(None) => Step::Quiet,
             Err(error) => {
-                self.tried = Some(digest.clone());
+                self.tried = Some((digest.clone(), Instant::now()));
                 Step::Ran(Err(error.to_string()))
             }
         }

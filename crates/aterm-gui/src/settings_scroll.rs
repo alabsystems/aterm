@@ -3043,7 +3043,9 @@ impl SettingsViewState {
     ///   nothing the person did not do (a resize, a text-size change, a status or the
     ///   aterm.toml reload warning bar coming or going, a landing measured again) takes it out
     ///   of view. A control the last screen showed cut is shown no less: the screen that shows
-    ///   the most of it, never one that shows less.
+    ///   the most of it, never one that shows less. A chrome chosen for the first frame or the
+    ///   person's event cuts the keyboard's control only where no rung of its ladder shows it
+    ///   whole.
     /// - R3: Before the first event the theme in use (the landing) is shown whole wherever that
     ///   keeps R2; where both can be shown whole, both are, first frame included. Where both
     ///   cannot, the keyboard's control wins. Where it is pinned, landing costs it nothing, so
@@ -3181,6 +3183,24 @@ impl SettingsViewState {
         let revealing = given_back
             .unwrap_or(self.page_reveal.as_ref())
             .filter(|_| self.reveal_as != Reveal::Hold && drawn_landing.is_none());
+        // A press that moved the keyboard reveals the control it moved to where the list cuts it.
+        let moved_by_press = self.reveal_as == Reveal::Pressed
+            && self
+                .scroll_record
+                .borrow()
+                .as_ref()
+                .is_some_and(|record| record.keyboard.as_ref() != focus);
+        let revealing = match (revealing, focus) {
+            (Some(key), Some(focus))
+                if moved_by_press
+                    && key != focus
+                    && plan.stop_of(focus).is_some()
+                    && !Left::on(plan, focus, top).whole =>
+            {
+                Some(focus)
+            }
+            (revealing, _) => revealing,
+        };
         let kept_in_view = revealing.or(focus);
         let held_in_view = kept_in_view.and_then(last_shown);
         let held = kept_in_view
@@ -3950,6 +3970,16 @@ impl SettingsViewState {
 
     /// Whether the theme in use fits a room `more` taller, with `keyboard` its control too (R3).
     pub(super) fn landing_fits(&self, more: f32, keyboard: bool) -> bool {
+        self.landing_fits_on(None, more, keyboard)
+    }
+
+    /// [`Self::landing_fits`] with the spans read on `laid` where given, a list's plan in its room.
+    pub(super) fn landing_fits_on(
+        &self,
+        laid: Option<&ScrollPlan>,
+        more: f32,
+        keyboard: bool,
+    ) -> bool {
         let Some(landing) = self.page_reveal.as_ref() else {
             return false;
         };
@@ -3959,7 +3989,7 @@ impl SettingsViewState {
             .as_ref()
             .filter(|record| record.context == context)
             .and_then(|record| {
-                let plan = &record.plan;
+                let plan = laid.unwrap_or(&record.plan);
                 let index = plan.stop_holding(landing)?;
                 let at = plan.stop_top(0, index);
                 let (from, to) = plan.revealed_span(index, Reveal::Keep);
@@ -3968,7 +3998,11 @@ impl SettingsViewState {
                     .flatten()
                     .and_then(|key| {
                         let stop = plan.stop_of(key)?;
-                        Left::on(plan, key, record.top).whole.then(|| {
+                        // The keyboard's control is owed where the screen seated lists it whole.
+                        if laid.is_some() {
+                            record.plan.stop_of(key)?;
+                        }
+                        Left::on(&record.plan, key, record.top).whole.then(|| {
                             let at = plan.stop_top(0, stop);
                             let (top, bottom) = plan
                                 .control_span(stop, key)
@@ -3982,6 +4016,19 @@ impl SettingsViewState {
                 Some(to - from <= plan.room + more + 0.01)
             })
             .unwrap_or_default()
+    }
+
+    /// Whether `record`, a screen seated, lists the keyboard's control whole: owed a landing span.
+    pub(super) fn keyboard_listed_whole(&self, record: Option<&ScrollRecord>) -> bool {
+        let context = self.scroll_context();
+        let record = record.filter(|record| record.context == context);
+        self.common
+            .last_focus
+            .as_ref()
+            .zip(record)
+            .is_some_and(|(key, record)| {
+                record.plan.stop_of(key).is_some() && Left::on(&record.plan, key, record.top).whole
+            })
     }
 
     /// What the screen last seated shows of the keyboard's listed control.
@@ -4122,6 +4169,7 @@ impl SettingsViewState {
         self.pressed_at.replace(at);
         self.page_reveal = Some(key);
         self.reveal_as = Reveal::Pressed;
+        self.press_left = None;
     }
 
     /// Whether the keyboard on `key` asks nothing of the list a press holds: a stop of the bar of
@@ -4198,9 +4246,10 @@ impl SettingsViewState {
 
     /// Whether a press holds the list on the screen it was pressed on, the status it brought
     /// standing ([`Self::pressed_bottom`]): its bar then takes the side that moves nothing
-    /// ([`Self::press_side`]).
+    /// ([`Self::press_side`]). A press that moved the keyboard away holds no place for a status.
     pub(super) fn press_holds_place(&self) -> bool {
         self.pressed_bottom().is_some()
+            && !self.reveal_left_by_press()
             && self
                 .pressed_at
                 .borrow()
@@ -4320,8 +4369,9 @@ impl SettingsViewState {
         false
     }
 
-    /// A press however it came keeps its control in view where it left the keyboard (`kept`).
-    pub(super) fn reveal_press(&mut self, key: &UiKey, before: Option<&UiKey>, kept: bool) {
+    /// Reveal pressed `key` where listed; one that `moved` the keyboard is the seat's to keep.
+    pub(super) fn reveal_press(&mut self, key: &UiKey, before: Option<&UiKey>, moved: bool) {
+        self.press_left = None;
         if self.page_reveal.as_ref() != before {
             return;
         }
@@ -4332,12 +4382,17 @@ impl SettingsViewState {
             .as_ref()
             .filter(|record| record.context == context)
             .is_some_and(|record| record.plan.stop_of(key).is_some());
-        if listed && kept {
+        if listed {
             self.reveal_pressed(key.clone());
-        } else if listed && self.landing_owed() {
-            // A press moving the keyboard ends the landing: R3 owes it only before the first event.
-            self.page_reveal = None;
+            self.press_left = moved.then(|| key.clone());
         }
+    }
+
+    /// Whether the reveal is the control a press moved the keyboard away from.
+    pub(super) fn reveal_left_by_press(&self) -> bool {
+        self.reveal_as == Reveal::Pressed
+            && self.press_left.is_some()
+            && self.press_left == self.page_reveal
     }
 
     /// Open a settings page scrolled and focused directly on control `key`.

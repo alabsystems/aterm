@@ -85,6 +85,7 @@ pub mod keyed;
 pub mod record;
 pub mod replay;
 pub mod seam;
+pub mod shadow;
 
 pub use demo::{
     converse, converse_oracle, converse_values, demo_clamp_poll_index, demo_poll_in_range, oracle,
@@ -98,4 +99,9 @@ pub use record::{
 pub use replay::{replay_cursor_in_bounds, replay_cursor_monotone, ReplayDivergence, ReplaySeam};
 pub use seam::{
     seam_false_reads_advance, seam_false_reads_matches, EffectRecord, EffectSeam, EffectsLog,
+};
+pub use shadow::{
+    shadow_code_in_range, shadow_code_select, shadow_exit_code, shadow_nonzero_bit,
+    shadow_taint_latch, ShadowDecisionOutcome, ShadowEmit, ShadowLedger, ShadowNeed, ShadowPoint,
+    ShadowSeam, MAX_SHADOW_EMITS, MAX_SHADOW_NEEDS, MAX_SHADOW_ROWS,
 };

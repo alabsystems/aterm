@@ -20262,6 +20262,8 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         format!("@{W} screen"),
         format!("@{W} result"),
         format!("@{W} result full"),
+        format!("@{W} inbox"),
+        format!("@{W} inbox fleet since=f0"),
         format!("await task @{W} since=0"),
         format!("await task @{W}:3,@{MINE} all timeout=20000"),
     ] {
@@ -20278,6 +20280,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         ),
         (format!("@{W} key Enter"), "key"),
         (format!("@{W} send hi"), "send"),
+        (format!("@{W} post key=k kind=note -- hi"), "post"),
         (format!("hold {W} on reason=build"), "hold"),
         (format!("hold {W} off"), "hold"),
         (format!("@{W} close"), "close"),
@@ -20447,6 +20450,80 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
             && long.contains("any other session with `@<sid> status` (or `text`)"),
         "{long}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_driven_proxy_forward_after_handoff_never_uses_the_owners_token() {
+    use std::io::{BufRead, BufReader, Write};
+    let driver = crate::fabric::Driver {
+        node: "03".repeat(16),
+        host: "mac-03".to_owned(),
+    };
+    for verb in ["inbox", "post key=k kind=note -- retained"] {
+        let scratch = crate::test_scratch::short_dir("a drive's moved session");
+        let dir = scratch.path();
+        let store = crate::session_store::new_store();
+        let (target, _rx) = pipe_session(91);
+        let sid = target.sid.clone();
+        let sock = hosting_instance(dir, 77071, &sid, "c0ffee03");
+        let sibling = aterm_uds::CtlListener::bind(&sock).expect("bind the new host");
+        sibling.set_nonblocking(true).expect("nonblocking sibling");
+        store.write().unwrap().register(target.clone());
+        let line = format!("@{} {verb}", sid.as_str());
+        let (client, server) = CtlStream::pair().expect("pair");
+        client.set_read_timeout(Some(EVENTUALLY)).unwrap();
+        server.set_read_timeout(Some(EVENTUALLY)).unwrap();
+        (&client)
+            .write_all(format!("{line}\nversion\n").as_bytes())
+            .unwrap();
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+
+        let _driving = crate::fabric::DrivingAs::enter(driver.clone());
+        let (request, scope, _) = drive_admission(
+            Request::parse(first.trim_end_matches('\n').to_owned()),
+            Scope::Fleet {
+                content: true,
+                drive: true,
+            },
+            &store,
+        )
+        .expect("the drive was admitted while the session was hosted here");
+        assert_eq!(scope, Scope::Owner);
+        assert!(proxy_forward_plan(&request, scope, &store, dir).is_none());
+
+        assert_eq!(
+            store.write().unwrap().deregister_local(target.local_id),
+            Some(sid.clone())
+        );
+        assert!(
+            proxy_forward_plan(&request, scope, &store, dir).is_some(),
+            "the second lookup sees the handoff"
+        );
+        assert!(try_proxy_forward(
+            &request,
+            scope,
+            &store,
+            dir,
+            &server,
+            &mut reader
+        ));
+        let mut response = String::new();
+        BufReader::new(&client).read_line(&mut response).unwrap();
+        assert_eq!(response, aterm_types::control_verbs::CONTROL_BUSY_LINE);
+        assert_eq!(
+            reader.buffer(),
+            b"version\n",
+            "no pipelined request crossed the boundary"
+        );
+        assert!(
+            matches!(sibling.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "no owner-token connection reached the sibling"
+        );
+    }
 }
 
 #[test]

@@ -50,12 +50,27 @@ pub fn member_keys(membership: &Membership) -> MemberKeys {
 /// its member replaced, one two members claim, and one left out of `[everyone]` are out.
 #[must_use]
 pub fn log_member_keys(log: &Log) -> MemberKeys {
+    log_member_keys_with_roster(log, None)
+}
+
+#[must_use]
+pub fn log_member_keys_with_roster(
+    log: &Log,
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
+) -> MemberKeys {
     let membership = log.membership();
     membership
         .nodes()
         .iter()
         .filter_map(|(key, standing)| {
             let standing = match standing {
+                NodeStanding::Member(actor)
+                    if membership
+                        .get(actor)
+                        .is_some_and(|m| log.recipient_is_removed(&m.binding.recipient())) =>
+                {
+                    Standing::Out("the membership log removed the Mac that holds it".to_owned())
+                }
                 NodeStanding::Member(actor)
                     if log.audience_left_out(
                         &aterm_secrets::membership_log::EpochAudience::Everyone,
@@ -65,6 +80,17 @@ pub fn log_member_keys(log: &Log) -> MemberKeys {
                     Standing::Out(
                         "the vault's newest key leaves the Mac that holds it out".to_owned(),
                     )
+                }
+                NodeStanding::Member(actor)
+                    if membership.get(actor).is_some_and(|m| {
+                        roster.is_some_and(|r| {
+                            r.is_label_denied(&m.label)
+                                || r.is_label_denied(&m.name)
+                                || r.is_node_denied(&aterm_codec::hex::encode_lower(key))
+                        })
+                    }) =>
+                {
+                    Standing::Out("the swarm roster denies the Mac that holds it".to_owned())
                 }
                 NodeStanding::Member(_) => Standing::Member,
                 NodeStanding::Removed(_) => {
@@ -108,12 +134,14 @@ fn stamp(file: &Path) -> Option<Stamp> {
 /// read it at.
 pub struct LocalLog {
     file: PathBuf,
+    aux_file: Option<PathBuf>,
     read: Reader,
     held: Mutex<Option<Held>>,
 }
 
 struct Held {
     stamp: Stamp,
+    aux_stamp: Option<Stamp>,
     keys: Option<Arc<MemberKeys>>,
 }
 
@@ -125,10 +153,13 @@ impl LocalLog {
         let from = paths.clone();
         Self::reading(
             paths.records_file(),
+            Some(paths.dir.join("applied.vault")),
             Box::new(move || {
-                Ok(aterm_secrets::client::load_records(&from)?
-                    .log()
-                    .map(log_member_keys))
+                let store = aterm_secrets::client::load_records(&from)?;
+                Ok(store.log().map(|log| {
+                    let roster = aterm_secrets::client::local_swarm_roster_for_log(&from, log);
+                    log_member_keys_with_roster(log, roster.as_ref())
+                }))
             }),
         )
     }
@@ -140,6 +171,7 @@ impl LocalLog {
         let from = file.clone();
         Self::reading(
             file,
+            None,
             Box::new(move || {
                 let bytes = std::fs::read(&from)
                     .map_err(|e| aterm_secrets::Error::new(format!("the record store: {e}")))?;
@@ -150,9 +182,10 @@ impl LocalLog {
         )
     }
 
-    fn reading(file: PathBuf, read: Reader) -> Self {
+    fn reading(file: PathBuf, aux_file: Option<PathBuf>, read: Reader) -> Self {
         Self {
             file,
+            aux_file,
             read,
             held: Mutex::new(None),
         }
@@ -170,13 +203,15 @@ impl LocalLog {
     /// lets in a key the log held out.
     pub fn keys(&self) -> Option<Arc<MemberKeys>> {
         // Taken before the read: a write between the two moves the next stamp.
-        let stamp = stamp(&self.file)?;
+        let file_stamp = stamp(&self.file)?;
+        let aux_stamp = self.aux_file.as_deref().and_then(stamp);
         let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(held) = held.as_ref()
-            && held.stamp == stamp
+            && held.stamp == file_stamp
+            && held.aux_stamp == aux_stamp
         {
             return held.keys.clone();
         }
@@ -185,7 +220,8 @@ impl LocalLog {
         };
         let keys = keys.map(Arc::new);
         *held = Some(Held {
-            stamp,
+            stamp: file_stamp,
+            aux_stamp,
             keys: keys.clone(),
         });
         keys
@@ -359,6 +395,30 @@ mod tests {
                 .expect("keys after commons narrowed")
                 .admits(&node_7.key()),
             "member left out of EpochAudience::Commons only is still a fleet member"
+        );
+
+        // Denying `m7` in `aterm-swarm-roster` (before removing from `[machines]`) also holds
+        // `node_7` out in `LocalLog::of`.
+        let admin = aterm_secrets::client::admin_open(&paths).unwrap();
+        let mut doc_roster_deny = admin.doc.clone();
+        let mut r = aterm_secrets::swarm_roster::SwarmRoster::from_document(&doc_roster_deny)
+            .unwrap()
+            .unwrap_or_default();
+        r.deny_labels.push("m7".to_owned());
+        doc_roster_deny
+            .set_entry(
+                &aterm_secrets::text::Audience::Everyone,
+                aterm_secrets::SWARM_ROSTER_ENTRY,
+                r.to_toml().as_bytes(),
+            )
+            .unwrap();
+        aterm_secrets::client::admin_publish(&paths, &admin, &doc_roster_deny).unwrap();
+        assert!(
+            local_log
+                .keys()
+                .expect("keys after roster deny")
+                .holds_out(&node_7.key()),
+            "member denied in aterm-swarm-roster must be held out by LocalLog"
         );
 
         // Removing `m7` from `[machines]` rotates `EpochAudience::Everyone` leaving `m7` out,

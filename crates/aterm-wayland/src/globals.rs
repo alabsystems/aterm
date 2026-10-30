@@ -93,11 +93,16 @@ impl Registry {
 
     /// Binds `global` as `iface` at up to `version` on the registry's queue.
     pub fn bind(&self, global: &Global, iface: &'static Interface, version: u32) -> Option<Proxy> {
-        let version = version.min(global.version).max(1);
+        let version = bind_version(global.version, iface.version(), version)?;
         // SAFETY: the registry is live (owned by self); the interface table
         // is static and names the global's interface.
         unsafe { wl_registry::bind(self.proxy, global.name, iface, version) }
     }
+}
+
+fn bind_version(advertised: u32, table: u32, requested: u32) -> Option<u32> {
+    let version = requested.min(advertised).min(table);
+    (version > 0).then_some(version)
 }
 
 enum Announced {
@@ -152,5 +157,20 @@ impl Drop for Registry {
         // request, so the proxy is destroyed client-side. The listener drops
         // after this, with the other fields.
         unsafe { self.proxy.destroy() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_version;
+
+    #[test]
+    fn bind_version_caps_to_advertised_and_table_and_rejects_zero() {
+        assert_eq!(bind_version(0, 6, 4), None);
+        assert_eq!(bind_version(6, 0, 4), None);
+        assert_eq!(bind_version(6, 6, 0), None);
+        assert_eq!(bind_version(3, 6, 5), Some(3));
+        assert_eq!(bind_version(8, 4, 6), Some(4));
+        assert_eq!(bind_version(8, 6, 2), Some(2));
     }
 }

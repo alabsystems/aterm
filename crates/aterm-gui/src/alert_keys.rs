@@ -48,6 +48,86 @@ pub(crate) fn confirm_key(
     }
 }
 
+/// Whether a key a confirmation's key monitor sees could reach that confirmation, so a key a
+/// control client posted is dropped there: one that names the confirmation's own window
+/// (`attached`), or, while the confirmation is up (`outstanding`), one that names no window
+/// (`hwkey … shape=press`: AppKit hands it to the key window) or any key at all during an
+/// app-modal alert (`app_modal`, a Quit or Close question), which takes every key. A posted key
+/// that names another window while a sheet is up passes on to that window.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const fn may_reach_confirmation(
+    attached: bool,
+    outstanding: bool,
+    names_window: bool,
+    app_modal: bool,
+) -> bool {
+    attached || (outstanding && (!names_window || app_modal))
+}
+
+#[cfg(not(test))]
+static CONFIRMATIONS_UP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// The test build's count: one per test thread, so parallel tests never see each other's.
+    static CONFIRMATIONS_UP: std::sync::atomic::AtomicUsize =
+        const { std::sync::atomic::AtomicUsize::new(0) };
+}
+
+fn with_confirmations<R>(f: impl FnOnce(&std::sync::atomic::AtomicUsize) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&CONFIRMATIONS_UP)
+    }
+    #[cfg(test)]
+    {
+        CONFIRMATIONS_UP.with(f)
+    }
+}
+
+/// Held while one of the person's confirmations is on screen (a multi-line paste sheet, a Quit
+/// or Close alert, an owner's question): `hwkey` starts no burst and posts no further key while
+/// any is held ([`confirmation_up`], read under the posting lock), and the question's opener
+/// fences the key queue once it holds one (`hwkey::fence_queued_keys`), so no posted key answers
+/// it, whatever window it names, queued before it opened or not, with or without the
+/// confirmation's key monitor.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct ConfirmationUp(());
+
+#[cfg(any(target_os = "macos", test))]
+impl ConfirmationUp {
+    /// Count a confirmation as on screen until this value drops.
+    pub(crate) fn hold() -> Self {
+        with_confirmations(|up| up.fetch_add(1, std::sync::atomic::Ordering::AcqRel));
+        Self(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for ConfirmationUp {
+    fn drop(&mut self) {
+        with_confirmations(|up| up.fetch_sub(1, std::sync::atomic::Ordering::AcqRel));
+    }
+}
+
+/// What `hwkey` answers while one of the person's confirmations is on screen
+/// ([`confirmation_up`]).
+pub(crate) const CONFIRMATION_UP_REFUSAL: &str = "ERR hwkey: a confirmation is up (a paste, Quit or Close question): its answer is the person's\n";
+
+/// What a burst answers when it stops before its next key because one of the person's
+/// confirmations came up ([`confirmation_up`]), with how many keys it had posted.
+pub(crate) fn confirmation_up_stop(sent: u32) -> String {
+    format!(
+        "ERR hwkey: stopped after posted={sent}: a confirmation is up (a paste, Quit or Close \
+         question): its answer is the person's\n"
+    )
+}
+
+/// Whether one of the person's confirmations is on screen now ([`ConfirmationUp`]).
+pub(crate) fn confirmation_up() -> bool {
+    with_confirmations(|up| up.load(std::sync::atomic::Ordering::Acquire) > 0)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{ConfirmKeyWatch as PasswordKeyWatch, watch_password_keys};
 #[cfg(target_os = "macos")]
@@ -141,6 +221,27 @@ mod macos {
         }
     }
 
+    /// Whether the watched confirmation is still up (its sheet outstanding on `parent`, or an
+    /// app-modal `panel` visible) and whether `event` names any window at all.
+    fn confirmation_state(
+        event: Id,
+        panel: Id,
+        parent: Option<Id>,
+        _mtm: MainThread,
+    ) -> (bool, bool) {
+        // SAFETY: plain property reads on a live event and a live retained panel, on the main
+        // thread (`_mtm` proves it). `-[NSEvent window]` is `-(NSWindow *)` (+0, compared with
+        // nil only) and `-[NSWindow isVisible]` is `-(BOOL)`.
+        unsafe {
+            let names_window = !appkit::send_id(event, sel!(window)).is_null();
+            let outstanding = match parent {
+                Some(parent) => sheet_outstanding(parent, panel),
+                None => !panel.is_null() && appkit::send_bool(panel, sel!(isVisible)),
+            };
+            (outstanding, names_window)
+        }
+    }
+
     /// Whether `event`, held by a native key monitor before dispatch, is a key a control client
     /// posted with `aterm ctl hwkey`.
     ///
@@ -191,9 +292,20 @@ mod macos {
                 appkit::send_u16(event, sel!(keyCode)),
             )
         };
-        // SAFETY: the live event this monitor holds, main thread (`mtm`).
-        let posted = attached && unsafe { posted_key(event) };
-        match confirm_key(attached, posted, modifier_flags, chars.as_deref(), key_code) {
+        let (outstanding, names_window) =
+            confirmation_state(event, panel.id(), parent.map(Obj::id), mtm);
+        let reaches =
+            super::may_reach_confirmation(attached, outstanding, names_window, parent.is_none());
+        // SAFETY: the live event this monitor holds, main thread (`mtm`). The ledger keeps a key
+        // it found, so asking here leaves it a posted key for a later dispatch it passes to.
+        let posted = reaches && unsafe { posted_key(event) };
+        match confirm_key(
+            attached || posted,
+            posted,
+            modifier_flags,
+            chars.as_deref(),
+            key_code,
+        ) {
             ConfirmKey::PassThrough => event,
             ConfirmKey::Drop => Id::NIL,
             ConfirmKey::Accept => {
@@ -358,16 +470,19 @@ mod macos {
         panel: Obj,
         /// The live key interceptor; dropping this entry removes it from AppKit.
         _keys: Option<ConfirmKeyWatch>,
+        /// Counts this sheet as on screen while the entry lives ([`super::ConfirmationUp`]).
+        _up: super::ConfirmationUp,
     }
 
     impl PasteConfirm {
-        /// Record a just-presented sheet.
-        pub(crate) const fn new(
+        /// Record a just-presented sheet, with the guard its opener took before presenting it.
+        pub(crate) fn new(
             id: u64,
             wid: crate::WindowId,
             parent: Obj,
             panel: Obj,
             keys: Option<ConfirmKeyWatch>,
+            up: super::ConfirmationUp,
         ) -> Self {
             Self {
                 id,
@@ -375,6 +490,7 @@ mod macos {
                 parent,
                 panel,
                 _keys: keys,
+                _up: up,
             }
         }
 
@@ -402,6 +518,63 @@ mod tests {
     const KEYPAD_ENTER: (Option<&str>, u16) = (Some("\u{3}"), 0x4c);
     const ESCAPE: (Option<&str>, u16) = (Some("\u{1b}"), 0x35);
     const LETTER_A: (Option<&str>, u16) = (Some("a"), 0x00);
+
+    /// A POSTED KEY THAT COULD REACH A CONFIRMATION IS ASKED ABOUT, WHATEVER WINDOW IT NAMES:
+    /// while the confirmation is up, a key naming no window (`hwkey … shape=press`, which AppKit
+    /// hands to the key window, the paste sheet) and any key during an app-modal Quit or Close
+    /// alert count as reaching it, so a posted one is dropped; a key naming another window while
+    /// a sheet is up passes to it, and nothing counts once the confirmation is gone.
+    /// NEGATIVE CONTROL: with the rule `attached` alone (as `decide` read it at 3a3de060b1), the
+    /// window-less key and the app-modal alert's key do not count, and the first assertion fails.
+    #[test]
+    fn a_posted_key_that_could_reach_a_confirmation_counts_whatever_window_it_names() {
+        use super::may_reach_confirmation as reaches;
+        // (attached, outstanding, names_window, app_modal)
+        assert!(
+            reaches(false, true, false, false),
+            "a window-less key, sheet up"
+        );
+        assert!(
+            reaches(false, true, true, true),
+            "any key, app-modal alert up"
+        );
+        assert!(
+            reaches(false, true, false, true),
+            "a window-less key, app-modal alert up"
+        );
+        assert!(
+            reaches(true, true, true, false),
+            "a key naming the sheet's window"
+        );
+        assert!(
+            !reaches(false, true, true, false),
+            "a key naming another window, sheet up"
+        );
+        assert!(
+            !reaches(false, false, false, false),
+            "a window-less key, nothing up"
+        );
+        assert!(
+            !reaches(false, false, true, true),
+            "any key, the alert gone"
+        );
+    }
+
+    /// `hwkey` reads whether one of the person's confirmations is on screen before every key: a
+    /// [`super::ConfirmationUp`] counts one while it lives, nested ones included.
+    /// NEGATIVE CONTROL: with `hold` counting nothing, `confirmation_up` reads false under a
+    /// held guard and the first assertion fails.
+    #[test]
+    fn a_confirmation_on_screen_is_counted_until_it_goes() {
+        assert!(!super::confirmation_up(), "none yet");
+        let paste = super::ConfirmationUp::hold();
+        assert!(super::confirmation_up(), "the paste sheet");
+        let quit = super::ConfirmationUp::hold();
+        drop(paste);
+        assert!(super::confirmation_up(), "the Quit alert still stands");
+        drop(quit);
+        assert!(!super::confirmation_up(), "both gone");
+    }
 
     fn action(attached: bool, mods: u64, key: (Option<&str>, u16)) -> ConfirmKey {
         confirm_key(attached, false, mods, key.0, key.1)

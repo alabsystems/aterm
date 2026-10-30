@@ -305,7 +305,9 @@ impl Document {
         }
     }
 
-    /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in a machine a person allowed on any member, with no password, except a key [`Document::code_only`] names.
+    /// Whether the vault is open (`[join]`'s `open = yes`). The pinned default ALab vault
+    /// admits LAN requests automatically; other vaults require a member's Allow. A key
+    /// [`Document::code_only`] names still needs explicit code approval.
     pub const fn open(&self) -> bool {
         self.model.open.is_some()
     }

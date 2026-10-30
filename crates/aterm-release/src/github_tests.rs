@@ -502,7 +502,9 @@ fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
     fake.add_token(&secret, LOGIN);
     fake.add_repo(SLUG, RepoSpec::public().push(LOGIN));
     let latest = format!("/repos/{SLUG}/releases/latest");
-    let hang = Duration::from_secs(if launched { 120 } else { 10 });
+    // The hold outlives the parent's hang detector in both lanes: the signal ends it (the direct
+    // lane's watcher calls `end_hangs` once it is caught), never its own clock.
+    let hang = 2 * aterm_spec::wait::MUST_HAPPEN;
     fake.fault_always(Match::api(&latest), Fault::Hang(hang));
     let p = fake.ports();
     let _routed = Fixture {

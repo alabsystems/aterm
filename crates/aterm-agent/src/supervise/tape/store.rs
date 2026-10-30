@@ -19,15 +19,20 @@ use super::header::{Entry, Header};
 use crate::supervise::fx::Fx;
 use crate::supervise::run::{Ctl, Session, SessionSetup, SuperviseOpts};
 
-/// A tape's id: sixteen hex digits from this process and the moment the run starts, written in its header.
+/// A tape's id: sixteen hex digits from this process, a monotonic sequence, and the moment the run starts, written in its header.
 #[must_use]
 pub fn tape_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut input = [0u8; 24];
+    input[..16].copy_from_slice(&ns.to_le_bytes());
+    input[16..].copy_from_slice(&seq.to_le_bytes());
     format!(
         "{:016x}",
-        aterm_zstd::xxh64::xxh64(u64::from(std::process::id()), &ns.to_le_bytes())
+        aterm_zstd::xxh64::xxh64(u64::from(std::process::id()), &input)
     )
 }
 
@@ -40,7 +45,7 @@ pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     o.open(path)
 }
@@ -493,6 +498,13 @@ mod tests {
         assert!(!seam_on(Some(std::ffi::OsStr::new("0"))));
         assert!(!seam_on(Some(std::ffi::OsStr::new(""))));
         assert!(!seam_on(None));
+        let first_id = tape_id();
+        let second_id = tape_id();
+        assert_eq!(first_id.len(), 16);
+        assert_ne!(
+            first_id, second_id,
+            "consecutive tape_id calls never collide"
+        );
     }
 
     /// THE STORE'S RETENTION: the sessions' tapes, newest first, are kept

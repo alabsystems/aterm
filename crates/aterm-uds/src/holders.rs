@@ -908,6 +908,27 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
         ffi::CDIR_PATH as i64,
     ),
     ("PROC_PIDPATHINFO_MAXSIZE", ffi::PIDPATH_MAX as i64),
+    ("PROC_PIDREGIONPATHINFO", ffi::PROC_PIDREGIONPATHINFO as i64),
+    (
+        "sizeof(struct proc_regionwithpathinfo)",
+        ffi::REGION_SIZE as i64,
+    ),
+    (
+        "offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_address)",
+        ffi::REGION_ADDRESS as i64,
+    ),
+    (
+        "offsetof(struct proc_regionwithpathinfo, prp_prinfo.pri_size)",
+        ffi::REGION_LEN as i64,
+    ),
+    (
+        "offsetof(struct proc_regionwithpathinfo, prp_vip.vip_vi.vi_stat.vst_ino)",
+        ffi::REGION_INODE as i64,
+    ),
+    (
+        "offsetof(struct proc_regionwithpathinfo, prp_vip.vip_path)",
+        ffi::REGION_PATH as i64,
+    ),
     ("PROC_PIDFDPSHMINFO", ffi::PROC_PIDFDPSHMINFO as i64),
     ("sizeof(struct pshm_fdinfo)", ffi::PSHM_FDINFO_SIZE as i64),
     (
@@ -950,6 +971,13 @@ pub(crate) mod ffi {
     pub const CDIR_PATH: usize = 152;
     /// `PROC_PIDPATHINFO_MAXSIZE`.
     pub const PIDPATH_MAX: usize = 4096;
+    /// `PROC_PIDREGIONPATHINFO` flavor and its SDK-checked result layout.
+    pub const PROC_PIDREGIONPATHINFO: i32 = 8;
+    pub const REGION_SIZE: usize = 1272;
+    pub const REGION_ADDRESS: usize = 80;
+    pub const REGION_LEN: usize = 88;
+    pub const REGION_INODE: usize = 104;
+    pub const REGION_PATH: usize = 248;
     /// `PROC_PIDFDPSHMINFO` flavor.
     pub const PROC_PIDFDPSHMINFO: i32 = 5;
     /// `sizeof(struct pshm_fdinfo)`.

@@ -969,6 +969,26 @@ impl SessionLog {
             None => f,
         };
         let (kind, by, f) = match fact {
+            F::FleetMailIn { id, kind, from } => {
+                let f = word(Fields::new(), Key::Dir, "in");
+                let f = word(f, Key::MailKind, kind);
+                let f = text(f, Key::From, from);
+                let f = with(
+                    f,
+                    Key::Re,
+                    aterm_slog::ShortId::new(&format!("f{id}")).map(Val::Id),
+                );
+                (Kind::Mail, aterm_slog::Actor::Aterm, f)
+            }
+            F::FleetMailSeen { id } => {
+                let f = with(
+                    Fields::new(),
+                    Key::Re,
+                    aterm_slog::ShortId::new(&format!("f{id}")).map(Val::Id),
+                );
+                let f = with(f, Key::Moved, Some(Val::U(1)));
+                (Kind::MailSeen, aterm_slog::Actor::Aterm, f)
+            }
             F::MailIn {
                 kind,
                 from,

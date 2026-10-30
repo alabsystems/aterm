@@ -174,7 +174,19 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         record.starts_with(&format!("OK task rev=1 state=working from={manager} ")),
         "{record}"
     );
-    let roster = ctl_ok(&inst, &["sessions"]);
+    // The window and active columns ride a main-thread hop that a loaded machine can miss (`-`):
+    // read the roster until it placed both, then judge the placement.
+    let roster = aterm_spec::wait::until_within(HANG, "the roster's placement columns", || {
+        let roster = ctl_ok(&inst, &["sessions"]);
+        let placed = |sid: &str| {
+            roster
+                .lines()
+                .find(|l| l.split_whitespace().nth(1) == Some(sid))
+                .and_then(|row| field(row, "active"))
+                .is_some_and(|active| active != "-")
+        };
+        (placed(&manager) && placed(&worker)).then_some(roster)
+    });
     let active = |sid: &str| {
         roster
             .lines()

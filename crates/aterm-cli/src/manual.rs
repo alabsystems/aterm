@@ -762,10 +762,10 @@ CONFIGURATION — `[ai]` in `aterm.toml`
 DETAILS
 
   A vault Mac starts with `aterm secrets create http://127.0.0.1:7484/v1/<name> --serve`:
-  its server set up and answering, then the vault. A new Mac joins through a member
-  (`aterm help members`): a person presses Allow on any member and types the phrase it
-  shows, and the admin's subscriber lets in the request that carries that Allow. An open
-  vault lets in no machine by asking alone. `aterm secrets password new` gives it a join
+  its server set up and answering, then the vault. The pinned default ALab vault admits
+  new Macs automatically from the LAN while open. Other vaults use a member's Allow
+  (`aterm help members`): a person presses Allow and types the phrase it shows, and the
+  admin's subscriber admits that request. `aterm secrets password new` gives a vault a join
   password, and `password off` leaves each machine to an Allow or an admin's code.
 
 HOW IT WORKS
@@ -795,7 +795,8 @@ VERBS
                   admins, rotate-key
   a server        serve, server on|off|status (`server on` returns once it answers)
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
-  a member allowed or that type the join password. `agent off` records that
+  a member allowed, that type the join password, or that join the open default ALab
+  vault from the LAN. `agent off` records that
   choice, which setup keeps, and every install of the subscriber removes it. A path
   vault has no join queue: approve each key.
 
@@ -805,7 +806,7 @@ FILES
     },
     Topic {
         name: "members",
-        tagline: "Macs joining ALab: ask every member, Allow on any one, type the phrase it shows (requests | allow | invite | ignore | join | status)",
+        tagline: "Macs joining ALab: ask every member, Allow on any one, type the phrase it shows; any member removes (requests | allow | invite | ignore | join | status | list | remove | undo)",
         body: Some(
             r#"members — Macs joining ALab, and the members that let them in (macOS and Linux;
 `aterm members --help` has every verb). No member is a leader: any one lets a Mac in.
@@ -814,6 +815,11 @@ FILES
   aterm members join <phrase>        type the phrase the member that allowed this Mac shows
   aterm members requests             on a member: the Macs asking that it hears
   aterm members allow <name>         on a member: show a phrase for that Mac on this screen
+  aterm members list                 the members, and the Macs the vault removed
+  aterm members remove <name>        on a member: take that Mac out (--stolen: rotate
+                                     the fleet code and name what to rotate)
+  aterm members undo [<name>]        on a Mac that member removed: its Undo rows; a
+                                     person's press of one in the window signs a share
 
 HOW A MAC JOINS
   1. The new Mac runs `aterm members join` (install.sh runs `members join --no-wait`,
@@ -837,7 +843,18 @@ HOW A MAC JOINS
 
   A wrong phrase burns it (one run each); a source gets 3 runs a minute. `Ignore` hides
   the request on that Mac only. `aterm members status` says whether this Mac is in,
-  waiting, or neither."#,
+  waiting, or neither.
+
+HOW A MAC LEAVES
+  Where the vault holds a membership log, any member removes a Mac, no admin needed:
+  `aterm members remove <name>` (or Remove on its row) signs its removal, gives every
+  audience it was in a new key the rest hold, and lists what it could read, to rotate at
+  the provider where it was lost; `--stolen` also rotates the fleet code and prints one
+  NEEDS YOU: line. A removed Mac that asks again shows as "m12 was removed by m7 on
+  Oct 30. Allow again?"; Allow again restores it. A Mac one member removed shows
+  "m7 removed this Mac and 3 others. Undo m7's removals?": a quorum of the Macs that
+  were members before m7's contested removals undoes them all, and then m7 is out. A
+  vault with no log yet removes by an admin's `aterm secrets revoke`."#,
         ),
     },
     Topic {
@@ -1020,7 +1037,15 @@ AUTOPILOT — how far the harness carries a session's work
   that tells its own set on its proven claim (`meta set harness_needs entry=<pct
   text> need=<pct need> …`, at most 32; `meta unset harness_needs`) has its needs
   shown the same way while that claim stands, any past the 32 still counted; one
-  that does not is shown by its entry's first need and count.
+  that does not is shown by its entry's first need and count. A go-ahead for an
+  agent's own reversible work (build, test, commit, push or merge its own branch to
+  main) is no need: Cruise and Land answer a reply that waits on one with the owner's
+  standing go-ahead (`go-ahead@v1`), which covers nothing outward, destructive or
+  another's, and tell the agent to drop that line now; a park three such answers or
+  an hour leave standing goes on the menu bar at once as an agent that refuses the
+  standing go-ahead, and nothing more is typed. A decision to publish outward,
+  spend, touch work the agent did not make, or do anything irreversible (delete,
+  overwrite, reset, force-push) stays a need.
 
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   enabled [true]                  master switch for the window supervisor
@@ -2813,7 +2838,7 @@ fn protected_folder_names() -> String {
 /// Terminal, a login over ssh): macOS grants Full Disk Access to that app, so the cell is not
 /// aterm's and reads `not aterm's`. A test binary reads none.
 fn permission_states() -> ([&'static str; 3], Option<String>) {
-    use aterm_containment::consent::{self, DebuggerMode, DevToolListing, FdaState};
+    use aterm_containment::consent::{self, DevToolListing, FdaState};
     if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
         return (["not read"; 3], None);
     }
@@ -2832,40 +2857,62 @@ fn permission_states() -> ([&'static str; 3], Option<String>) {
         .filter(|app| {
             let theirs = consent::app_bundle_root(&app.path)
                 .and_then(|root| consent::bundle_id_of(&root, &protected));
-            theirs.is_none() || theirs != subject
+            runs_elsewhere(subject.as_deref(), theirs.as_deref())
         })
         .map(|app| app.display_name);
     let states = std::thread::scope(|scope| {
         let fda = scope.spawn(|| {
-            if elsewhere.is_some() {
-                return "not aterm's";
-            }
-            match aterm_containment::probe_fda(gate()).state {
-                FdaState::Granted => "granted",
-                FdaState::Denied => "off",
-                FdaState::Unknown => "unknown",
-            }
+            elsewhere
+                .is_none()
+                .then(|| aterm_containment::probe_fda(gate()).state)
         });
         let devtools = scope.spawn(|| {
             let id = subject.as_deref().unwrap_or_default();
-            match consent::probe_devtool_list(gate(), id).listing {
-                DevToolListing::On => "on",
-                DevToolListing::Off => "off",
-                DevToolListing::Absent => "not listed",
-                DevToolListing::Unknown => "unknown",
-            }
+            consent::probe_devtool_list(gate(), id).listing
         });
-        let debugger = match consent::probe_debugger(gate()).mode {
-            DebuggerMode::Enabled => "allowed",
-            DebuggerMode::Disabled => "asks",
-            DebuggerMode::Unrecognized | DebuggerMode::Unknown => "unknown",
-        };
-        let join = |handle: std::thread::ScopedJoinHandle<'_, &'static str>| {
-            handle.join().unwrap_or("unknown")
-        };
-        [join(fda), join(devtools), debugger]
+        let debugger = consent::probe_debugger(gate()).mode;
+        permission_words(
+            fda.join().unwrap_or(Some(FdaState::Unknown)),
+            devtools.join().unwrap_or(DevToolListing::Unknown),
+            debugger,
+        )
     });
     (states, elsewhere)
+}
+
+/// Whether the app macOS holds responsible for this process is another app: its bundle id
+/// (`theirs`) could not be read, or it is not aterm's own (`subject`).
+fn runs_elsewhere(subject: Option<&str>, theirs: Option<&str>) -> bool {
+    theirs.is_none() || theirs != subject
+}
+
+/// The words the table's NOW column shows for what [`permission_states`]' probes read: the
+/// Full Disk Access state (`None` when this process runs under another app, whose grant it
+/// is, so the probe did not run), the Developer Tools listing and the debugger mode.
+fn permission_words(
+    fda: Option<aterm_containment::consent::FdaState>,
+    listing: aterm_containment::consent::DevToolListing,
+    mode: aterm_containment::consent::DebuggerMode,
+) -> [&'static str; 3] {
+    use aterm_containment::consent::{DebuggerMode, DevToolListing, FdaState};
+    let fda = match fda {
+        None => "not aterm's",
+        Some(FdaState::Granted) => "granted",
+        Some(FdaState::Denied) => "off",
+        Some(FdaState::Unknown) => "unknown",
+    };
+    let listing = match listing {
+        DevToolListing::On => "on",
+        DevToolListing::Off => "off",
+        DevToolListing::Absent => "not listed",
+        DevToolListing::Unknown => "unknown",
+    };
+    let mode = match mode {
+        DebuggerMode::Enabled => "allowed",
+        DebuggerMode::Disabled => "asks",
+        DebuggerMode::Unrecognized | DebuggerMode::Unknown => "unknown",
+    };
+    [fda, listing, mode]
 }
 
 /// The table `aterm help permissions` opens with: each permission, why aterm wants it, what it
@@ -4444,7 +4491,10 @@ fn agent_page(sid: Option<&str>) -> String {
          every turn end until all of the work is on the remote main branch and a reply defends\n  \
          that in a few lines starting `Nothing left:`; off types nothing.\n  \
          NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar\n  \
-         and window border (`NEEDS YOU: nothing` takes it down); the work goes on.\n",
+         and window border (`NEEDS YOU: nothing` takes it down); the work goes on. A go-ahead for\n  \
+         your own reversible work is no need: cruise and land answer one with the owner's\n  \
+         standing go-ahead (`go-ahead@v1`). A decision to publish outward, spend, touch work you\n  \
+         did not make, or do anything irreversible (delete, overwrite, reset, force-push) is one.\n",
     );
     s.push_str(
         "\nRESTART YOUR AGENT\n  \
@@ -4647,13 +4697,15 @@ THE HALT (`hold=1`)
   * `origin=person` (`reason=taken-over`) — local Take Over (`aterm help needs`); only
     the person's Hand Back lifts it.
   * `origin=remote` — held by another Mac over the fleet (the survey's `held_from=`
-    names its node): its own `hold <sid> off` or the person's Take Over lifts it, and
-    it ends here once that Mac may drive this one no more (`aterm help fleet`): a lower
-    `aterm fleet allow` here ends every grant; once it left the fleet, `aterm fleet peers
-    rm <its node>` ends it, run here where no `"*"` grant stands here (the rm ends a
-    grant here that names the node); under the `"*"` grant it ends once this Mac's
-    membership log removes that Mac, or, for a key the log does not name, once no book
-    here binds it (`ERR halted` names which); and once its place answers under another fleet's secret or key,
+    names its node): its own `hold <sid> off` or the person's Take Over then Hand Back
+    lifts it. It also ends here once that Mac may drive this one no more (`aterm help
+    fleet`): `aterm fleet allow content` here ends every grant. `aterm fleet peers rm <its node>`
+    here also removes grants naming that node, but another member's book can restore
+    a valid signed entry admitted by the `"*"` grant. Removing a peer from one book,
+    including the issuer's, does not revoke membership in every book. Under the
+    `"*"` grant the hold ends once this Mac's membership log removes that Mac, or, for a
+    key the log does not name, once no book
+    here binds it; and once its place answers under another fleet's secret or key,
     `aterm ctl hold <sid> off` here lifts it too. Its own CLI drives with no aterm
     running there, so a Mac that does not answer keeps its hold.
   * `origin=fleet` — fleet-wide halt via `aterm fabric halt --cap-file <cap> <reason>`
@@ -5849,6 +5901,54 @@ mod tests {
             "{terminal}"
         );
         assert!(terminal.lines().count() <= 10, "{terminal}");
+    }
+
+    /// The app macOS holds responsible for this process is another app's unless its bundle id
+    /// reads as aterm's own: one that cannot be read, or an aterm whose own id cannot be, is
+    /// still another app's.
+    #[test]
+    fn the_responsible_app_is_another_apps_unless_its_bundle_id_reads_as_aterms_own() {
+        let aterm = Some("com.aterm.aterm");
+        assert!(!runs_elsewhere(aterm, aterm));
+        assert!(runs_elsewhere(aterm, Some("com.apple.Terminal")));
+        assert!(runs_elsewhere(aterm, None));
+        assert!(runs_elsewhere(None, Some("com.apple.Terminal")));
+        assert!(runs_elsewhere(None, None));
+    }
+
+    /// Each state a probe reads has its own word in the NOW column, and Full Disk Access under
+    /// another app reads `not aterm's`.
+    #[test]
+    fn each_permission_state_reads_as_its_own_word() {
+        use aterm_containment::consent::{DebuggerMode, DevToolListing, FdaState};
+        assert_eq!(
+            permission_words(
+                Some(FdaState::Granted),
+                DevToolListing::On,
+                DebuggerMode::Enabled
+            ),
+            ["granted", "on", "allowed"]
+        );
+        assert_eq!(
+            permission_words(None, DevToolListing::Absent, DebuggerMode::Disabled),
+            ["not aterm's", "not listed", "asks"]
+        );
+        assert_eq!(
+            permission_words(
+                Some(FdaState::Denied),
+                DevToolListing::Off,
+                DebuggerMode::Unrecognized
+            ),
+            ["off", "off", "unknown"]
+        );
+        assert_eq!(
+            permission_words(
+                Some(FdaState::Unknown),
+                DevToolListing::Unknown,
+                DebuggerMode::Unknown
+            ),
+            ["unknown"; 3]
+        );
     }
 
     /// Every page in [`EXTRA_PAGES`] dispatches, and each, like the front page, ends its last

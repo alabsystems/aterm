@@ -884,6 +884,10 @@ fn idle_facts() -> Facts {
         ready_superseded: false,
         quiet: false,
         unnoticed: false,
+        own_hold_s: 0,
+        tells: 0,
+        told_s: u64::MAX,
+        may_tell: false,
         press: Press::None,
     }
 }
@@ -944,6 +948,196 @@ fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
     assert_eq!(
         next_step(&announced, &ask, false, 200),
         Step::Wait("awaiting-ready")
+    );
+}
+
+/// A quiet round the agent's own work has held [`OWN_TELL_S`] at [`Rung::Land`], under an
+/// autopilot that carries the session: told at a break or at an idle point its work holds, never
+/// moved over that work, at most [`MAX_TELLS`] times and [`RETELL_S`] apart.
+#[test]
+fn a_quiet_round_its_own_work_holds_is_told_past_the_bound_and_never_moved_over_it() {
+    let idle = Facts {
+        quiet: true,
+        rung: Rung::Land,
+        own_hold_s: OWN_TELL_S,
+        may_tell: true,
+        ..idle_facts()
+    };
+    let brk = Facts {
+        status: "busy".into(),
+        background_point: true,
+        ..idle.clone()
+    };
+    let shells = Facts {
+        background: vec!["zsh".into()],
+        ..idle.clone()
+    };
+    let pending = Phase::Pending;
+    assert_eq!(
+        next_step(&pending, &brk, false, 200),
+        Step::Tell("background")
+    );
+    assert_eq!(
+        break_step(Step::Tell("background")),
+        Step::Tell("background")
+    );
+    assert_eq!(
+        next_step(&pending, &shells, false, 200),
+        Step::Tell("background")
+    );
+    assert_eq!(
+        next_step(&pending, &idle, false, 200),
+        Step::Terminate,
+        "nothing of its own running: the move comes first"
+    );
+    let unmoved: [Knock; 8] = [
+        (|f| f.own_hold_s = OWN_TELL_S - 1, "below the bound"),
+        (|f| f.rung = Rung::KeysOnly, "below the land rung"),
+        (|f| f.may_tell = false, "no autopilot carries it"),
+        (
+            |f| (f.tells, f.told_s) = (1, RETELL_S - 1),
+            "told within the rest",
+        ),
+        (
+            |f| (f.tells, f.told_s) = (MAX_TELLS, u64::MAX),
+            "told the most times",
+        ),
+        (|f| f.status = "busy".into(), "its turn runs"),
+        (|f| f.taskless = true, "no task"),
+        (|f| f.quiet = false, "the ask flow"),
+    ];
+    for (edit, why) in unmoved {
+        for base in [&brk, &shells] {
+            let mut f = base.clone();
+            edit(&mut f);
+            if f == *base {
+                continue;
+            }
+            let step = next_step(&pending, &f, false, 200);
+            assert!(!matches!(step, Step::Tell(_)), "{why}: {step:?}");
+            assert!(
+                !matches!(step, Step::Terminate | Step::Fresh),
+                "{why}: never moved over its work: {step:?}"
+            );
+        }
+    }
+    let rested = Facts {
+        tells: 1,
+        told_s: RETELL_S,
+        ..brk.clone()
+    };
+    assert_eq!(
+        next_step(&pending, &rested, false, 200),
+        Step::Tell("background")
+    );
+    assert_eq!(
+        next_step(
+            &pending,
+            &Facts {
+                quiet: false,
+                ..brk.clone()
+            },
+            false,
+            200
+        ),
+        Step::Announce,
+        "the ask flow is untouched"
+    );
+    for phase in [
+        Phase::Announced { at_s: 100, asks: 1 },
+        Phase::Exiting { at_s: 1 },
+        Phase::Done,
+        Phase::Failed("x".into()),
+    ] {
+        for f in [&brk, &shells] {
+            let step = next_step(&phase, f, false, 200);
+            assert!(!matches!(step, Step::Tell(_)), "{phase:?}: {step:?}");
+        }
+    }
+    let knocks: [Knock; 8] = [
+        (|f| f.typing = true, "attended"),
+        (|f| f.approval_box = true, "box"),
+        (|f| f.composer_empty = false, "draft"),
+        (|f| f.held = true, "held"),
+        (|f| f.busy_footer = true, "busy"),
+        (|f| f.queued = true, "queued"),
+        (|f| f.limited = true, "limited"),
+        (|f| f.login = true, "login"),
+    ];
+    for (edit, word) in knocks {
+        for base in [&brk, &shells] {
+            let mut f = base.clone();
+            edit(&mut f);
+            let step = next_step(&pending, &f, false, 200);
+            assert!(
+                matches!(step, Step::Wait(_)),
+                "{word}: a person's hold or a wall is never told over: {step:?}"
+            );
+            assert_eq!(gate_announce(&f), Gate::Wait(word), "{word}");
+        }
+    }
+    for rung in [Rung::Prefer, Rung::Settled, Rung::KeysOnly, Rung::Land] {
+        for (background, point) in [(true, false), (false, true), (true, true)] {
+            for own_hold_s in [0, OWN_TELL_S - 1, OWN_TELL_S, 10 * OWN_TELL_S] {
+                for (tells, told_s) in [
+                    (0, u64::MAX),
+                    (0, RETELL_S - 1),
+                    (1, 0),
+                    (1, RETELL_S),
+                    (MAX_TELLS, RETELL_S),
+                ] {
+                    let f = Facts {
+                        rung,
+                        background: if background {
+                            vec!["zsh".into()]
+                        } else {
+                            Vec::new()
+                        },
+                        background_point: point,
+                        own_hold_s,
+                        tells,
+                        told_s,
+                        ..idle.clone()
+                    };
+                    let step = next_step(&pending, &f, false, 200);
+                    assert!(
+                        !matches!(step, Step::Terminate | Step::Fresh),
+                        "{f:?}: {step:?}"
+                    );
+                    assert_eq!(
+                        matches!(step, Step::Tell(_)),
+                        rung == Rung::Land
+                            && own_hold_s >= OWN_TELL_S
+                            && tells < MAX_TELLS
+                            && told_s >= RETELL_S,
+                        "{f:?}: {step:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The quiet tell's line: a fact naming both builds and how long the work held, with the restart
+/// the agent may run itself only where the tab offers it.
+#[test]
+fn the_quiet_tell_names_both_builds_and_its_verb_only_where_offered() {
+    let verb = tell_prompt(Agent::Claude, "2.1.305", "2.1.310", OWN_TELL_S, true);
+    assert!(verb.starts_with(TELL_HEAD), "{verb}");
+    for part in [
+        "Claude Code 2.1.310 is installed",
+        "this session runs 2.1.305",
+        "held the move for 1h",
+        "`aterm ctl @self restart` moves it sooner and ends any still running.",
+    ] {
+        assert!(verb.contains(part), "{part}: {verb}");
+    }
+    let fact = tell_prompt(Agent::Claude, "2.1.305", "2.1.310", OWN_TELL_S, false);
+    assert!(!fact.contains("aterm ctl"), "{fact}");
+    assert!(fact.ends_with("subagent of its own running."), "{fact}");
+    assert!(
+        own_draft(&format!("❯ {fact}")),
+        "a tell left in the composer is the harness's"
     );
 }
 
@@ -1233,6 +1427,7 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
                                     Step::Wait(_) => "wait",
                                     Step::Fresh => "fresh",
                                     Step::Rearm => "rearm",
+                                    Step::Tell(_) => "tell",
                                 });
                                 let decided = |m: &aterm_spec::derive::Model| {
                                     [

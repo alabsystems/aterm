@@ -13,7 +13,7 @@ use crate::{
 use aterm_codec::hex;
 use aterm_digest::Sha256;
 use aterm_json::{Value, json};
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::Path};
 
 const MAX_CSV: usize = 1024 * 1024;
 const MAX_ROWS: usize = 4096;
@@ -50,11 +50,24 @@ impl Csv {
         Ok(column)
     }
 }
+/// `O_NONBLOCK`, which differs: 0o4000 on Linux, 0x0004 on Darwin and the BSDs.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: i32 = 0o4000;
+/// `O_NONBLOCK`, which differs: 0o4000 on Linux, 0x0004 on Darwin and the BSDs.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const O_NONBLOCK: i32 = 0x0004;
+
 fn load(path: &Path) -> Result<Csv> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::new("CSV path is not a regular file"));
+    }
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take((MAX_CSV + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    file.take((MAX_CSV + 1) as u64).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_CSV {
         return Err(Error::new("CSV exceeds import capacity"));
     }
@@ -496,5 +509,6 @@ mod tests {
             inspect(&path).unwrap()["source_values_printed"],
             json!(false)
         );
+        assert!(inspect(root.path()).is_err());
     }
 }

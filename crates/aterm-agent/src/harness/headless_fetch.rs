@@ -138,7 +138,10 @@ pub fn run_stoppable(
         return Err(STOPPED.to_owned());
     }
     let mut child = cmd.spawn().map_err(|e| format!("it will not run: {e}"))?;
-    let until = Instant::now() + within;
+    let now = Instant::now();
+    let until = now
+        .checked_add(within)
+        .unwrap_or_else(|| now + Duration::from_secs(3600));
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status.code()),
@@ -386,11 +389,16 @@ pub fn last_failure(root: &Path, archive: &Archive) -> Option<String> {
 /// read (nor one whose time cannot be read).
 fn last_failure_at(root: &Path, archive: &Archive, now: SystemTime) -> Option<String> {
     let record = failure_path(root, archive);
-    let written = std::fs::metadata(&record).and_then(|m| m.modified()).ok()?;
+    let written = std::fs::symlink_metadata(&record)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|m| m.modified().ok())?;
     if now.duration_since(written).unwrap_or(Duration::ZERO) > FAILURE_KEPT {
         return None;
     }
-    let text = std::fs::read_to_string(&record).ok()?;
+    let text = super::accounts::read_bounded(&record, 16 * 1024)
+        .ok()
+        .flatten()?;
     let why = super::one_line(text.trim(), FAILED_WHY_MAX);
     Some(if why.is_empty() {
         "an earlier fetch failed".to_owned()
@@ -424,10 +432,12 @@ pub fn install(
         }
         Err(why) if !stopped() => {
             // Best effort: a root that cannot be made keeps no record either.
-            let _ = std::fs::write(
-                &record,
-                format!("{}\n", super::one_line(why, FAILED_WHY_MAX)),
-            );
+            if root.is_dir() {
+                let _ = super::upgrade_models::write_atomic(
+                    &record,
+                    &format!("{}\n", super::one_line(why, FAILED_WHY_MAX)),
+                );
+            }
         }
         Err(_) => {}
     }

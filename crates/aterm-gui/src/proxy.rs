@@ -769,7 +769,13 @@ pub(crate) fn forward_first_line(token: &str, verb: &str) -> String {
 }
 
 /// Deadline for a forwarded connection's connect probe.
+#[cfg(not(test))]
 pub(crate) const FORWARD_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// A unit test's hosts serve, or refuse or close at once, and its forwards run on threads a
+/// per-thread bound would not reach: the probe waits the hang detector. A test of a host that
+/// accepts nothing passes its own bound to [`deliver_then_relay`].
+#[cfg(test)]
+pub(crate) const FORWARD_ACCEPT_DEADLINE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Verify the host serves on `hop`, send `line` and `client_prebuffered`, and splice `client`.
 pub(crate) fn relay_hop(
@@ -886,7 +892,13 @@ struct ForwardHost {
     listener: Option<aterm_uds::listener::ListenerId>,
 }
 
+/// How long a look at a host that ended a forward waits for its answer.
+#[cfg(not(test))]
 const HOST_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
+/// A unit test's host answers its looks, or drops its listener, which refuses or resets them: a
+/// look a loaded machine slows waits the hang detector rather than calling a serving host gone.
+#[cfg(test)]
+const HOST_LOOK: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 impl ForwardHost {
     fn gone_line(&self) -> Option<String> {

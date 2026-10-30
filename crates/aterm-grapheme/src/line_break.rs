@@ -596,6 +596,10 @@ pub fn break_inside(
         let (at, with_mark) = inside
             .point(start, fits)
             .unwrap_or_else(|| inside.anywhere(start, fits));
+        if at >= piece.end {
+            lines.push((start, rest.trim_start().to_string()));
+            break;
+        }
         lines.push((start, inside.marked(start, at, with_mark)));
         start = at;
     }
@@ -793,7 +797,7 @@ impl<'a> Inside<'a> {
                 at = back;
             }
         }
-        (at, self.word)
+        (at, self.word && at < self.word_end)
     }
 }
 
@@ -1031,6 +1035,12 @@ mod tests {
         );
         assert_eq!(inside("background", "", 6), ["back", "ground"]);
         assert_eq!(inside("cursor_style", "", 7), ["cursor", "_style"]);
+        assert_eq!(inside("a", "-", 0), ["a"]);
+        assert_eq!(inside("ab", "-", 0), ["a-", "b"]);
+        assert_eq!(
+            break_inside("a \u{b7}", 0..4, "-", &|line| line.chars().count() <= 1),
+            [(0, "a".to_string()), (1, "\u{b7}".to_string())]
+        );
     }
     /// A typesetter breaks a name AFTER its hyphens (the hyphen ends the line, never starts
     /// the next) and keeps a file's extension with the word before it.

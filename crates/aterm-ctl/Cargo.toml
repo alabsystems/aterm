@@ -19,6 +19,14 @@ path = "src/main.rs"
 # main.rs holds no tests; integration tests still get the binary.
 test = false
 
+[features]
+# DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!` reads (a
+# discovery probe's wait, `ATERM_DEBUG_CTL_PROBE_WITHIN_MS`, and a connect's accept patience,
+# `ATERM_DEBUG_CTL_ACCEPT_WITHIN_MS`, which the live suites lift to their hang detector). A debug
+# build compiles them anyway; the release cutter never enables this (aterm's `dev-seams`
+# forwards here), so a shipped binary waits the full 2 s and 10 s.
+dev-seams = []
+
 [dependencies]
 # Workspace crates only: this binary has no third-party dependencies.
 #

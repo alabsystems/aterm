@@ -1251,6 +1251,136 @@ fn a_headless_browser_gets_its_grace_before_any_kill() {
     );
 }
 
+/// The headless browser's environment is the opener's kept variables
+/// ([`super::super::open_url::CHILD_ENV_KEPT`]) and nothing else: no mailbox credential the
+/// opener holds reaches the browser. CONTROL: the opener's home and path do arrive, and the
+/// browser is started on its profile.
+#[cfg(unix)]
+#[test]
+fn a_headless_browser_gets_only_the_kept_environment() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let home = dir.path().join("home");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&profile).unwrap();
+    let path = dir.path().join("bin").join("chrome-headless-shell");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    aterm_tempfile::stand_in(
+        &path,
+        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) d=\"${a#--user-data-dir=}\";; \
+         esac; done\nprintf '%s\\n' \"$@\" > \"$d/argv\"\n/usr/bin/env > \"$d/env\"\n",
+    )
+    .expect("stand-in browser");
+    let browser = HeadlessBrowser {
+        path,
+        is_headless_shell: true,
+    };
+    let home_text = home.as_os_str().to_os_string();
+    let var = move |name: &str| match name {
+        "HOME" => Some(home_text.clone()),
+        "PATH" => Some(OsString::from("/usr/bin:/bin")),
+        IMAP_PASS_ENV | WEBMAIL_PASS_ENV | MAILBOX_TOKEN_ENV | TOTP_SECRET_ENV => {
+            Some(OsString::from("fake-secret-in-env"))
+        }
+        super::super::open_url::MAILBOX_ENV => Some(OsString::from(
+            "imaps://u:fake-secret-in-url@mail.example.test",
+        )),
+        _ => None,
+    };
+    let cmd = headless_browser_command(&browser, &profile, &var);
+    let mut child = aterm_uds::spawnfd::spawn(cmd).expect("the stand-in starts");
+    // A hang detector: the stand-in exits as soon as it has written.
+    let hang = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("waited") {
+            break status;
+        }
+        assert!(Instant::now() < hang, "the stand-in browser hung");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    let env = std::fs::read_to_string(profile.join("env")).expect("the stand-in wrote its env");
+    let names: BTreeSet<&str> = env
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, _)| k)
+        .collect();
+    let allowed: BTreeSet<&str> = super::super::open_url::CHILD_ENV_KEPT
+        .iter()
+        .copied()
+        .chain(["PWD", "SHLVL", "_"])
+        .collect();
+    assert!(
+        names.is_subset(&allowed),
+        "only the kept variables: {names:?}"
+    );
+    assert!(
+        !env.contains("fake-secret"),
+        "no credential reaches the browser: {env}"
+    );
+    assert!(
+        !env.contains("ATERM_"),
+        "none of the opener's settings: {env}"
+    );
+    assert!(
+        env.lines().any(|l| l == format!("HOME={}", home.display())),
+        "CONTROL: the opener's home, not this process's: {env}"
+    );
+    let argv = std::fs::read_to_string(profile.join("argv")).unwrap();
+    assert!(
+        argv.lines()
+            .any(|l| l == format!("--user-data-dir={}", profile.display())),
+        "CONTROL: started on its profile: {argv}"
+    );
+}
+
+/// A mailbox poll reads a mailbox on another machine once every two seconds, each read a new
+/// login there: a provider's IMAP server, an HTTPS mailbox, the fleet's relay. CONTROL: one on
+/// this machine (a bridge on loopback, a test's server) is read often.
+#[test]
+fn a_remote_mailbox_is_polled_gently_and_a_loopback_one_often() {
+    let cfg = |imap: Option<&str>, http: Option<&str>| MailboxConfig {
+        imap_url: imap.map(str::to_owned),
+        http_url: http.map(str::to_owned),
+        ..MailboxConfig::default()
+    };
+    let target = Some("work@example.test");
+    for (imap, http) in [
+        (Some("imaps://imap.example.test:993/INBOX"), None),
+        (None, Some("https://mail.example.test/api")),
+        (
+            Some("imap://127.0.0.1:1143/INBOX"),
+            Some("https://mail.example.test/api"),
+        ),
+    ] {
+        assert_eq!(
+            network_poll_interval(&cfg(imap, http), target),
+            REMOTE_POLL,
+            "{imap:?} {http:?}"
+        );
+    }
+    let relay = MailboxConfig {
+        relay_enabled: true,
+        ..MailboxConfig::default()
+    };
+    assert_eq!(network_poll_interval(&relay, target), REMOTE_POLL);
+    assert!(REMOTE_POLL >= Duration::from_secs(2));
+    for (imap, http) in [
+        (Some("imap://127.0.0.1:1143/INBOX"), None),
+        (
+            Some("imaps://localhost:9993/INBOX"),
+            Some("http://127.0.0.1:8025/api"),
+        ),
+        (None, Some("http://[::1]:8025/api")),
+    ] {
+        assert_eq!(
+            network_poll_interval(&cfg(imap, http), target),
+            LOOPBACK_POLL,
+            "CONTROL: {imap:?} {http:?}"
+        );
+    }
+}
+
 /// Kimi's device card as the lab read it on www.kimi.ai (2026-10-24): it names the account
 /// signed in and its contact, offers `Log in`, `Cancel` and `Switch account`, and shows its code
 /// only in its URL.

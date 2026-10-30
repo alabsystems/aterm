@@ -2130,8 +2130,16 @@ pub(super) fn is_shell_binary(path: &Path) -> bool {
 }
 
 pub(super) fn browser_cache_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    browser_cache_roots_with(home, &|name| std::env::var_os(name))
+}
+
+/// [`browser_cache_roots`] reading `env` in place of the process's environment.
+pub(super) fn browser_cache_roots_with(
+    home: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
+    if let Some(xdg) = env("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
     {
@@ -2184,7 +2192,19 @@ pub(super) fn shell_in(root: &Path) -> Option<PathBuf> {
 /// Find a headless-capable Chromium executable.
 #[must_use]
 pub fn find_headless_browser(home: Option<&Path>) -> Option<HeadlessBrowser> {
-    if let Some(named) = std::env::var_os(BROWSER_BIN_ENV).filter(|v| !v.is_empty()) {
+    find_headless_browser_with(home, &|name| std::env::var_os(name), true)
+}
+
+/// [`find_headless_browser`] reading `env` in place of the process's environment; with `system`
+/// false it looks only where `env` and `home` point (a browser `env` names, the browser caches,
+/// `~/Applications`), never in `/Applications` or on `PATH`.
+#[must_use]
+pub(super) fn find_headless_browser_with(
+    home: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    system: bool,
+) -> Option<HeadlessBrowser> {
+    if let Some(named) = env(BROWSER_BIN_ENV).filter(|v| !v.is_empty()) {
         let path = PathBuf::from(named);
         if path.is_file() {
             return Some(HeadlessBrowser {
@@ -2193,7 +2213,7 @@ pub fn find_headless_browser(home: Option<&Path>) -> Option<HeadlessBrowser> {
             });
         }
     }
-    for root in browser_cache_roots(home) {
+    for root in browser_cache_roots_with(home, env) {
         if let Some(path) = shell_in(&root) {
             return Some(HeadlessBrowser {
                 path,
@@ -2209,7 +2229,7 @@ pub fn find_headless_browser(home: Option<&Path>) -> Option<HeadlessBrowser> {
         ];
         for app in apps {
             let sys = Path::new("/Applications").join(app);
-            if sys.is_file() {
+            if system && sys.is_file() {
                 return Some(HeadlessBrowser {
                     path: sys,
                     is_headless_shell: false,
@@ -2225,7 +2245,7 @@ pub fn find_headless_browser(home: Option<&Path>) -> Option<HeadlessBrowser> {
                 }
             }
         }
-    } else if let Some(path_var) = std::env::var_os("PATH") {
+    } else if let Some(path_var) = env("PATH").filter(|_| system) {
         for dir in std::env::split_paths(&path_var) {
             for name in [
                 "chrome-headless-shell",
@@ -2473,6 +2493,27 @@ pub fn headless_launch_args(browser: &HeadlessBrowser, profile_dir: &Path) -> Ve
     args
 }
 
+/// The headless browser's command for one sign-in in `profile_dir`: [`headless_launch_args`],
+/// nothing on its standard streams, and an environment of the opener's
+/// [`super::open_url::CHILD_ENV_KEPT`] variables as `var` reads them, so no mailbox credential
+/// the opener holds reaches the browser.
+#[cfg(unix)]
+pub(super) fn headless_browser_command(
+    browser: &HeadlessBrowser,
+    profile_dir: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> aterm_uds::spawnfd::LaneCommand {
+    use aterm_uds::spawnfd::{ChildStdio, LaneCommand};
+
+    let mut cmd = LaneCommand::new(&browser.path);
+    cmd.args(headless_launch_args(browser, profile_dir))
+        .env_exactly(super::open_url::child_env(var))
+        .stdin(ChildStdio::Null)
+        .stdout(ChildStdio::Null)
+        .stderr(ChildStdio::Null);
+    cmd
+}
+
 /// The flags every launch on the browser profile `profile_dir` takes, headless or in a window
 /// ([`super::browser_window::window_args`]): the profile itself, the window's size, no first-run
 /// or default-browser prompt, no background work, and the profile's own password store and
@@ -2539,7 +2580,10 @@ impl BrowserChild {
     /// # Errors
     /// The child could not be waited for.
     pub fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let until = Instant::now() + self.grace;
+        let now = Instant::now();
+        let until = now
+            .checked_add(self.grace)
+            .unwrap_or_else(|| now + Duration::from_secs(3600));
         loop {
             if let Some(status) = self.child.try_wait()? {
                 return Ok(status);
@@ -3473,7 +3517,10 @@ fn load_seen_digests(seen_file: Option<&Path>) -> BTreeSet<String> {
     let Some(path) = seen_file else {
         return BTreeSet::new();
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = super::accounts::read_bounded(path, 4 * 1024 * 1024)
+        .ok()
+        .flatten()
+    else {
         return BTreeSet::new();
     };
     text.lines()
@@ -3493,11 +3540,14 @@ fn record_seen_digest(seen_file: Option<&Path>, seen: &mut BTreeSet<String>, dig
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Ok(mut f) = open.open(path) {
         let _ = writeln!(f, "{digest}");
     }
 }
@@ -4807,14 +4857,26 @@ fn scan_maildir_once(
             if exhausted {
                 tried.insert((path.clone(), len, mtime));
                 if mark_clicked && let Some(name) = path.file_name() {
+                    let write_marker = |target: &Path| {
+                        let mut open = std::fs::OpenOptions::new();
+                        open.write(true).create(true).truncate(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt as _;
+                            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                        }
+                        if let Ok(mut f) = open.open(target) {
+                            let _ = f.write_all(b"1\n");
+                        }
+                    };
                     let name_str = name.to_string_lossy();
                     let parent = path.parent().unwrap_or(mailbox_dir);
                     let marker = parent.join(format!("{name_str}.clicked"));
-                    let _ = std::fs::write(marker, b"1\n");
+                    write_marker(&marker);
                     if !mailbox_dir.is_file() && parent != mailbox_dir {
                         let base_name = name_str.split(":2,").next().unwrap_or(&name_str);
                         let root_marker = mailbox_dir.join(format!("{base_name}.clicked"));
-                        let _ = std::fs::write(root_marker, b"1\n");
+                        write_marker(&root_marker);
                     }
                 }
             }
@@ -4944,6 +5006,32 @@ fn poll_non_webmail_once(
     None
 }
 
+/// How often a mailbox poll reads a mailbox on this machine over the network (a local bridge, a
+/// test's server): often, as such a read costs no one anything.
+const LOOPBACK_POLL: Duration = Duration::from_millis(150);
+
+/// How often a mailbox poll reads a mailbox on another machine (a provider's IMAP server, an
+/// HTTP mailbox, the fleet's relay): each read is a new connection and login there, so it comes
+/// once every two seconds rather than several times a second, which a sign-in mail's wait of
+/// seconds does not notice and a provider's abuse limits do.
+const REMOTE_POLL: Duration = Duration::from_secs(2);
+
+/// The interval [`poll_mailbox_config_for_credential`] reads `cfg`'s network mailboxes for
+/// `target_email` at: [`LOOPBACK_POLL`] where every one it reads is on a loopback host, else
+/// [`REMOTE_POLL`].
+fn network_poll_interval(cfg: &MailboxConfig, target_email: Option<&str>) -> Duration {
+    let imap_here = cfg
+        .effective_imap_url(target_email)
+        .is_none_or(|url| parse_imap_url(&url).is_some_and(|imap| is_loopback_host(&imap.host)));
+    let http_here = cfg.http_url.as_deref().is_none_or(is_loopback_http_url);
+    let relay = cfg.relay_enabled && target_email.is_some();
+    if imap_here && http_here && !relay {
+        LOOPBACK_POLL
+    } else {
+        REMOTE_POLL
+    }
+}
+
 /// Poll `cfg` for either a magic link or a 6-digit OTP addressed to `target_email`.
 pub fn poll_mailbox_config_for_credential(
     cfg: &MailboxConfig,
@@ -4980,11 +5068,14 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
     // A mailbox reached over IMAP alone, whose login was refused (here or within its wait),
     // ends the poll at once with that reason instead of waiting out the timeout.
     let imap_alone = cfg.dir.is_none() && cfg.http_url.is_none() && !has_relay;
-    let deadline = Instant::now() + timeout;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let mut tried_files = BTreeSet::new();
     let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
     let mut last_network_poll: Option<Instant> = None;
-    let network_interval = Duration::from_millis(150);
+    let network_interval = network_poll_interval(cfg, target_email);
 
     loop {
         if let Some(dir) = cfg.dir.as_deref()
@@ -5903,7 +5994,10 @@ pub fn poll_webmail_via_cdp(
         return Err(super::mailbox_routes::refused_words(login));
     }
 
-    let deadline = Instant::now() + timeout;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let step_timeout = || deadline.saturating_duration_since(Instant::now());
 
     let target = cdp.call(
@@ -6323,7 +6417,10 @@ pub(super) fn drive_cdp_oauth_within(
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
         .or_else(|| extract_login_hint(authorize_url));
-    let deadline = Instant::now() + timeout;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let step_timeout = || deadline.saturating_duration_since(Instant::now());
 
     let target = cdp.call(
@@ -6608,7 +6705,7 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
     timeout: Duration,
     mut pending_credential: Option<MailboxCredential>,
 ) -> Result<(), &'static str> {
-    use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
+    use aterm_uds::spawnfd::spawn_with_two_fds;
     use std::os::fd::OwnedFd;
 
     let _flow = MailboxFlow::new(authorize_url)?;
@@ -6635,21 +6732,18 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
             let (out_read, out_write) =
                 std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
 
-            let mut cmd = LaneCommand::new(&browser.path);
-            cmd.args(headless_launch_args(&browser, profile_dir))
-                .stdin(ChildStdio::Null)
-                .stdout(ChildStdio::Null)
-                .stderr(ChildStdio::Null);
+            let cmd =
+                headless_browser_command(&browser, profile_dir, &|name| std::env::var_os(name));
 
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
-            let _ = super::browser_window::make_up_tidy(
-                &mut cdp,
-                profile_dir,
-                Instant::now() + super::browser_window::MAKE_UP_WITHIN,
-            );
+            let make_up_now = Instant::now();
+            let make_up_until = make_up_now
+                .checked_add(super::browser_window::MAKE_UP_WITHIN)
+                .unwrap_or_else(|| make_up_now + Duration::from_secs(60));
+            let _ = super::browser_window::make_up_tidy(&mut cdp, profile_dir, make_up_until);
             let mut seen_otps = BTreeSet::new();
 
             let t0 = Instant::now();
@@ -8306,7 +8400,7 @@ impl super::login_drive::Approver for VendorApprover {
         handoff: &super::login_drive::Handoff<'_>,
     ) -> super::login_drive::Approval {
         use super::login_drive::Approval;
-        use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
+        use aterm_uds::spawnfd::spawn_with_two_fds;
         use std::os::fd::OwnedFd;
         let bound = match FlowBound::of(handoff.url) {
             Ok(bound) => bound,
@@ -8346,21 +8440,20 @@ impl super::login_drive::Approver for VendorApprover {
                 std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
             let (out_read, out_write) =
                 std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
-            let mut cmd = LaneCommand::new(&browser.path);
-            cmd.args(headless_launch_args(&browser, profile_dir))
-                .stdin(ChildStdio::Null)
-                .stdout(ChildStdio::Null)
-                .stderr(ChildStdio::Null);
+            let cmd =
+                headless_browser_command(&browser, profile_dir, &|name| std::env::var_os(name));
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
+            let make_up_now = Instant::now();
+            let make_up_until = make_up_now
+                .checked_add(super::browser_window::MAKE_UP_WITHIN)
+                .unwrap_or(handoff.deadline);
             let _ = super::browser_window::make_up_tidy(
                 &mut cdp,
                 profile_dir,
-                handoff
-                    .deadline
-                    .min(Instant::now() + super::browser_window::MAKE_UP_WITHIN),
+                handoff.deadline.min(make_up_until),
             );
             let mut seen_otps = BTreeSet::new();
             let gate = Gate {

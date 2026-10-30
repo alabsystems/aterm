@@ -204,7 +204,8 @@ fn run(
         .env("HOME", &fx.home)
         .env("XDG_CONFIG_HOME", &fx.config_home)
         .env("PATH", path)
-        .env("ATPKG_TEST_HOOK", hook);
+        .env("ATPKG_TEST_HOOK", hook)
+        .env(atpkg::build_admit::LEDGER_ENV, fx.home.join("ledger"));
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -538,6 +539,7 @@ fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
             .env("HOME", &fx.home)
             .env("XDG_CONFIG_HOME", &fx.config_home)
             .env("PATH", &path)
+            .env(atpkg::build_admit::LEDGER_ENV, fx.home.join("ledger"))
             .output()
             .unwrap();
         (

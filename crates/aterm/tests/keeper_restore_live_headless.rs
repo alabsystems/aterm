@@ -323,9 +323,13 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
     );
 }
 
-/// One `turn` typed into the session at its prompt (`echo <marker>`, settled): its id.
+/// One `turn` typed into the session at its prompt (`echo <marker>`, settled): its id. The turn
+/// and each press's submit wait the hang detector, not the verb's 2 s submit window.
 fn drive_turn(ctl: &mut Ctl, marker: &str) -> u64 {
-    let (header, _) = ctl.counted(&format!("turn idle=200 timeout=30000 -- echo {marker}"));
+    let ms = HANG.as_millis();
+    let (header, _) = ctl.counted(&format!(
+        "turn idle=200 timeout={ms} submit_window={ms} -- echo {marker}"
+    ));
     let f = fields(&header);
     assert_eq!(f.get("status"), Some(&"settled"), "{header}");
     f.get("id")

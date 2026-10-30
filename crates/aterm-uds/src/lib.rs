@@ -110,6 +110,8 @@ pub mod ownerlock;
 pub mod partition;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
 pub mod peer;
+/// This Mac's sleep and wake as the system announces them (`IORegisterForSystemPower`), each handed to a handler on a thread of its own and a will-sleep acknowledged once the handler returned; elsewhere nothing is heard.
+pub mod power;
 /// Unix-only: strict private files, the user's own regular file directly in the user's own 0700 directory, with no second link, no symlink and no ACL grant (lifted from aterm-net's `fleet_member`).
 #[cfg(unix)]
 pub mod private_file;

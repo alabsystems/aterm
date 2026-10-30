@@ -286,6 +286,10 @@ pub struct Row {
     pub minted_at: u64,
     /// The last look that saw the agent's own work hold the move (`St::own_work_at`; `0`: none).
     pub own_work_at: u64,
+    /// How many times the agent was told what waits on this row's target, and when last
+    /// ([`upgrade::Step::Tell`]: `St::tells`, `St::told_at`; `0`: never).
+    pub agent_tells: u32,
+    pub agent_told_at: u64,
     /// A `/goal` was in force at the last look that read the screen (`St::goal`).
     pub goal: bool,
     /// The launch's relaunch line as the record planned it.
@@ -437,6 +441,8 @@ impl Row {
             },
             minted_at: st.salt,
             own_work_at: st.own_work_at,
+            agent_tells: if st.told_to == st.to { st.tells } else { 0 },
+            agent_told_at: if st.told_to == st.to { st.told_at } else { 0 },
             goal: st.goal,
             line: st.line.clone(),
             fresh: crate::harness::relaunch::starts_afresh(&st.cause),
@@ -1408,7 +1414,7 @@ impl Row {
             "upgrade tab={} session={} from={} to={}({}) phase={} pending_for={} wait={} \
              wait_for={wait_for} request={} next_round={next_round} stalled={} held_by={} \
              release={} rung={} looked={} by={} point={} guard={} watch_at={watch_at} cause={} \
-             told={}{refused}",
+             told={} agent_told={}{refused}",
             dash(&self.tab),
             dash(&self.session),
             dash(&self.from),
@@ -1429,6 +1435,7 @@ impl Row {
             dash(&self.guard),
             self.cause_word(now),
             word(&self.told_word(now)),
+            self.agent_told_word(now),
         )
     }
 
@@ -1480,6 +1487,8 @@ impl Row {
             ("refused", u64::from(self.refused)),
             ("refused_at", self.refused_at),
             ("limit_until", self.limit_until),
+            ("agent_tells", u64::from(self.agent_tells)),
+            ("agent_told_at", self.agent_told_at),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -1707,6 +1716,21 @@ impl Row {
         self.overdue_class(now).word()
     }
 
+    /// The agent's tells on this row's target ([`Self::agent_tells`]): `-`, or how many of the
+    /// most and how long since the last.
+    fn agent_told_word(&self, now: u64) -> String {
+        if self.agent_tells == 0 {
+            "-".to_string()
+        } else {
+            format!(
+                "{}/{}@{}",
+                self.agent_tells,
+                upgrade::MAX_TELLS,
+                upgrade::span(now.saturating_sub(self.agent_told_at))
+            )
+        }
+    }
+
     fn told_word(&self, now: u64) -> String {
         match self.attention(now) {
             Attention::Quiet => "-".to_string(),
@@ -1719,7 +1743,7 @@ impl Row {
 
 /// What holds a wait, by class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WaitClass {
+pub(super) enum WaitClass {
     /// The agent's own work.
     OwnWork,
     /// A person: a box, a draft, a login, a person at the tab, a hold.
@@ -1765,7 +1789,7 @@ impl WaitClass {
     }
 }
 
-fn wait_class(wait: &str) -> WaitClass {
+pub(super) fn wait_class(wait: &str) -> WaitClass {
     let wait = wait.strip_prefix("release:").unwrap_or(wait);
     let head = wait.split_once(':').map_or(wait, |(head, _)| head);
     match (head, wait) {
@@ -2457,6 +2481,8 @@ impl Row {
             "End its /goal and that work in the tab when it suits you"
         } else if self.goal {
             "End its /goal in the tab when it suits you"
+        } else if self.agent_tells > 0 {
+            "aterm told the agent, and it moves once none of its own work runs"
         } else if holders > 0 || breaking {
             "Stop that work in the tab when it suits you"
         } else {
@@ -4800,6 +4826,7 @@ impl View {
                 land: false,
                 press: None,
                 timings: crate::harness::Timings::for_build(),
+                tell: crate::harness::upgrade_drive::Tell::Off,
             };
             self.mark(&opts, &BTreeMap::new());
         }
@@ -4964,14 +4991,7 @@ pub fn word_marker(state: &Path) -> std::path::PathBuf {
 
 fn announce_word(opts: &Opts, now: u64) {
     let path = word_marker(&opts.state);
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(dir);
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, format!("{now}\n")).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = crate::harness::upgrade_models::write_atomic(&path, &format!("{now}\n"));
 }
 
 #[cfg(all(test, unix))]

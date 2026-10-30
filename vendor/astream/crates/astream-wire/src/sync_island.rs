@@ -272,4 +272,13 @@ clean {
 
     def sync_within_capacity_isl (retained : UInt64) (capacity : UInt64) : Bool :=
       decide (retained < capacity)
+
+    def clamp_le_unfulfilled_isl (v : UInt64) (hi : UInt64) : UInt64 :=
+      if hi < v then hi else v
+
+    def sync_sequence_follows_prop (previous : UInt64) (next : UInt64) : Prop :=
+      previous < 18446744073709551615 ∧ UInt64.toNat next = Nat.succ (UInt64.toNat previous)
+
+    def sync_discharge_isl (unfulfilled : Nat) : Nat :=
+      Nat.pred unfulfilled
 }

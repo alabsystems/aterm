@@ -18,6 +18,8 @@ use aterm_types::fabric_grammar::{
 
 use aterm_gui_timing::now_ms;
 
+pub mod fleet_mail;
+
 /// What the fabric needs of a session.
 pub trait FabricSession: Send + Sync {
     fn self_id(&self) -> &SessionId;
@@ -28,6 +30,10 @@ pub trait FabricSession: Send + Sync {
     /// Tell the presence band this session's mail or hold moved.
     fn fabric_changed(&self);
     fn holder_token(&self) -> Option<String>;
+    /// Stable private storage for this session's direct fleet mail; absent in inert contexts.
+    fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
@@ -45,6 +51,9 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
     }
     fn holder_token(&self) -> Option<String> {
         (**self).holder_token()
+    }
+    fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
+        (**self).fleet_mail_path()
     }
 }
 
@@ -64,6 +73,14 @@ pub trait Timeline {
 /// ([`FabricSession::record_fact`]), so nothing parses a timeline payload back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FabricFact<'a> {
+    /// A newly persisted direct arrival. `id` is in the independent `fN` namespace.
+    FleetMailIn {
+        id: u64,
+        kind: &'a str,
+        from: &'a str,
+    },
+    /// A direct arrival was answered or explicitly retired by its recipient.
+    FleetMailSeen { id: u64 },
     /// A row delivered to this session's inbox.
     MailIn {
         kind: &'a str,
@@ -374,7 +391,7 @@ impl InboxRow {
 pub fn sender_class(from: &str) -> &'static str {
     if from.starts_with("h-") {
         "human"
-    } else if from.starts_with("s-") {
+    } else if from.starts_with("s-") || from.starts_with("fleet:") {
         "agent"
     } else if from.starts_with("a-") {
         "service"
@@ -395,6 +412,15 @@ pub struct MailFilter {
 }
 
 impl MailFilter {
+    fn wants_direct(&self, row: &fleet_mail::Notice) -> bool {
+        self.topic.is_none()
+            && (self.kinds.is_empty() || self.kinds.contains(&row.kind))
+            && self
+                .from
+                .as_ref()
+                .is_none_or(|f| f == &row.from || f == "agent")
+    }
+
     fn wants(&self, row: &InboxRow) -> bool {
         if !self.kinds.is_empty() && !self.kinds.contains(&row.kind) {
             return false;
@@ -703,6 +729,8 @@ fn caller_sized_bytes(body: &str, via: Option<&str>) -> usize {
 #[derive(Default)]
 #[doc(hidden)]
 pub struct Inbox {
+    /// A body-free copy of the durable direct mailbox, maintained on worker lanes.
+    direct_mail: fleet_mail::Metadata,
     pub rows: VecDeque<InboxRow>,
     pub posts: VecDeque<PostRow>,
     outbox_turn: u64,
@@ -1387,6 +1415,7 @@ pub struct TopicEntry {
 pub struct SessionFabric {
     inbox: Mutex<Inbox>,
     changed: Condvar,
+    direct_epoch: AtomicU64,
     topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
     hold_serial: std::sync::atomic::AtomicU64,
     person_refusals: AtomicU64,
@@ -1490,6 +1519,30 @@ impl SessionFabric {
     #[must_use]
     pub fn last_msg_id(&self) -> u64 {
         self.lock().last_msg_id
+    }
+
+    /// Cached direct arrivals newer than the independent direct cursor. No storage I/O.
+    pub fn direct_mail_since(
+        &self,
+        after: u64,
+        want: &MailFilter,
+    ) -> (u64, Vec<fleet_mail::Notice>) {
+        let inbox = self.lock();
+        (
+            inbox.direct_mail.high,
+            inbox
+                .direct_mail
+                .rows
+                .iter()
+                .filter(|row| row.id > after && want.wants_direct(row))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The direct mailbox's cached high-water mark, independently of broker ids.
+    pub fn last_direct_mail_id(&self) -> u64 {
+        self.lock().direct_mail.high
     }
 
     /// The topics this session opted into with each one's `since=` token, in topic order.
@@ -2106,37 +2159,52 @@ impl SessionFabric {
     pub fn mail_facts(&self) -> aterm_messages::presence::MailFacts {
         let inbox = self.lock();
         let seen = inbox.seen;
-        let unread = inbox.rows.iter().filter(|r| r.id > seen).count() as u64;
+        let mut direct_unread = inbox.direct_mail.rows.iter().filter(|r| !r.replied);
+        let unread = inbox.rows.iter().filter(|r| r.id > seen).count() as u64
+            + direct_unread.clone().count() as u64;
         let pending = inbox
             .rows
             .iter()
             .filter(|r| r.id > seen && r.listed)
-            .count() as u64;
+            .count() as u64
+            + direct_unread.clone().filter(|r| r.listed).count() as u64;
         let queued = inbox
             .posts
             .iter()
             .filter(|p| p.off.is_none() && !p.dead)
             .count() as u64;
         let is_unread = |r: &&InboxRow| r.id > seen;
-        let last = inbox
-            .rows
-            .iter()
+        let direct_last = direct_unread
+            .clone()
             .rev()
-            .filter(is_unread)
             .find(|r| r.kind == "task" || r.kind == "ask")
-            .or_else(|| inbox.rows.iter().rev().find(is_unread))
+            .or_else(|| direct_unread.next_back())
             .map(|r| aterm_messages::presence::MailLast {
                 kind: r.kind.clone(),
                 from: r.from.clone(),
-                trust: r.trust.clone(),
+                trust: "agent".to_owned(),
             });
+        let last = direct_last.or_else(|| {
+            inbox
+                .rows
+                .iter()
+                .rev()
+                .filter(is_unread)
+                .find(|r| r.kind == "task" || r.kind == "ask")
+                .or_else(|| inbox.rows.iter().rev().find(is_unread))
+                .map(|r| aterm_messages::presence::MailLast {
+                    kind: r.kind.clone(),
+                    from: r.from.clone(),
+                    trust: r.trust.clone(),
+                })
+        });
         aterm_messages::presence::MailFacts {
             unread,
             pending,
             dropped: inbox.dropped,
             queued,
             last,
-            head: inbox.rows.back().map_or(0, |r| r.id),
+            head: inbox.last_msg_id.saturating_add(inbox.direct_mail.high),
         }
     }
 
@@ -3657,43 +3725,16 @@ fn standing_refusal(ctx: &dyn FabricSession) -> Option<(String, String)> {
     Some((halted(ctx, &holds, &hold, None), hold.origin))
 }
 
-/// Whose `peers rm` of a remote hold's node ends what lets it drive this session's Mac
-/// ([`on_rm_lifts`]), which the hold's refusal names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RmLifts {
-    /// This Mac's own: a grant here names the node, or this Mac's own book binds it.
-    Here,
-    /// Only the fleet's issuer's: the `"*"` grant here admits the node, which this Mac's copy of
-    /// the issuer's book binds, so it follows that `peers rm` once it reads that book again.
-    Issuer,
-}
-
-static RM_LIFTS: std::sync::OnceLock<fn(&str) -> RmLifts> = std::sync::OnceLock::new();
-
-/// Have each remote hold's refusal ask `hook` whose `peers rm` of its node lifts it.
-pub fn on_rm_lifts(hook: fn(&str) -> RmLifts) {
-    let _ = RM_LIFTS.set(hook);
-}
-
-/// What lifts the remote hold of `node` (shown as `host`) on session `sid`, `rm` naming whose
-/// `peers rm` of the node does once it left the fleet. The node is named whole, as a member's
-/// `peers rm` takes the issuer it can no longer read.
-fn remote_lifts(sid: &str, host: &str, node: &str, rm: RmLifts) -> String {
+/// What lifts the remote hold of `node` (shown as `host`) on session `sid`. Peer removal
+/// drops named grants locally; signed membership can return through another member's book.
+fn remote_lifts(sid: &str, host: &str, node: &str) -> String {
     let off = format!("`aterm ctl --host <this session's Mac> hold {sid} off` run on {host}");
-    match rm {
-        RmLifts::Here => format!(
-            "{off}, or the person at this session's Mac (Take Over, a lower `aterm fleet allow` \
-             there, or `aterm fleet peers rm {node}` there once that node left the fleet), lifts \
-             it"
-        ),
-        RmLifts::Issuer => format!(
-            "{off}, or the person at this session's Mac (Take Over, or a lower `aterm fleet allow` \
-             there), lifts it; once that node left the fleet, so does `aterm fleet peers rm \
-             {node}` on the fleet's issuer (the \"*\" grant there lets every member the issuer's \
-             book binds drive), once this session's Mac reads that book again (`aterm fleet \
-             peers` there reads it now)"
-        ),
-    }
+    format!(
+        "{off}, or the person at this session's Mac (Take Over then Hand Back, or `aterm fleet \
+         allow content` there), lifts it; `aterm fleet peers rm {node}` on this session's Mac \
+         also drops grants naming that node, but an all-member grant can admit a valid signed entry \
+         merged back from another member's book"
+    )
 }
 
 /// The `ERR halted` line of `hold`, one of `holds`: a remote one names who holds it and what
@@ -3703,8 +3744,7 @@ fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Ho
         Some(remote) => {
             let (host, sid) = (&remote.host, ctx.self_id().as_str());
             let (node, short) = (&remote.node, remote.node.get(..8).unwrap_or(&remote.node));
-            let rm = RM_LIFTS.get().map_or(RmLifts::Here, |hook| hook(node));
-            let lifts = remote_lifts(sid, host, node, rm);
+            let lifts = remote_lifts(sid, host, node);
             match found {
                 Some(Holder::Drives) => format!(
                     " (held by {host} over the fleet, which still drives this session's Mac: \
@@ -5504,9 +5544,27 @@ const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta]
 
 /// `inbox` — the whole keyword, sub-forms included.
 pub fn cmd_inbox_verb(ctx: &dyn FabricSession, rest: &str) -> String {
+    if serving_driver().is_some() {
+        if let Some(word) = rest.strip_prefix("seen ") {
+            return fleet_mail::acknowledge(ctx, word);
+        }
+        return fleet_mail::inbox(
+            ctx,
+            rest.strip_prefix("fleet").unwrap_or(rest).trim(),
+            false,
+        );
+    }
     match rest.split_once(' ') {
+        Some(("fleet", tail)) => fleet_mail::inbox(ctx, tail, false),
+        Some(("seen", tail)) if tail.starts_with('f') => {
+            match tail.split_whitespace().collect::<Vec<_>>().as_slice() {
+                [id, "forget"] => fleet_mail::forget(ctx, id),
+                _ => "ERR usage: inbox seen f<id> forget\n".to_owned(),
+            }
+        }
         Some(("get", tail)) => cmd_inbox_get(ctx, tail),
         Some(("seen", tail)) => cmd_inbox_seen(ctx, tail),
+        _ if rest.trim() == "fleet" => fleet_mail::inbox(ctx, "", false),
         _ if matches!(rest.trim(), "get" | "seen") => INBOX_USAGE.to_string(),
         _ => cmd_inbox(ctx, rest),
     }
@@ -5540,15 +5598,21 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
         }
     }
 
+    let (direct, direct_unavailable) = match fleet_mail::view(ctx, rest, true) {
+        Ok(view) => (view, false),
+        Err(_) => (fleet_mail::View::default(), true),
+    };
     let holder = holder_token(ctx);
     let mut inbox = ctx.fabric().lock();
     let hold_flag = u8::from(inbox.holds.is_held());
     let selected = inbox.rows.iter().filter(|r| r.id > since).count();
-    let mut skip = limit.map_or(0, |n| selected.saturating_sub(n));
+    let mut skip = limit.map_or(0, |n| {
+        selected.saturating_sub(n.saturating_sub(direct.count))
+    });
 
     let mut body = String::new();
     let mut sent = 0usize;
-    let mut pending = 0usize;
+    let mut pending = direct.pending;
     for row in &mut inbox.rows {
         let mut kept = row.id > since;
         if kept && skip > 0 {
@@ -5585,11 +5649,16 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
     let oldest = inbox
         .oldest_on_bus
         .map_or_else(|| "-".to_string(), |o| format!("@{o}"));
+    sent += direct.count;
+    body.push_str(&direct.text);
     let mut out = format!(
         "OK {sent} hold={hold_flag} holder={holder} seen={} bus_head={} oldest_on_bus={oldest} \
          dropped={} pending={pending}",
         inbox.seen, inbox.bus_head, inbox.dropped,
     );
+    if direct_unavailable {
+        out.push_str(" fleet_error=unavailable");
+    }
     if let Some(g) = inbox.given_up {
         let _ = write!(out, " given_up=@{}..@{}", g.from, g.to);
         if let Some(n) = g.records {
@@ -5901,6 +5970,13 @@ const WAIT_MAX_MS: u64 = 600_000;
 /// `post` — queue one outbound message and, for the kinds that need a correlation id, wait for
 /// the offset it landed at.
 pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> String {
+    if serving_driver().is_some() || fleet_mail::is_reply(rest) {
+        return if body.is_none() {
+            fleet_mail::post(ctx, rest)
+        } else {
+            "ERR usage: direct fleet mail uses inline text\n".to_owned()
+        };
+    }
     let mut to: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut re: Option<u64> = None;
@@ -6209,19 +6285,32 @@ fn wait_is_futile() -> bool {
 /// `await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] | await inbox re=<off> [since=<id>]
 /// [kinds=<k|hold,...>] [topic=<t>]` (the caller strips `timeout=<ms>`).
 pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) -> String {
-    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] \
+    const USAGE: &str = "ERR usage: await inbox since=<id|f-id> [fleet_since=f<id>] [kinds=<k|hold,...>] [topic=<t>] \
                          [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] \
                          [topic=<t>] [timeout=<ms>]\n";
     let mut since: Option<u64> = None;
+    let mut fleet_since = 0;
+    let mut direct_only = false;
     let mut re: Option<u64> = None;
     let mut kinds: Option<Vec<String>> = None;
     let mut topic: Option<String> = None;
     for tok in args {
         if let Some(v) = kv(tok, "since") {
+            if let Some(value) = v.strip_prefix('f').and_then(|s| s.parse().ok()) {
+                fleet_since = value;
+                direct_only = true;
+                since = Some(0);
+                continue;
+            }
             match v.parse() {
                 Ok(n) => since = Some(n),
                 Err(_) => return USAGE.to_string(),
             }
+        } else if let Some(value) = kv(tok, "fleet_since")
+            .and_then(|s| s.strip_prefix('f'))
+            .and_then(|s| s.parse().ok())
+        {
+            fleet_since = value;
         } else if let Some(v) = kv(tok, "re") {
             match parse_bus_offset(v) {
                 Some(n) => re = Some(n),
@@ -6252,6 +6341,9 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         (None, Some(_)) => 0,
         (None, None) => return USAGE.to_string(),
     };
+    if direct_only && (re.is_some() || topic.is_some()) {
+        return USAGE.to_owned();
+    }
     let watch_hold = kinds
         .as_ref()
         .is_some_and(|k| k.iter().any(|k| k == "hold"));
@@ -6274,6 +6366,17 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
     let hold_at_arm = guard.holds.is_held();
     let named = re.map(|off| guard.watch(off, true));
     loop {
+        let epoch = ctx.fabric().direct_epoch.load(Ordering::Acquire);
+        drop(guard);
+        let direct = if re.is_none() && topic.is_none() {
+            fleet_mail::pending(ctx, fleet_since, accepts)
+        } else {
+            Ok(None)
+        };
+        guard = ctx.fabric().lock();
+        if epoch != ctx.fabric().direct_epoch.load(Ordering::Acquire) {
+            continue;
+        }
         // The named post's record must still be on the log (a moved generation below the fork
         // keeps it).
         if let Some(post) = &named
@@ -6281,8 +6384,18 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         {
             return format!("ERR log-replaced re={}\n", post.off);
         }
-        if let Some(id) = guard.rows.iter().filter(|r| latches(r)).map(|r| r.id).max() {
+        if !direct_only
+            && let Some(id) = guard.rows.iter().filter(|r| latches(r)).map(|r| r.id).max()
+        {
             return format!("OK inbox {id}\n");
+        }
+        let direct = match direct {
+            Ok(pending) => pending,
+            Err(why) if direct_only => return fleet_mail::refusal(why),
+            Err(_) => None,
+        };
+        if let Some(id) = direct {
+            return format!("OK inbox {} fleet=f{id}\n", guard.last_msg_id);
         }
         if watch_hold && guard.holds.is_held() != hold_at_arm {
             return format!("OK inbox hold={}\n", u8::from(guard.holds.is_held()));
@@ -6296,10 +6409,17 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         if std::time::Instant::now() >= deadline {
             return "OK timeout\n".to_string();
         }
+        // Another aterm process may own the same durable mailbox during handoff. Its
+        // writes cannot signal this process's condvar, so recheck the file periodically.
+        let wake = if re.is_none() && topic.is_none() && ctx.fleet_mail_path().is_some() {
+            deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        } else {
+            deadline
+        };
         guard = aterm_control::park::park_guarded(
             &ctx.fabric().changed,
             guard,
-            deadline,
+            wake,
             aterm_control::park::Lane::SERVED,
         );
     }
@@ -6379,6 +6499,10 @@ mod test_support {
     pub(crate) fn said(fact: FabricFact<'_>) -> String {
         let or_dash = |n: Option<u64>| n.map_or_else(|| "-".to_string(), |n| n.to_string());
         match fact {
+            FabricFact::FleetMailIn { id, kind, from } => {
+                format!("f{id} from={from} kind={kind}")
+            }
+            FabricFact::FleetMailSeen { id } => format!("f{id} moved=1"),
             FabricFact::MailIn {
                 kind,
                 from,

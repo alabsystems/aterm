@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use aterm_toolchain::build_cache::noindex;
 
 use crate::Ctx;
+use crate::memory::StageKey as _;
 use crate::scope::Scope;
 
 /// Target directory name under `<root>/libc-oracle` ([`Lane::LibcOracleTarget`]).

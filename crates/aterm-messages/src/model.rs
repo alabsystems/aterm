@@ -414,6 +414,21 @@ pub enum Intent {
         /// The request's handle on this member's desk.
         request: u64,
     },
+    /// "Allow again" the Mac this member's desk heard as `request`, which a member's removal
+    /// took out (`docs/DESIGN-fluid-swarm-2026-10-28.md` F16): the phrase shows as for
+    /// [`Intent::AllowJoin`], and the run restores the Mac. A person's own press on this Mac's
+    /// screen only ([`Intent::person_only`]), never a row's primary ([`Intent::never_default`]).
+    AllowJoinAgain {
+        /// The request's handle on this member's desk.
+        request: u64,
+    },
+    /// Sign this Mac's share of the quorum `Remove` that undoes the removals of the Mac whose
+    /// join code is `remover` (F16's "Undo m7's removals?"). A person's own press only, never a
+    /// row's primary.
+    UndoRemovals {
+        /// The remover's join code (`xxxx-xxxx-xxxx-xxxx`).
+        remover: String,
+    },
     /// Restart one of macOS's own services that holds far too much memory, in a tab that asks
     /// for the administrator's password once (`aterm_vitals::services::RESTARTS`).
     RestartService {
@@ -486,6 +501,8 @@ impl Intent {
             Self::ApproveJoin { .. } => "Approve",
             Self::AllowJoin { .. } => "Allow",
             Self::IgnoreJoin { .. } => "Ignore",
+            Self::AllowJoinAgain { .. } => "Allow again",
+            Self::UndoRemovals { .. } => "Undo removals",
             Self::RestartService { .. } => "Restart",
         }
     }
@@ -523,18 +540,25 @@ impl Intent {
             Self::EndRecovered => "End",
             Self::ReviewVaultSync => "System",
             Self::ApproveJoin { .. } => "Approve",
-            Self::AllowJoin { .. } => "Allow",
+            Self::AllowJoin { .. } | Self::AllowJoinAgain { .. } => "Allow",
             Self::IgnoreJoin { .. } => "Ignore",
+            Self::UndoRemovals { .. } => "Undo",
             Self::RestartService { .. } => "Restart",
         }
     }
 
     /// An intent pressed only by name, never a row's primary or default button: letting a
-    /// machine into the vault is a person's reading of its code, not a reflex.
+    /// machine into the vault, or back in, is a person's reading of its code, not a reflex.
     #[inline]
     #[must_use]
     pub const fn never_default(&self) -> bool {
-        matches!(self, Self::ApproveJoin { .. } | Self::AllowJoin { .. })
+        matches!(
+            self,
+            Self::ApproveJoin { .. }
+                | Self::AllowJoin { .. }
+                | Self::AllowJoinAgain { .. }
+                | Self::UndoRemovals { .. }
+        )
     }
 
     /// An intent only a person's own input on this Mac may press: `notice act`, a fleet drive
@@ -543,7 +567,10 @@ impl Intent {
     #[inline]
     #[must_use]
     pub const fn person_only(&self) -> bool {
-        matches!(self, Self::AllowJoin { .. })
+        matches!(
+            self,
+            Self::AllowJoin { .. } | Self::AllowJoinAgain { .. } | Self::UndoRemovals { .. }
+        )
     }
 
     /// Only `NotNow` closes its row.
@@ -654,6 +681,10 @@ impl Intent {
             }
             Self::AllowJoin { request } => format!("allow-join:{request}"),
             Self::IgnoreJoin { request } => format!("ignore-join:{request}"),
+            Self::AllowJoinAgain { request } => format!("allow-join-again:{request}"),
+            Self::UndoRemovals { remover } => {
+                format!("undo-removals:{}", escape_payload(remover))
+            }
             Self::RestartService { service } => {
                 format!("restart-service:{}", escape_payload(service))
             }
@@ -735,6 +766,13 @@ impl Intent {
             "ignore-join" => Some(Self::IgnoreJoin {
                 request: payload.parse().ok()?,
             }),
+            "allow-join-again" => Some(Self::AllowJoinAgain {
+                request: payload.parse().ok()?,
+            }),
+            "undo-removals" => {
+                let remover = unescape_payload(payload);
+                remover_word(&remover).then_some(Self::UndoRemovals { remover })
+            }
             "restart-service" => {
                 let service = unescape_payload(payload);
                 service_name(&service).then_some(Self::RestartService { service })
@@ -763,6 +801,15 @@ pub fn service_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether `word` can name the remover an [`Intent::UndoRemovals`] carries: its join code or
+/// label, 1 to 64 bytes of lowercase letters, digits and `-`.
+fn remover_word(word: &str) -> bool {
+    (1..=64).contains(&word.len())
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn escape_field(s: &str) -> String {
@@ -843,6 +890,10 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         },
         Intent::AllowJoin { request: 7 },
         Intent::IgnoreJoin { request: 7 },
+        Intent::AllowJoinAgain { request: 7 },
+        Intent::UndoRemovals {
+            remover: "abcd-efgh-ijkl-mn23".into(),
+        },
         Intent::RestartService {
             service: "fseventsd".into(),
         },

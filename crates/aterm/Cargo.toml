@@ -129,6 +129,7 @@ libc = { workspace = true }
 dev-seams = [
     "aterm-agent/dev-seams",
     "aterm-cli/dev-seams",
+    "aterm-ctl/dev-seams",
     "aterm-gui/dev-seams",
     "aterm-link/dev-seams",
     "aterm-update/dev-seams",

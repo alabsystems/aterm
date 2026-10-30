@@ -156,6 +156,16 @@ impl ReleaseCredentials {
         let identity_sha1 = credentials_value(&text, "signing_identity_sha1")
             .map_err(|e| format!("{}: {e}", path.display()))?
             .map(str::to_string);
+        #[cfg(unix)]
+        let identity_sha1 = if let Some(home) = home {
+            let paths = aterm_secrets::client::Paths::for_home(home);
+            aterm_secrets::client::release::effective_signing_identity(&paths, path)
+                .ok()
+                .flatten()
+                .or(identity_sha1)
+        } else {
+            identity_sha1
+        };
         let machine_id = credentials_value(&text, "machine_id")
             .map_err(|e| format!("{}: {e}", path.display()))?
             .map(str::to_string);
@@ -590,6 +600,11 @@ pub fn sign_app(
 ) -> Result<String, String> {
     let signed_by = match sign_id {
         Some(id) => {
+            #[cfg(unix)]
+            let _lease = {
+                let home = std::env::var_os("HOME").ok_or("HOME is missing for signing")?;
+                aterm_secrets::release_keychain::wait_signing_lease(Path::new(&home))?
+            };
             println!(
                 "==> codesign (Developer-ID, hardened runtime + entitlements): {}",
                 id.common_name
@@ -625,6 +640,11 @@ pub fn sign_app(
 
 /// Sign the DMG.
 pub fn sign_dmg(dmg: &Path, sign_id: &DevIdIdentity) -> Result<(), String> {
+    #[cfg(unix)]
+    let _lease = {
+        let home = std::env::var_os("HOME").ok_or("HOME is missing for signing")?;
+        aterm_secrets::release_keychain::wait_signing_lease(Path::new(&home))?
+    };
     println!("==> codesign dmg (Developer-ID): {}", sign_id.common_name);
     run_checked(
         Command::new(CODESIGN).args(dmg_sign_args(dmg, sign_id)),

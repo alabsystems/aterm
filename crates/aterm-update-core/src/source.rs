@@ -35,7 +35,7 @@ impl Source {
     #[must_use]
     pub fn resolve_with(dev_seams: bool, cfg_owner: Option<&str>, cfg_repo: Option<&str>) -> Self {
         if !dev_seams {
-            if cfg_owner.or(cfg_repo).is_some_and(|v| !v.trim().is_empty()) {
+            if has_nonempty_repoint(cfg_owner, cfg_repo) {
                 note_ignored_repoint();
             }
             return Self {
@@ -48,6 +48,11 @@ impl Source {
             repo: pick_slug("[update] repo", cfg_repo, DEFAULT_REPO),
         }
     }
+}
+
+fn has_nonempty_repoint(cfg_owner: Option<&str>, cfg_repo: Option<&str>) -> bool {
+    cfg_owner.is_some_and(|v| !v.trim().is_empty())
+        || cfg_repo.is_some_and(|v| !v.trim().is_empty())
 }
 
 fn note_ignored_repoint() {
@@ -215,5 +220,11 @@ mod tests {
         );
         let half = Source::resolve_with(true, Some("fork-owner"), None);
         assert_eq!(half.repo, DEFAULT_REPO);
+
+        assert!(has_nonempty_repoint(Some(""), Some("fork-repo")));
+        assert!(has_nonempty_repoint(Some("   "), Some("fork-repo")));
+        assert!(has_nonempty_repoint(Some("fork-owner"), Some("")));
+        assert!(!has_nonempty_repoint(Some(""), Some("   ")));
+        assert!(!has_nonempty_repoint(None, None));
     }
 }

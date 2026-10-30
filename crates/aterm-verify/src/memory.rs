@@ -28,29 +28,24 @@
 
 use std::cell::RefCell;
 use std::fmt;
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-
-use serde::{Deserialize, Serialize};
 
 use crate::plan::{Lane, StageId, StageSpec};
 use crate::scope::Scope;
 
-/// The peaks one record keeps, newest last.
-pub const KEPT: usize = 8;
+/// The record's peaks, schema and size, and the record itself, lifted into `aterm_capacity`'s
+/// book so a plain build reads verify's records as its analogue
+/// ([`aterm_capacity::book::chain`]): what verify keeps and reads is unchanged.
+pub use aterm_capacity::book::{KEPT, Learned, Peak, ROWS_KEPT, Records, Row, SCHEMA};
 
-/// The records the file keeps: past this, the one whose newest peak is oldest goes, so change
-/// cones that never come back do not grow it without end.
-pub const ROWS_KEPT: usize = 512;
-
-/// The records' schema: 2 keys each record by its checkout and variant as well ([`Key`]); a file
-/// of schema 1, keyed by the stage and selection alone, is read as none, and the next keep
-/// writes schema 2 over it.
-pub const SCHEMA: u64 = 2;
+/// What a record is kept for ([`StageKey::of_run`]): a stage, the checkout it ran in, the run's
+/// crate selection, sorted, where the stage reads it, and what else of the run changes its work.
+pub use aterm_capacity::book::Key;
 
 /// The record's file under this user's aterm state directory ([`Book::live`]).
-pub const RECORD: &str = "verify/stage-memory.json";
+pub const RECORD: &str = aterm_capacity::book::VERIFY_RECORD;
 
 /// Whether stage `id` compiles, and so claims [`aterm_capacity::cold_claim`] until a run of it is
 /// measured: each such stage runs a cargo or rustdoc build of its own (a test, lint, doctest,
@@ -228,23 +223,39 @@ impl Drop for Metering {
     }
 }
 
-/// WHAT A RECORD IS KEPT FOR: a stage, the checkout it ran in, the run's crate selection, sorted,
-/// where the stage reads it, and what else of the run changes its work ([`Key::of_run`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Key {
-    /// The stage, by its [`StageId`]'s name.
-    pub stage: String,
-    /// The checkout's root, as the run named it: each builds into a cache of its own.
-    pub checkout: String,
-    /// The selection's crates (`-p`'s, or the change cone's), sorted and without repeats;
-    /// `None` for the whole workspace, which holds every selection, and for a stage whose work
-    /// is the same whatever is selected ([`reads_selection`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub crates: Option<Vec<String>>,
-    /// What else of the run changes the stage's work: the test binaries run at once for the test
-    /// run (`jobs 4`), the cells asked for (`cells linux-arm win`) or pulled (`cells pulled`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub variant: Option<String>,
+thread_local! {
+    /// The cover marker of the memory claim of the stage this thread runs ([`covering`]).
+    static COVER: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
+}
+
+/// The cover marker ([`aterm_capacity::COVER_ENV`]) of the memory claim the stage this thread
+/// runs holds, which each child it spawns is handed ([`crate::exec::run`]) over the run's
+/// [`aterm_capacity::NO_COVER`]; `None` outside a stage that holds one.
+#[must_use]
+pub fn cover() -> Option<Arc<str>> {
+    COVER.with(|c| c.borrow().clone())
+}
+
+/// This thread's stage cover marker ([`cover`]) until the answer drops, when the one before comes
+/// back.
+#[must_use = "the marker is this thread's only while the guard lives"]
+pub struct Covering {
+    before: Option<Arc<str>>,
+}
+
+/// Make `marker` this thread's stage cover marker ([`cover`]) until the answer drops: a stage's
+/// own thread, and each worker thread it hands children to, as [`metering`] does its meter.
+pub fn covering(marker: Option<Arc<str>>) -> Covering {
+    Covering {
+        before: COVER.with(|c| c.replace(marker)),
+    }
+}
+
+impl Drop for Covering {
+    fn drop(&mut self) {
+        let before = self.before.take();
+        COVER.with(|c| *c.borrow_mut() = before);
+    }
 }
 
 /// Whether stage `id` does work that depends on the run's crate selection, with cells pulled by
@@ -263,11 +274,20 @@ pub const fn reads_selection(id: StageId, cells_pulled: bool) -> bool {
     }
 }
 
-impl Key {
+/// The keys of verify's stages ([`Key`] is the book's: `aterm_capacity::book`).
+pub trait StageKey {
     /// The key of stage `id` run over `scope` in a checkout named nothing, with no variant: what
     /// a test that reads one record at a time sets.
-    #[must_use]
-    pub fn of(id: StageId, scope: &Scope) -> Key {
+    fn of(id: StageId, scope: &Scope) -> Key;
+
+    /// The key of stage `id` in the run `ctx`: its checkout ([`crate::Ctx::root`]), its
+    /// selection where the stage reads it ([`reads_selection`]), and its variant: the requested
+    /// test binaries at once for the test run, the cells for the cells lane's stages.
+    fn of_run(id: StageId, ctx: &crate::Ctx) -> Key;
+}
+
+impl StageKey for Key {
+    fn of(id: StageId, scope: &Scope) -> Key {
         Key {
             stage: format!("{id:?}"),
             checkout: String::new(),
@@ -281,11 +301,7 @@ impl Key {
         }
     }
 
-    /// The key of stage `id` in the run `ctx`: its checkout ([`crate::Ctx::root`]), its
-    /// selection where the stage reads it ([`reads_selection`]), and its variant: the requested
-    /// test binaries at once for the test run, the cells for the cells lane's stages.
-    #[must_use]
-    pub fn of_run(id: StageId, ctx: &crate::Ctx) -> Key {
+    fn of_run(id: StageId, ctx: &crate::Ctx) -> Key {
         let mut key = if reads_selection(id, ctx.cells_pulled) {
             Key::of(id, &ctx.scope)
         } else {
@@ -312,197 +328,6 @@ impl Key {
         };
         key
     }
-
-    /// Whether this key's selection holds `other`'s, for the same stage, checkout and variant:
-    /// the workspace holds every selection, and a list holds one whose every crate it names.
-    #[must_use]
-    pub fn holds(&self, other: &Key) -> bool {
-        self.stage == other.stage
-            && self.checkout == other.checkout
-            && self.variant == other.variant
-            && match (&self.crates, &other.crates) {
-                (None, _) => true,
-                (Some(_), None) => false,
-                (Some(mine), Some(theirs)) => theirs.iter().all(|c| mine.contains(c)),
-            }
-    }
-
-    /// The selection as a person reads it: `the workspace`, or `-p a -p b`.
-    #[must_use]
-    pub fn selection(&self) -> String {
-        match &self.crates {
-            None => "the workspace".to_owned(),
-            Some(c) if c.is_empty() => "no crate".to_owned(),
-            Some(c) => c
-                .iter()
-                .map(|n| format!("-p {n}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-}
-
-/// One stage's measured peak.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Peak {
-    /// The peak, bytes ([`Meter::peak`]).
-    pub bytes: u64,
-    /// When the stage ended, unix ms.
-    pub at_ms: u64,
-}
-
-/// The peaks one key keeps, newest last, at most [`KEPT`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Row {
-    /// What they were measured for.
-    pub key: Key,
-    /// The peaks.
-    pub peaks: Vec<Peak>,
-}
-
-impl Row {
-    /// The most it keeps.
-    fn most(&self) -> Option<u64> {
-        self.peaks.iter().map(|p| p.bytes).max()
-    }
-
-    /// When its newest peak was kept.
-    fn newest(&self) -> u64 {
-        self.peaks.iter().map(|p| p.at_ms).max().unwrap_or(0)
-    }
-}
-
-/// The file's whole text, schema [`SCHEMA`].
-#[derive(Serialize, Deserialize)]
-struct File {
-    schema: u64,
-    rows: Vec<Row>,
-}
-
-/// What a lookup read ([`Records::learned`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Learned {
-    /// The peak read, bytes.
-    pub peak: u64,
-    /// How many peaks its record keeps.
-    pub runs: usize,
-    /// The wider selection it was read from; `None` for the key's own record.
-    pub wider: Option<Key>,
-}
-
-/// EVERY STAGE'S KEPT PEAKS ([`Row`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Records {
-    rows: Vec<Row>,
-}
-
-impl Records {
-    /// The records.
-    #[must_use]
-    pub fn rows(&self) -> &[Row] {
-        &self.rows
-    }
-
-    /// Keep `bytes`, measured at `at_ms`, under `key`: its record's oldest peak goes past
-    /// [`KEPT`], and past [`ROWS_KEPT`] records the one whose newest peak is oldest goes.
-    pub fn push(&mut self, key: Key, bytes: u64, at_ms: u64) {
-        let at = match self.rows.iter().position(|r| r.key == key) {
-            Some(at) => at,
-            None => {
-                self.rows.push(Row {
-                    key,
-                    peaks: Vec::new(),
-                });
-                self.rows.len() - 1
-            }
-        };
-        let peaks = &mut self.rows[at].peaks;
-        peaks.push(Peak { bytes, at_ms });
-        let over = peaks.len().saturating_sub(KEPT);
-        peaks.drain(..over);
-        while self.rows.len() > ROWS_KEPT {
-            let oldest = (0..self.rows.len())
-                .filter(|i| *i != at)
-                .min_by_key(|i| self.rows[*i].newest());
-            match oldest {
-                Some(i) => {
-                    self.rows.remove(i);
-                }
-                None => break,
-            }
-        }
-    }
-
-    /// What `key`'s stage took: the most its own record keeps; else the most any record of a wider
-    /// selection of the same stage, checkout and variant keeps ([`Key::holds`]: a superset's build
-    /// compiles the subset's crates too, and the most of them, not the least, since a wider run
-    /// over a warmer cache can have taken less than this one will); `None` where neither is kept.
-    #[must_use]
-    pub fn learned(&self, key: &Key) -> Option<Learned> {
-        if let Some(row) = self.rows.iter().find(|r| r.key == *key)
-            && let Some(peak) = row.most()
-        {
-            return Some(Learned {
-                peak,
-                runs: row.peaks.len(),
-                wider: None,
-            });
-        }
-        self.rows
-            .iter()
-            .filter(|r| r.key != *key && r.key.holds(key))
-            .filter_map(|r| r.most().map(|m| (m, r)))
-            .max_by_key(|(m, _)| *m)
-            .map(|(peak, r)| Learned {
-                peak,
-                runs: r.peaks.len(),
-                wider: Some(r.key.clone()),
-            })
-    }
-
-    /// The records as the file holds them.
-    #[must_use]
-    pub fn encode(&self) -> String {
-        aterm_json::to_string(&File {
-            schema: SCHEMA,
-            rows: self.rows.clone(),
-        })
-        .unwrap_or_else(|_| "{}".to_owned())
-    }
-
-    /// The records `text` holds; none for text that is not [`Self::encode`]'s.
-    #[must_use]
-    pub fn decode(text: &str) -> Records {
-        match aterm_json::from_str::<File>(text) {
-            Ok(f) if f.schema == SCHEMA => Records { rows: f.rows },
-            _ => Records::default(),
-        }
-    }
-
-    /// The records kept in `path`; none where it is absent or unreadable.
-    #[must_use]
-    pub fn load(path: &Path) -> Records {
-        std::fs::read_to_string(path)
-            .map(|t| Records::decode(&t))
-            .unwrap_or_default()
-    }
-
-    /// Write the records to `path`: staged in a private folder beside it, then renamed over it,
-    /// so a reader finds the old file or the new one whole. Two runs that write at once can lose
-    /// one of their peaks; neither leaves a torn file.
-    ///
-    /// # Errors
-    /// Its directory could not be made, or the write failed: the records kept before stand.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(dir)?;
-        let stage = aterm_tempfile::Builder::new()
-            .prefix(".stage-memory-")
-            .tempdir_in(dir)?;
-        let staged = stage.path().join("data");
-        std::fs::File::create(&staged)?.write_all(self.encode().as_bytes())?;
-        std::fs::rename(&staged, path)
-    }
 }
 
 /// Why a stage claims what it does ([`StageNeed`]).
@@ -510,6 +335,9 @@ impl Records {
 pub enum How {
     /// From kept peaks ([`Records::learned`]).
     Learned(Learned),
+    /// From the peaks its stage and selection kept in another checkout
+    /// ([`Records::elsewhere`]), with none kept in its own.
+    Elsewhere(Learned),
     /// No peak kept, and it compiles: the cold figure ([`aterm_capacity::cold_claim`]).
     Cold,
     /// No peak kept, and it compiles nothing.
@@ -546,6 +374,15 @@ impl fmt::Display for StageNeed {
                     aterm_capacity::size(l.peak)
                 ),
             },
+            How::Elsewhere(l) => write!(
+                f,
+                "{bytes}, the most a run of it in {} used ({}) and a fifth more, at least 1 GiB: \
+                 no run of it is kept in this checkout",
+                l.wider
+                    .as_ref()
+                    .map_or("another checkout", |k| k.checkout.as_str()),
+                aterm_capacity::size(l.peak)
+            ),
             How::Cold => write!(
                 f,
                 "{bytes} cold: no run of it is kept, and it compiles (16 GiB, at most half of \
@@ -557,11 +394,14 @@ impl fmt::Display for StageNeed {
     }
 }
 
-/// What stage `spec`, its record kept under `key` ([`Key::of_run`]), claims on a machine of
+/// What stage `spec`, its record kept under `key` ([`StageKey::of_run`]), claims on a machine of
 /// `physical` bytes (`None`: unread), by `records`: its learned peak and a fifth more, at least
-/// 1 GiB more ([`aterm_capacity::peak_claim`]); with none kept, the cold figure for a stage that
-/// compiles ([`aterm_capacity::cold_claim`]) and nothing for any other; nothing for a stage that
-/// touches no target directory ([`metered`]).
+/// 1 GiB more ([`aterm_capacity::peak_claim`]); with none kept in its checkout, the most its
+/// stage and selection kept in another ([`Records::elsewhere`]: a new worktree's first run, the
+/// common case, would otherwise claim the cold figure for a compile some other worktree measured);
+/// with none kept anywhere, the cold figure for a stage that compiles
+/// ([`aterm_capacity::cold_claim`]) and nothing for any other; nothing for a stage that touches
+/// no target directory ([`metered`]).
 #[must_use]
 pub fn need(records: &Records, spec: &StageSpec, key: &Key, physical: Option<u64>) -> StageNeed {
     if !metered(spec) {
@@ -570,10 +410,16 @@ pub fn need(records: &Records, spec: &StageSpec, key: &Key, physical: Option<u64
             how: How::Unmetered,
         };
     }
-    match records.learned(key) {
-        Some(l) => StageNeed {
+    if let Some(l) = records.learned(key) {
+        return StageNeed {
             bytes: aterm_capacity::peak_claim(l.peak),
             how: How::Learned(l),
+        };
+    }
+    match records.elsewhere(key) {
+        Some(l) => StageNeed {
+            bytes: aterm_capacity::peak_claim(l.peak),
+            how: How::Elsewhere(l),
         },
         None if compiles(spec.id) => StageNeed {
             bytes: aterm_capacity::cold_claim(physical),

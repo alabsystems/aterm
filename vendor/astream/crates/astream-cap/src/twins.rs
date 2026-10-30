@@ -43,6 +43,28 @@ pub const fn live_expiry_or_zero(exp: u64, now_ms: u64, zero_val: u64) -> u64 {
     }
 }
 
+/// `ceiling_rule_index_clamp` as `ceiling_island.rs` defines it in Clean:
+/// `if idx < max_rules then idx else max_rules`.
+#[must_use]
+pub const fn ceiling_rule_index_clamp(idx: u64, max_rules: u64) -> u64 {
+    if idx < max_rules {
+        idx
+    } else {
+        max_rules
+    }
+}
+
+/// `ceiling_mode_subsumes_code` as `ceiling_island.rs` defines it in Clean:
+/// `if ceiling_rw < member_rw then 0 else 1`.
+#[must_use]
+pub const fn ceiling_mode_subsumes_code(ceiling_rw: u64, member_rw: u64) -> u64 {
+    if ceiling_rw < member_rw {
+        0
+    } else {
+        1
+    }
+}
+
 /// `capfile_line_advance` as `capfile_island.rs` defines it in Clean:
 /// `if cur < cand then cand else cur`.
 ///
@@ -100,6 +122,24 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::capfile_line_advance(a, b)), want);
+        let want = "000011012";
+        assert_eq!(
+            answers(|[a, b]| crate::ceiling_rule_index_clamp(a, b)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b]| super::ceiling_rule_index_clamp(a, b)),
+            want
+        );
+        let want = "100110111";
+        assert_eq!(
+            answers(|[a, b]| crate::ceiling_mode_subsumes_code(a, b)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b]| super::ceiling_mode_subsumes_code(a, b)),
+            want
+        );
     }
 
     // Not vacuous: `cap_clock_advance_monotone` with its branches swapped answers otherwise.

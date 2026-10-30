@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 pub const SITE_DEPLOYER_KEY_ENTRY: &str =
     "~/company-life/config/local/service-account.alab-site-deployer.json";
 
+/// The notary credential consumed by the release subscriber. The legacy `notary` entry
+/// triggers older clients before their developer-tools checks, so it is never supplied.
+pub const NOTARY_ENTRY: &str = "release-notary";
+
 /// The catalog's version, cited as a catalog retirement's evidence.
 pub const VERSION: u32 = 1;
 
@@ -34,7 +38,7 @@ pub enum GhProfile {
 pub enum Want {
     /// `site-deployer-key`: the site deployer's service-account key.
     SiteDeployerKey,
-    /// `notary`: the notary credential (`~/.secrets/notary`).
+    /// `notary`: the notary credential (`~/.secrets/release-notary`).
     Notary,
     /// `mailbox:<label>`: one AI account's mailbox password (and TOTP seed).
     Mailbox(String),
@@ -212,7 +216,7 @@ impl Want {
     pub fn entries(&self) -> Vec<String> {
         match self {
             Self::SiteDeployerKey => vec![SITE_DEPLOYER_KEY_ENTRY.to_owned()],
-            Self::Notary => vec!["notary".to_owned()],
+            Self::Notary => vec![NOTARY_ENTRY.to_owned()],
             Self::Mailbox(label) => vec![format!("{label}_password"), format!("{label}_totp")],
             Self::Gh(GhProfile::Dev) => vec!["gh_access_token".to_owned()],
             Self::Gh(GhProfile::Release) => vec!["gh_access_token_alabsystems".to_owned()],
@@ -319,7 +323,7 @@ impl Want {
             Self::SiteDeployerKey => {
                 crate::materialize::target_path(home, SITE_DEPLOYER_KEY_ENTRY).ok()
             }
-            Self::Notary => Some(home.join(".secrets").join("notary")),
+            Self::Notary => Some(home.join(".secrets").join(NOTARY_ENTRY)),
             Self::Mailbox(label) => Some(home.join(".secrets").join(format!("{label}_password"))),
             _ => None,
         }
@@ -378,12 +382,15 @@ impl Purpose {
     }
 
     /// Whether a consumer in this build runs its own check and reports it
-    /// ([`super::satisfied`]): `ship provision`'s deployer-key row and the sign-in ladder. Any
+    /// ([`super::satisfied`]): `ship provision`'s deployer-key and notary rows, and the sign-in ladder. Any
     /// other need (one raised by hand, or for a consumer not wired yet) has no check of its own,
     /// so the vault version that gives this Mac the want's entry is what fulfils it; without
     /// that it would stay published for good.
     #[must_use]
     pub const fn checks_itself(self) -> bool {
-        matches!(self, Self::ReleaseSiteKey | Self::HarnessSignIn)
+        matches!(
+            self,
+            Self::ReleaseSiteKey | Self::ReleaseNotary | Self::HarnessSignIn
+        )
     }
 }

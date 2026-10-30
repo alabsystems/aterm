@@ -1609,7 +1609,7 @@ fn host_run(bin: &str, args: &[&str]) -> Result<(), Fail> {
 fn build_app(run: &Path) -> Result<PathBuf, Fail> {
     let out = run.join("app");
     println!("mac nux: building the app here (ship dev-app, made release-shaped)");
-    let status = crate::util::targo(&[
+    let args = [
         "--unverified",
         "ship",
         "dev-app",
@@ -1619,10 +1619,18 @@ fn build_app(run: &Path) -> Result<PathBuf, Fail> {
         "--sign-id",
         "-",
         "--out",
-    ])
-    .arg(&out)
-    .stdin(Stdio::null())
-    .status()
+    ];
+    // An alias, past the shim: claimed as the build it runs.
+    let claim = crate::util::claim_build(
+        &args,
+        Some(&["--unverified", "build", "--release", "-p", "aterm"]),
+        &crate::paths::paths().repo,
+    )
+    .map_err(|e| Fail::die(format!("ship dev-app: {e}")))?;
+    let status = crate::util::status_claimed(
+        crate::util::targo(&args).arg(&out).stdin(Stdio::null()),
+        claim,
+    )
     .map_err(|e| Fail::die(format!("targo: {e}")))?;
     if !status.success() {
         return Err(Fail::die(format!("ship dev-app: {status}")));
@@ -4807,7 +4815,7 @@ pub fn bin_executable(json_lines: &str, name: &str) -> Option<PathBuf> {
 /// share, where a person base's preparation and each person row install it from
 /// ([`crate::mac::person_install`]).
 fn build_helper(share: &Path) -> Result<(), Fail> {
-    let out = crate::util::targo(&[
+    let args = [
         "--unverified",
         "build",
         "-p",
@@ -4816,10 +4824,11 @@ fn build_helper(share: &Path) -> Result<(), Fail> {
         GUEST_HELPER,
         "--message-format",
         "json-render-diagnostics",
-    ])
-    .stdin(Stdio::null())
-    .output()
-    .map_err(|e| Fail::die(format!("targo: {e}")))?;
+    ];
+    let claim = crate::util::claim_build(&args, None, &crate::paths::paths().repo)
+        .map_err(|e| Fail::die(format!("the guest helper's build: {e}")))?;
+    let out = crate::util::output_claimed(crate::util::targo(&args).stdin(Stdio::null()), claim)
+        .map_err(|e| Fail::die(format!("targo: {e}")))?;
     let lines = String::from_utf8_lossy(&out.stdout);
     let built = bin_executable(&lines, GUEST_HELPER).filter(|_| out.status.success());
     let Some(built) = built else {

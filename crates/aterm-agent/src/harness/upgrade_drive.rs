@@ -395,6 +395,204 @@ pub fn ladder_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, 
 #[doc(hidden)]
 pub fn progress_environment() {}
 
+/// The quiet round's projection ([`upgrade::tell_due`], [`upgrade::quiet_move`]): the
+/// `HarnessUpgradeQuiet` variables a look's real [`Facts`] stand for.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i64> {
+    let flag = |b: bool| i64::from(b);
+    // A status that only lags past a turn end ([`upgrade::status_lags`]) is the agent's own
+    // in-process work keeping it busy (a workflow), at an idle screen; the owner's `--now` reads
+    // it as none.
+    let lags = upgrade::status_lags(f);
+    let posture = if f.limited || f.login {
+        3
+    } else if f.typing || f.held || upgrade::person_hold(f).is_some() {
+        4
+    } else if f.background_point {
+        1
+    } else if f.status == "idle" || lags {
+        2
+    } else {
+        0
+    };
+    std::collections::BTreeMap::from([
+        ("posture", posture),
+        (
+            "work",
+            flag(!f.background.is_empty() || (lags && !f.owner_now)),
+        ),
+        ("near", flag(f.attended)),
+        (
+            "held",
+            flag(
+                upgrade::rung_in_force(f) == upgrade::Rung::Land
+                    && f.own_hold_s >= upgrade::OWN_TELL_S,
+            ),
+        ),
+        ("tells", i64::from(f.tells)),
+        ("rest", flag(f.told_s < upgrade::RETELL_S)),
+        ("moved", 0),
+    ])
+}
+
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TurnRuns",
+        reason = "A turn of the agent's own running: Claude Code's step. The Tier-1 binds read it as a busy status and footer off any break, where the quiet round neither moves nor tells (`gate_announce` waits `not-idle`)."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "BreakSettles",
+        reason = "A settled break of the agent's own background work: the agent's and its supervisor loop's (`host_steps_in_background`, `IdleHost::at_background_on`). The Tier-1 binds offer the break step (`background_point`, `break_step`) there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "IdlePoint",
+        reason = "An idle point: the agent's turn ending and the loop offering it (`host_steps_here`). The Tier-1 binds read an idle, settled screen exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WallStands",
+        reason = "A usage limit or the login wall on the screen: the API's and Claude Code's step. The Tier-1 binds read `Facts::limited` exactly there, which `quiet_step` waits on first."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "PersonHolds",
+        reason = "A person's box, draft, keys or hold: a person's step. The Tier-1 binds read an approval box exactly there, which `gate_announce` and `quiet_move` wait on."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "PersonNear",
+        reason = "A person's key within their grace: a person's step. The Tier-1 binds read `Facts::attended` exactly there, which `upgrade::person_seen` holds the tell on and the land rung's move does not."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "PersonLeaves",
+        reason = "That grace running out: the clock's step. The Tier-1 binds clear `Facts::attended` exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WorkStarts",
+        reason = "A process starting under the agent: the agent's step. The Tier-1 binds name it in `Facts::background` exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WorkEnds",
+        reason = "That process ending: the agent's step. The Tier-1 binds empty `Facts::background` exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "HoldOutlasts",
+        reason = "The agent's own work holding the round past `upgrade::OWN_TELL_S`: the clock's step over `St::own_since`, which `St::note_wait` starts at the first own-work wait. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's hold-clock test binds the record."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "HoldBreaks",
+        reason = "A look that finds a person or a wall: the drive clears `St::own_since` where `upgrade::person_seen` holds, and `St::note_wait` on a limit's wait. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's hold-clock tests bind the record."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "RestRuns",
+        reason = "The rest after a tell running out: the clock's step (`upgrade::RETELL_S` since `St::told_at`). The Tier-1 binds build it through `Facts::told_s`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellOffAPoint",
+        reason = "Buggy=1 negative control only; a tell typed while a turn runs or a wall stands, which `quiet_step` (the wall) and `gate_announce` (a turn off a break) refuse. The Tier-1 bind's control reads a running turn as a break and drops the wall."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellOverAPerson",
+        reason = "Buggy=1 negative control only; a tell typed over a person's box, draft, keys or a key within their grace, which `upgrade::person_seen` refuses. The Tier-1 bind's control hides the person from the reducer."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellsEarly",
+        reason = "Buggy=1 negative control only; a tell before the agent's work held the round `upgrade::OWN_TELL_S`. The Tier-1 bind's control drops that bound."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellsPastTheCap",
+        reason = "Buggy=1 negative control only; a tell past `upgrade::MAX_TELLS`. The Tier-1 bind's control drops that cap."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "MoveOverWork",
+        reason = "Buggy=1 negative control only; the move over processes under the agent, where `quiet_move` waits `background`. The Tier-1 bind's control clears `Facts::background`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "MoveAtABreak",
+        reason = "Buggy=1 negative control only; the move at a break of the agent's background work, where `quiet_step` waits `background`. The Tier-1 bind's control reads the break as an idle point."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellNeverTyped",
+        reason = "Buggy=1 negative control only; a round that owes its tell and never types it. The Tier-1 drive bind (`a_quiet_round_held_by_its_own_work_tells_the_agent_once_and_ends_nothing`) types it, and aterm-spec's liveness sweep breaks the law with it."
+    )
+)]
+#[doc(hidden)]
+pub fn quiet_environment() {}
+
 /// What one sweep is told.
 #[derive(Clone, Debug)]
 pub struct Opts {
@@ -420,8 +618,23 @@ pub struct Opts {
     pub agents_off: Vec<aterm_phase::Program>,
     pub land: bool,
     pub timings: super::Timings,
+    /// Whether a quiet round may tell the agent what waits ([`upgrade::Step::Tell`]).
+    pub tell: Tell,
     /// The sweep is the lane of the owner's press of the ⬆️ ([`press`]): `None` for every other.
     pub press: Option<PressOpts>,
+}
+
+/// What a quiet round may type to an agent whose own work holds its move ([`Opts::tell`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tell {
+    /// Nothing: no autopilot carries the session, so a person reads what is typed.
+    #[default]
+    Off,
+    /// The line, under an autopilot that carries the session.
+    Fact,
+    /// The line with the restart the agent may run itself (`aterm ctl @self restart`), where that
+    /// restart is offered and promised for the tab.
+    Verb,
 }
 
 /// What the lane of the owner's press of the ⬆️ is told ([`press`]).
@@ -573,7 +786,11 @@ const PS_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 fn ps(args: &[&str]) -> Option<String> {
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"));
     cmd.args(args).env("LC_ALL", "C").env("TZ", "UTC");
-    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + PS_WAIT).ok()?;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(PS_WAIT)
+        .unwrap_or_else(|| now + Duration::from_secs(60));
+    let out = aterm_uds::deadline::output_until(&mut cmd, deadline).ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1299,9 +1516,11 @@ pub(super) fn lsof_holders(file: &Path, pids: &[u32]) -> Option<Vec<u32>> {
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"));
     cmd.args(["-n", "-P", "-t", "-a", "-p", &list.join(","), "--"])
         .arg(file);
-    let out =
-        aterm_uds::deadline::output_until(&mut cmd, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
-            .ok()?;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap_or_else(|| now + Duration::from_secs(60));
+    let out = aterm_uds::deadline::output_until(&mut cmd, deadline).ok()?;
     lsof_holder_pids(&out)
 }
 
@@ -1415,7 +1634,9 @@ pub(super) fn shell_dialect_of(
 pub(super) fn store_version(program: &Path) -> Option<String> {
     let build = program.parent()?.parent()?;
     let record = build.with_extension("vendor");
-    let text = std::fs::read_to_string(record).ok()?;
+    let text = crate::harness::accounts::read_bounded(&record, 64 * 1024)
+        .ok()
+        .flatten()?;
     text.lines().find_map(|l| {
         let v = l.trim().strip_prefix("version")?.trim_start();
         let v = v.strip_prefix('=')?.trim().trim_matches('"');
@@ -1428,7 +1649,10 @@ pub(super) fn store_version(program: &Path) -> Option<String> {
 /// parsed here, so a Windows landing is not read, though the wake polls that twin there
 /// (`upgrade_wake::twin_under`).
 pub(super) fn twin_naming(twin: &Path, program: &str) -> Option<PathBuf> {
-    let exe = catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
+    let text = crate::harness::accounts::read_bounded(twin, 64 * 1024)
+        .ok()
+        .flatten()?;
+    let exe = catalog::twin_binary(&text)?;
     (exe.file_name().and_then(|n| n.to_str()) == Some(program) && exe.is_file())
         .then(|| twin.to_path_buf())
 }
@@ -1456,7 +1680,10 @@ fn agents_dir() -> Option<PathBuf> {
 }
 
 pub(super) fn twin_version(twin: &Path) -> Option<String> {
-    let exe = catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
+    let text = crate::harness::accounts::read_bounded(twin, 64 * 1024)
+        .ok()
+        .flatten()?;
+    let exe = catalog::twin_binary(&text)?;
     store_version(&exe)
 }
 
@@ -1477,7 +1704,10 @@ fn version_of(exe: &Path) -> Probed {
 }
 
 fn version_within(exe: &Path, limit: Duration) -> Probed {
-    let deadline = Instant::now() + limit;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(limit)
+        .unwrap_or_else(|| now + Duration::from_secs(3600));
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.arg("--version")
         .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -1871,9 +2101,18 @@ pub(super) fn aside_of(
     clients: impl IntoIterator<Item = Client>,
     agents_off: &[aterm_phase::Program],
 ) -> Aside {
+    aside_of_within(clients, agents_off, CLAIMS_WAIT)
+}
+
+/// [`aside_of`], each instance's roster read given `wait` in place of [`CLAIMS_WAIT`].
+fn aside_of_within(
+    clients: impl IntoIterator<Item = Client>,
+    agents_off: &[aterm_phase::Program],
+    wait: Duration,
+) -> Aside {
     clients
         .into_iter()
-        .filter_map(|mut c| roster_aside(&mut c, agents_off))
+        .filter_map(|mut c| roster_aside_within(&mut c, agents_off, wait))
         .fold(Aside::default(), |mut all, one| {
             all.claimed.extend(one.claimed);
             all.off.extend(one.off);
@@ -3499,6 +3738,13 @@ pub(super) struct St {
     pub(super) stop_streak: u32,
     pub(super) notices: u32,
     pub(super) own_work_at: u64,
+    /// Since when the agent's own work has held this round, unbroken by a person or a limit
+    /// ([`St::note_wait`]); 0 for none.
+    pub(super) own_since: u64,
+    /// How many times [`Self::told_to`] was told to the agent ([`upgrade::Step::Tell`]).
+    pub(super) tells: u32,
+    pub(super) told_at: u64,
+    pub(super) told_to: String,
     pub(super) work_end_at: Vec<u64>,
     pub(super) goal: bool,
     pub(super) firsts: Vec<(String, u64)>,
@@ -3592,6 +3838,10 @@ struct History {
     notices: u32,
     waits: Vec<WaitNote>,
     own_work_at: u64,
+    own_since: u64,
+    tells: u32,
+    told_at: u64,
+    told_to: String,
     firsts: Vec<(String, u64)>,
     work_end_at: Vec<u64>,
     goal: bool,
@@ -3839,6 +4089,10 @@ impl St {
             notices: self.notices,
             waits: self.waits.clone(),
             own_work_at: self.own_work_at,
+            own_since: self.own_since,
+            tells: self.tells,
+            told_at: self.told_at,
+            told_to: self.told_to.clone(),
             firsts: self.firsts.clone(),
             work_end_at: self.work_end_at.clone(),
             goal: self.goal,
@@ -3851,6 +4105,10 @@ impl St {
         self.notices = history.notices;
         self.waits = history.waits;
         self.own_work_at = history.own_work_at;
+        self.own_since = history.own_since;
+        self.tells = history.tells;
+        self.told_at = history.told_at;
+        self.told_to = history.told_to;
         self.firsts = history.firsts;
         self.work_end_at = history.work_end_at;
         self.goal = history.goal;
@@ -3917,6 +4175,10 @@ impl St {
                     st.waits.clear();
                     st.firsts.clear();
                     st.own_work_at = 0;
+                    st.own_since = 0;
+                    st.tells = 0;
+                    st.told_at = 0;
+                    st.told_to.clear();
                     st.work_end_at.clear();
                     st.goal = false;
                 } else if st.proc_start.is_empty()
@@ -4252,6 +4514,13 @@ impl St {
         if upgrade_status::holds_by_own_work(&self.wait, false) {
             self.saw_own_work(now);
         }
+        match upgrade_status::wait_class(word) {
+            upgrade_status::WaitClass::OwnWork if self.own_since == 0 => self.own_since = now,
+            upgrade_status::WaitClass::Person | upgrade_status::WaitClass::Limit => {
+                self.own_since = 0;
+            }
+            _ => {}
+        }
     }
 
     pub(super) const fn saw_hand(&mut self, now: u64) -> bool {
@@ -4305,6 +4574,7 @@ impl St {
         } else if let Some(why) = step
             .strip_prefix("wait:")
             .or_else(|| step.strip_prefix("held-back:"))
+            .or_else(|| step.strip_prefix("told:"))
         {
             self.note_wait(&upgrade::wait_word(why, status), now);
         } else if !step.starts_with("skip:") && !step.starts_with("would-") {
@@ -4329,7 +4599,7 @@ impl St {
     }
 
     fn note_held(&mut self, step: &str, held: &[upgrade::Held], now: u64) {
-        if !step.starts_with("wait:") {
+        if !step.starts_with("wait:") && !step.starts_with("told:") {
             self.held_by.clear();
             return;
         }
@@ -4410,6 +4680,7 @@ impl St {
             ("left_typed", &self.left_typed),
             ("release", &self.release),
             ("last_stop", &self.last_stop),
+            ("told_to", &self.told_to),
             ("streak_why", &self.streak_why),
             ("still_print", &self.still_print),
             ("proc_start", &self.proc_start),
@@ -4513,6 +4784,9 @@ impl St {
             ("refused_at", self.refused_at),
             ("work_seen", u64::from(self.work_seen)),
             ("own_work_at", self.own_work_at),
+            ("own_since", self.own_since),
+            ("tells", u64::from(self.tells)),
+            ("told_at", self.told_at),
             ("goal", u64::from(self.goal)),
             ("limit_until", self.limit_until),
             ("quiet", u64::from(self.quiet)),
@@ -4742,6 +5016,10 @@ impl St {
             still_since: n("still_since"),
             still_at: n("still_at"),
             own_work_at: n("own_work_at"),
+            own_since: n("own_since"),
+            tells: small("tells"),
+            told_at: n("told_at"),
+            told_to: s("told_to"),
             proc_start: s("proc_start"),
             waits: list("waits")
                 .iter()
@@ -5388,11 +5666,7 @@ mod record {
         }
         #[cfg(not(unix))]
         {
-            let mut tmp = path.as_os_str().to_os_string();
-            tmp.push(".tmp");
-            let tmp = PathBuf::from(tmp);
-            std::fs::write(&tmp, text)?;
-            std::fs::rename(&tmp, path)
+            crate::harness::upgrade_models::write_atomic(path, text)
         }
     }
 
@@ -5544,12 +5818,7 @@ mod record {
         {
             // Keep the existing portable replacement route, returning its
             // failure to the checked caller instead of hiding it.
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, st.to_json())?;
-            std::fs::rename(&tmp, &path)
+            crate::harness::upgrade_models::write_atomic(&path, &st.to_json())
         }
     }
 
@@ -5603,11 +5872,14 @@ pub(super) fn ledger(opts: &Opts, r: &Report, detail: &str) {
     let dir = state_dir(opts);
     let _ = std::fs::create_dir_all(&dir);
     let path = ledger_path(opts);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Ok(mut f) = open.open(&path) {
         let _ = writeln!(
             f,
             "{}",
@@ -8098,6 +8370,7 @@ fn known_after(step: &str, waits: u32) -> Option<After> {
     let later = || ladder(waits);
     Some(match step.split_once(':').map_or(step, |(head, _)| head) {
         "announced" | "continued" | "adopted" => After::NextIdle,
+        "told" => later(),
         "gave-up" | "drain-expired" => After::NextIdle,
         "released" | "rearmed" => later(),
         _ if is_last_word(step) => After::Finished,
@@ -8140,7 +8413,7 @@ pub fn after_attended(looks: u32, same: u32, grace_s: u32) -> After {
 pub fn typed(step: &str) -> bool {
     matches!(
         step.split_once(':').map_or(step, |(head, _)| head),
-        "announced" | "continued" | "released"
+        "announced" | "continued" | "released" | "told"
     )
 }
 
@@ -8155,6 +8428,8 @@ pub fn host_turn(step: &str) -> Option<crate::supervise::policy::turn_end::HostT
             HostTurn::Notice
         } else if step == "continued:check" {
             HostTurn::Check
+        } else if step.split_once(':').map_or(step, |(head, _)| head) == "told" {
+            HostTurn::Fact
         } else {
             HostTurn::CarryOn
         }
@@ -8672,10 +8947,14 @@ pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str>
     }
     let dir = state_dir(opts);
     std::fs::create_dir_all(&dir).map_err(|_| "state-unwritable")?;
-    let lock: std::fs::File = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock: std::fs::File = open
         .open(dir.join("sweep.lock"))
         .map_err(|_| "lock-unopenable")?;
     #[expect(
@@ -9286,6 +9565,52 @@ fn visit_models(
         step = upgrade::requested_step(&request, &st.phase, &facts, false, now, &st.to);
         asked_about = st.phase.clone();
     }
+    // The relaunch the move would type from the foreground shell `shell`: the notice carries its
+    // line, and a tell, which promises the move, goes only where it can be made.
+    let move_plan = |shell: u32| -> Result<Plan, NoPlan> {
+        let home = args.env_var(super::accounts::HOME_ENV);
+        let homedir = home_carried(&opts.home, home, &sf.cwd, &records)?;
+        let mode = resume_mode(&records, &sf.session_id, shown_mode.clone());
+        let model = model_to.clone().or_else(hand_model);
+        plan(
+            opts,
+            &Launch {
+                homedir: homedir.as_deref(),
+                billing: if model_to.is_some() {
+                    super::relaunch::ModelBilling::Move(profile.as_ref())
+                } else {
+                    super::relaunch::ModelBilling::Keep
+                },
+                ..launch_of(
+                    sf,
+                    &args.argv,
+                    &target,
+                    model.as_deref(),
+                    mode.as_deref(),
+                    true,
+                    home,
+                    args.env_var(super::accounts::LOGIN_ENV),
+                    stored_login_of(&args.env),
+                )
+            },
+            shell,
+            t,
+        )
+    };
+    // A tell names the newer build waiting and promises aterm's move onto it, so it waits its own
+    // work's word on a model's move alone (the target is the build the agent runs, which the line
+    // cannot name) and where the relaunch the move would type cannot be planned now (its shell,
+    // the HOME it carries, its model's billing), before the build's start is probed for a line it
+    // will not type.
+    if let Step::Tell(why) = step
+        && (target.version == running
+            || foreground_shell(k.job(sf.pid))
+                .ok()
+                .map_or(Err(NoPlan::Wait("ids")), move_plan)
+                .is_err())
+    {
+        step = Step::Wait(why);
+    }
     let mut proven = None;
     if matches!(step, Step::Announce | Step::Terminate | Step::Fresh) {
         match foreground_shell(k.job(sf.pid)) {
@@ -9293,12 +9618,24 @@ fn visit_models(
             Err(why) => step = Step::Wait(why),
         }
     }
-    let moving = matches!(step, Step::Announce | Step::Terminate | Step::Fresh);
+    // A tell promises the move (and, offered, the agent's own restart), so it is held by the
+    // build's start as the move would be.
+    let moving = matches!(
+        step,
+        Step::Announce | Step::Terminate | Step::Fresh | Step::Tell(_)
+    );
     if target.version != running
         && (upgrade::asked_for_a_move(&asked_about, ready) || moving)
         && build_starts(opts, &r, &target, now, request == Request::Now, moving).is_err()
     {
         step = upgrade::build_hold(step, &asked_about, ready);
+    }
+    // A view types nothing, and a release owed goes first: the line it types says the upgrade is
+    // off, which a tell beside it would contradict.
+    if let Step::Tell(why) = step
+        && (opts.dry_run || !st.release.is_empty())
+    {
+        step = Step::Wait(why);
     }
     let held_point = opts
         .dry_run
@@ -9332,36 +9669,7 @@ fn visit_models(
             if let Err(why) = require_unique_owner(&opts.home, sf) {
                 return said(r, format!("wait:{why}"));
             }
-            let mode = resume_mode(&records, &sf.session_id, shown_mode.clone());
-            let model = model_to.clone().or_else(hand_model);
-            let planned = proven.map_or(Err(NoPlan::Wait("ids")), |shell| {
-                let home = args.env_var(super::accounts::HOME_ENV);
-                let homedir = home_carried(&opts.home, home, &sf.cwd, &records)?;
-                plan(
-                    opts,
-                    &Launch {
-                        homedir: homedir.as_deref(),
-                        billing: if model_to.is_some() {
-                            super::relaunch::ModelBilling::Move(profile.as_ref())
-                        } else {
-                            super::relaunch::ModelBilling::Keep
-                        },
-                        ..launch_of(
-                            sf,
-                            &args.argv,
-                            &target,
-                            model.as_deref(),
-                            mode.as_deref(),
-                            true,
-                            home,
-                            args.env_var(super::accounts::LOGIN_ENV),
-                            stored_login_of(&args.env),
-                        )
-                    },
-                    shell,
-                    t,
-                )
-            });
+            let planned = proven.map_or(Err(NoPlan::Wait("ids")), move_plan);
             let planned_line = planned.as_ref().map(|p| p.line.clone()).ok();
             let salt = st.salt;
             let asks = upgrade::announce_asks(&asked_about, facts.undelivered);
@@ -9446,6 +9754,28 @@ fn visit_models(
             }
             result
         }
+        Step::Tell(why) => {
+            // The agent's own restart is named only where its relaunch takes the target: a build
+            // proved to start (`build_proved`), as that relaunch requires.
+            let verb = opts.tell == Tell::Verb && build_proved(opts, &r, &target, now).is_ok();
+            tell(
+                opts,
+                r,
+                &mut st,
+                &mut c,
+                &Told {
+                    tab: &tab,
+                    sf,
+                    host_claim,
+                    why,
+                    from: &running.to_string(),
+                    held_s: facts.own_hold_s,
+                    verb,
+                },
+                k,
+                now,
+            )
+        }
         Step::Terminate if opts.dry_run => said(r, "would-restart"),
         Step::Fresh if opts.dry_run => said(r, "would-restart:fresh"),
         Step::Terminate | Step::Fresh => {
@@ -9513,6 +9843,11 @@ fn visit_models(
     };
     st.saw_work(&facts);
     st.note_step(&result.step, &facts.status, now);
+    if upgrade::person_seen(&facts) {
+        // Whatever the step's word (the agent's work outranks a person in it), a look that
+        // finds a person restarts the own-work hold ([`upgrade::person_seen`]).
+        st.own_since = 0;
+    }
     st.restart_look =
         result.step.starts_with("wait:") && restart_word.as_deref() == Some(result.step.as_str());
     let copy = if running_native { "foreign" } else { "managed" };
@@ -9524,7 +9859,9 @@ fn visit_models(
             facts.background.len(),
         ),
     );
-    let held = if facts.background.is_empty() || !result.step.starts_with("wait:") {
+    let held = if facts.background.is_empty()
+        || !(result.step.starts_with("wait:") || result.step.starts_with("told:"))
+    {
         Vec::new()
     } else {
         k.describe(sf.pid, &background_procs(sf.pid, t))
@@ -9731,6 +10068,18 @@ pub(super) fn look_facts(
                     st,
                 )),
         unnoticed: now.saturating_sub(st.behind_since()) < upgrade::quiet_s(),
+        own_hold_s: if st.own_since == 0 {
+            0
+        } else {
+            now.saturating_sub(st.own_since)
+        },
+        tells: if st.told_to == st.to { st.tells } else { 0 },
+        told_s: if st.told_at == 0 {
+            u64::MAX
+        } else {
+            now.saturating_sub(st.told_at)
+        },
+        may_tell: opts.tell != Tell::Off,
         press: upgrade::Press::None,
     };
     let idle_read = ladder.idle_read;
@@ -9973,6 +10322,110 @@ fn release(
                 left_cut(st, c, tab, &text);
             }
             owed(r, &e.word())
+        }
+    }
+}
+
+/// What one [`tell`] says, and to which tab.
+struct Told<'a> {
+    tab: &'a str,
+    sf: &'a SessionFile,
+    host_claim: Option<&'a HostClaim>,
+    why: &'static str,
+    from: &'a str,
+    held_s: u64,
+    /// The line names `aterm ctl @self restart` ([`Tell::Verb`], the target proved to start).
+    verb: bool,
+}
+
+/// Types the quiet round's one line to the agent whose own work (`told.why`) holds its move
+/// ([`Step::Tell`]), at most [`upgrade::MAX_TELLS`] times for one target. The count is spent and
+/// saved once the fence is read, right before the first key ([`type_fenced_then`]), so a line cut
+/// short, a reply lost after the keys or a crash mid-type is never typed again sooner than
+/// [`upgrade::RETELL_S`]. A refusal before that spends nothing, a save that fails types nothing,
+/// and a turn the server reports untyped (`changed`, a yield to a person) gives the count back.
+fn tell(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    c: &mut Client,
+    told: &Told<'_>,
+    k: &dyn Kernel,
+    now: u64,
+) -> Report {
+    let Told {
+        tab,
+        sf,
+        host_claim,
+        why,
+        from,
+        held_s,
+        verb,
+    } = *told;
+    let waits = |r| said(r, format!("wait:{why}"));
+    if leads_terminal(k.job(sf.pid)).is_err()
+        || !k
+            .terminal(sf.pid)
+            .as_ref()
+            .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str())))
+        || require_unique_owner(&opts.home, sf).is_err()
+        || host_claim.is_some_and(|claim| !claim_still_live(c, sf.pid, claim))
+    {
+        return waits(r);
+    }
+    let text = upgrade::tell_prompt(st.agent, from, &st.to, held_s, verb);
+    let spent = (st.tells, st.told_at, st.told_to.clone());
+    let typed = {
+        let st = &mut *st;
+        type_fenced_then(
+            c,
+            tab,
+            &text,
+            None,
+            Put::Pressed,
+            opts.timings.fence_every,
+            &mut || {
+                st.tells = if st.told_to == st.to {
+                    spent.0.saturating_add(1)
+                } else {
+                    1
+                };
+                st.told_at = now;
+                st.told_to.clone_from(&st.to);
+                save_checked(opts, &sf.session_id, st).map_err(|_| {
+                    (st.tells, st.told_at, st.told_to) = spent.clone();
+                    Typed::Refused("unsaved".to_string())
+                })
+            },
+        )
+    };
+    match typed {
+        Ok(()) => {
+            let r = said(r, format!("told:{why}"));
+            ledger(
+                opts,
+                &r,
+                &format!(
+                    "the agent's own running work held the quiet upgrade to {} for {}: one line \
+                     told it what waits and when it moves (tell {} of {}); nothing it runs was \
+                     ended or asked of it",
+                    st.to,
+                    upgrade::span(held_s),
+                    st.tells,
+                    upgrade::MAX_TELLS
+                ),
+            );
+            r
+        }
+        Err(Typed::Cut(why)) => {
+            left_cut(st, c, tab, &text);
+            said(r, format!("wait:cut-{why}"))
+        }
+        Err(e) => {
+            if matches!(e, Typed::Changed | Typed::Yielded) {
+                (st.tells, st.told_at, st.told_to) = spent;
+            }
+            said(r, format!("wait:{}", e.word()))
         }
     }
 }
@@ -10300,7 +10753,7 @@ fn heard(st: &St, sf: &SessionFile, tab: &str, tail: Option<&str>) -> bool {
 fn release_is_next(step: &Step, word: &str) -> bool {
     match step {
         Step::GiveUp | Step::Void(_) => true,
-        Step::Wait(why) => upgrade::release_is_next(why),
+        Step::Wait(why) | Step::Tell(why) => upgrade::release_is_next(why),
         Step::Announce | Step::Terminate | Step::Fresh => {
             word.starts_with("failed:") || word.starts_with("refused:")
         }
@@ -10778,6 +11231,21 @@ pub(super) fn type_fenced(
     put: Put,
     fence_every: Duration,
 ) -> Result<(), Typed> {
+    type_fenced_then(c, tab, text, retry, put, fence_every, &mut || Ok(()))
+}
+
+/// [`type_fenced`], calling `before_keys` once the fence is read and right before each try's
+/// keys are sent: an error from it types nothing and is the result. Every refusal before it
+/// typed nothing; an error after it may follow keys the server took.
+pub(super) fn type_fenced_then(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    retry: Option<&Retry>,
+    put: Put,
+    fence_every: Duration,
+    before_keys: &mut dyn FnMut() -> Result<(), Typed>,
+) -> Result<(), Typed> {
     let mut hand = Hand::take(c, tab).ok_or_else(|| Typed::Refused("held".to_string()))?;
     let out = (|| {
         let mut tries = 0;
@@ -10798,6 +11266,7 @@ pub(super) fn type_fenced(
             if put == Put::Pressed && aterm_phase::survey::survey_block(&read.rows).is_some() {
                 return Err(Typed::Refused("survey".to_string()));
             }
+            before_keys()?;
             let typed = match put {
                 Put::Paste => turn_fenced(c, tab, text, generation.as_deref()),
                 Put::Pressed => notice_fenced(c, tab, text, generation.as_deref()),

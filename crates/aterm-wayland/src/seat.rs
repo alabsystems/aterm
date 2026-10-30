@@ -249,7 +249,7 @@ struct SeatSlot {
     capabilities: u32,
     devices: Devices,
     frames: Frames<Proxy>,
-    keyboard_serial: Option<u32>,
+    latest_serial: Option<u32>,
     keyboard_focus: Option<Proxy>,
     listener: Option<Listener>,
 }
@@ -306,7 +306,7 @@ impl Seats {
         let globals: Vec<_> = registry
             .globals()
             .into_iter()
-            .filter(|g| g.interface.as_c_str() == c"wl_seat")
+            .filter(|g| g.interface.as_c_str() == c"wl_seat" && g.version > 0)
             .collect();
         let (gone, bound): (Vec<SeatSlot>, Vec<u32>) = {
             let mut seat_book = self
@@ -346,7 +346,7 @@ impl Seats {
                 capabilities: 0,
                 devices: Devices::default(),
                 frames: Frames::new(0),
-                keyboard_serial: None,
+                latest_serial: None,
                 keyboard_focus: None,
                 listener: Some(listener),
             };
@@ -412,19 +412,11 @@ impl Seats {
 
     /// Newest serial the seat's keyboard (enter, key, modifiers) or pointer (enter, button) gave.
     pub fn latest_serial(&self, seat: u32) -> Option<u32> {
-        let mut seat_book = self
-            .seat_book
+        self.seat_book
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let s = seat_book.slot(seat)?;
-        [
-            s.keyboard_serial,
-            s.frames.latest_enter(),
-            s.frames.latest_button(),
-        ]
-        .into_iter()
-        .flatten()
-        .max()
+            .unwrap_or_else(PoisonError::into_inner)
+            .slot(seat)
+            .and_then(|s| s.latest_serial)
     }
 
     /// Surface currently holding the seat's keyboard focus, if any.
@@ -681,26 +673,51 @@ impl SeatBook {
         Some(match input {
             DeviceInput::Pointer(raw) => Input::Pointer {
                 seat: id,
-                frame: slot.frames.feed(raw)?,
+                frame: record_pointer(&mut slot.frames, &mut slot.latest_serial, raw)?,
             },
             DeviceInput::Keyboard(event) => {
-                match &event {
-                    KeyboardEvent::Enter {
-                        serial, surface, ..
-                    } => {
-                        slot.keyboard_serial = Some(*serial);
-                        slot.keyboard_focus = *surface;
-                    }
-                    KeyboardEvent::Leave { .. } => slot.keyboard_focus = None,
-                    KeyboardEvent::Key { serial, .. } | KeyboardEvent::Modifiers { serial, .. } => {
-                        slot.keyboard_serial = Some(*serial);
-                    }
-                    _ => {}
-                }
+                record_keyboard(&mut slot.latest_serial, &mut slot.keyboard_focus, &event);
                 Input::Keyboard { seat: id, event }
             }
             DeviceInput::Touch(event) => Input::Touch { seat: id, event },
         })
+    }
+}
+
+fn record_pointer(
+    frames: &mut Frames<Proxy>,
+    latest_serial: &mut Option<u32>,
+    raw: Raw<Proxy>,
+) -> Option<Vec<PointerEvent<Proxy>>> {
+    if let Raw::Enter { serial, .. }
+    | Raw::Button {
+        serial,
+        state: 0 | 1,
+        ..
+    } = &raw
+    {
+        *latest_serial = Some(*serial);
+    }
+    frames.feed(raw)
+}
+
+fn record_keyboard(
+    latest_serial: &mut Option<u32>,
+    keyboard_focus: &mut Option<Proxy>,
+    event: &KeyboardEvent,
+) {
+    match event {
+        KeyboardEvent::Enter {
+            serial, surface, ..
+        } => {
+            *latest_serial = Some(*serial);
+            *keyboard_focus = *surface;
+        }
+        KeyboardEvent::Leave { .. } => *keyboard_focus = None,
+        KeyboardEvent::Key { serial, .. } | KeyboardEvent::Modifiers { serial, .. } => {
+            *latest_serial = Some(*serial);
+        }
+        _ => {}
     }
 }
 
@@ -790,7 +807,10 @@ fn keyboard_input(opcode: u32, args: &[EventArg<'_>]) -> Option<DeviceInput> {
                 EventArg::Uint(size),
             ],
         ) => {
-            // SAFETY: the event's descriptor, which the receiver owns.
+            if *fd < 0 {
+                return None;
+            }
+            // SAFETY: a non-negative descriptor from the event, which the receiver owns.
             let fd = unsafe { OwnedFd::from_raw_fd(*fd) };
             KeyboardEvent::Keymap(read_keymap(*format, fd, *size))
         }
@@ -978,5 +998,57 @@ mod tests {
             bytes.extend(k.to_ne_bytes());
         }
         assert_eq!(words(&bytes), [30, 48]);
+    }
+
+    #[test]
+    fn latest_serial_tracks_arrival_order_across_u32_wraparound() {
+        let mut frames = Frames::new(5);
+        let mut latest = None;
+        let mut focus = None;
+
+        record_pointer(
+            &mut frames,
+            &mut latest,
+            Raw::Enter {
+                serial: u32::MAX,
+                surface: None,
+                x: 0.0,
+                y: 0.0,
+            },
+        );
+        assert_eq!(latest, Some(u32::MAX));
+
+        record_keyboard(
+            &mut latest,
+            &mut focus,
+            &KeyboardEvent::Key {
+                serial: 0,
+                time: 10,
+                key: 30,
+                state: 1,
+            },
+        );
+        assert_eq!(latest, Some(0));
+
+        record_pointer(
+            &mut frames,
+            &mut latest,
+            Raw::Button {
+                serial: 1,
+                time: 20,
+                button: 272,
+                state: 1,
+            },
+        );
+        assert_eq!(latest, Some(1));
+    }
+
+    #[test]
+    fn keymap_with_negative_fd_is_rejected_without_owned_fd_ub() {
+        let got = keyboard_input(
+            wl_keyboard::evt::KEYMAP,
+            &[EventArg::Uint(1), EventArg::Fd(-1), EventArg::Uint(16)],
+        );
+        assert!(got.is_none());
     }
 }

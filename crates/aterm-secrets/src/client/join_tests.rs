@@ -114,7 +114,7 @@ fn a_join_fetches_the_vault_once_and_a_probed_one_not_again() {
 
     // A join after a probe applies what the probe fetched: the probe's GET is the only one.
     let before = server.envelope_gets();
-    let Ok(ProbeOutcome::Found(probed)) = probe_within(&source, PROBE_DEADLINE) else {
+    let Ok(ProbeOutcome::Found(probed)) = probe_within(&source, HANG_DETECTOR) else {
         panic!("the vault answers its probe");
     };
     let joined = join(
@@ -2586,7 +2586,7 @@ fn a_join_whose_request_is_not_heard_keeps_its_proof_for_the_next_ask() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
     let (_admin, source, password) = team(root.path(), &server);
-    let Ok(ProbeOutcome::Found(probed)) = probe_within(&source, PROBE_DEADLINE) else {
+    let Ok(ProbeOutcome::Found(probed)) = probe_within(&source, HANG_DETECTOR) else {
         panic!("the vault answers its probe");
     };
     // The vault goes away between the look and the request: the join applies what it saw,
@@ -3526,7 +3526,11 @@ fn a_held_approver_moves_only_once_it_cannot_read_the_vaults_admin_locker() {
             paths,
             own,
             held,
+            Some(Path::new("/installed/aterm")),
             &|program| {
+                if program == Path::new("/installed/aterm") {
+                    return Ok(own.version);
+                }
                 assert_eq!(program, held.program, "only the held program is read");
                 at.ok_or_else(|| "timed out".to_string())
             },
@@ -3615,11 +3619,24 @@ fn the_alab_admins_held_approver_older_than_0_146_moves_onto_this_release() {
     };
     let moves = std::cell::Cell::new(0);
     let mend = |own: &locker_skew::Own, held: &Held, at: (u64, u64, u64)| {
-        mend_held_with(&admin, own, held, &|_| Ok(at), &mut |watch| {
-            assert_eq!(watch, None, "an approver's move waits on no server");
-            moves.set(moves.get() + 1);
-            Ok(Some("moved".to_string()))
-        })
+        mend_held_with(
+            &admin,
+            own,
+            held,
+            Some(Path::new("/installed/aterm")),
+            &|program| {
+                Ok(if program == Path::new("/installed/aterm") {
+                    own.version
+                } else {
+                    at
+                })
+            },
+            &mut |watch| {
+                assert_eq!(watch, None, "an approver's move waits on no server");
+                moves.set(moves.get() + 1);
+                Ok(Some("moved".to_string()))
+            },
+        )
         .expect("judged")
     };
     let held_back = (0, 145, 0);
@@ -3665,6 +3682,152 @@ fn the_alab_admins_held_approver_older_than_0_146_moves_onto_this_release() {
         "the ALab admin's 0.145 approver moves onto 0.146"
     );
     assert_eq!(moves.get(), 1);
+}
+
+#[test]
+fn managed_alab_subscribers_follow_installed_releases_without_admin_or_downgrade() {
+    use crate::envelope::{Retired, TEST_RETIRED};
+    use crate::service::{Held, Job};
+    struct ResetRetired;
+    impl Drop for ResetRetired {
+        fn drop(&mut self) {
+            TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+    let _reset = ResetRetired;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let admin = Paths::for_home(&root.path().join("admin"));
+    let source = root.path().join("alab.vault");
+    let created = create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+    let config = config(&admin).unwrap().unwrap();
+    let member = Paths::for_home(&root.path().join("pending"));
+    let joined = join(
+        &member,
+        &options(
+            &format!("{}#{}", source.display(), created.signer),
+            JoinPassword::Given(None),
+            None,
+            Duration::ZERO,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(joined, JoinOutcome::Pending { .. }));
+    let own = locker_skew::Own {
+        version: (0, 147, 0),
+        release: true,
+        program: None,
+    };
+    let held = Held {
+        job: Job::Subscriber,
+        program: PathBuf::from("/held/aterm"),
+        args: vec!["secrets".into(), "watch".into()],
+        pin: None,
+    };
+    let moves = std::cell::Cell::new(0);
+    let mend = |own: &locker_skew::Own, held: &Held, version: &str| {
+        mend_held_with(
+            &member,
+            own,
+            held,
+            Some(Path::new("/installed/aterm")),
+            &|program| {
+                Ok(if program == Path::new("/installed/aterm") {
+                    own.version
+                } else {
+                    locker_skew::version(version).unwrap()
+                })
+            },
+            &mut |watch| {
+                assert!(watch.is_none());
+                moves.set(moves.get() + 1);
+                Ok(Some("moved".into()))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        mend(&own, &held, "0.146.0"),
+        HeldMend::Kept(HeldKept::NoAdmin),
+        "a personal vault named alab is not the default ALab authority"
+    );
+    TEST_RETIRED.with(|cell| {
+        *cell.borrow_mut() = Some(Retired {
+            keys: Vec::new(),
+            current: config.signer,
+        });
+    });
+    {
+        assert_eq!(admin_locker_here(&member), AdminLocker::None);
+        let destination = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let before = moves.get();
+        for target in [
+            Ok((0, 91, 0)),
+            Ok((0, 146, 0)),
+            Err("unreadable destination".to_owned()),
+        ] {
+            let refused = mend_held_with(
+                &member,
+                &own,
+                &held,
+                Some(destination),
+                &|program| {
+                    if program == destination {
+                        target.clone()
+                    } else {
+                        Ok((0, 146, 0))
+                    }
+                },
+                &mut |_| {
+                    moves.set(moves.get() + 1);
+                    Ok(Some("incorrectly moved".to_owned()))
+                },
+            );
+            assert!(
+                refused.is_err(),
+                "a 0.147 helper must not install {target:?}"
+            );
+        }
+        assert_eq!(
+            moves.get(),
+            before,
+            "refusal happens before any job mutation"
+        );
+        for version in ["0.146.0", "0.147.0", "0.147.0+g1234"] {
+            assert_eq!(
+                mend(&own, &held, version),
+                HeldMend::Moved("moved".into()),
+                "{version}"
+            );
+        }
+        let before = moves.get();
+        assert_eq!(
+            mend(&own, &held, "0.148.0+g1234"),
+            HeldMend::Kept(HeldKept::NoAdmin)
+        );
+        assert_eq!(
+            mend(
+                &locker_skew::Own {
+                    release: false,
+                    ..own.clone()
+                },
+                &held,
+                "0.146.0"
+            ),
+            HeldMend::Kept(HeldKept::Development)
+        );
+        assert_eq!(
+            mend(
+                &own,
+                &Held {
+                    pin: Some(held.program.clone()),
+                    ..held.clone()
+                },
+                "0.146.0"
+            ),
+            HeldMend::Kept(HeldKept::Pinned)
+        );
+        assert_eq!(moves.get(), before);
+    }
 }
 
 /// The approver's log says how each Mac it let in got in: on a vault with a join password, the

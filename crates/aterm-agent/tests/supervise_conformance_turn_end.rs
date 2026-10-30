@@ -150,6 +150,7 @@ fn reading(
         opens_cut: false,
         turn_said: Some(crate::common::earlier(earlier)),
         opened_by: None,
+        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,

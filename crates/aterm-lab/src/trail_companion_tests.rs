@@ -65,6 +65,10 @@ fn a_body_beside_the_line_meets_no_letter_and_one_over_it_does() {
         "ox",
         "{m:?}"
     );
+    assert_eq!(
+        m.shaved, 2,
+        "a body across both cells meets each past the shave: {m:?}"
+    );
     assert!(m.caret_px > 0, "{m:?}");
     // Blank cells are no letters: a body over the spaces between the words meets none.
     let gap = (12 + 6 * 14 + 2, 12 + 7 * 14 - 2, 106, 132);
@@ -117,6 +121,12 @@ fn write_frame_with_head(
     put(format!("{stem}.dims.txt"), DIMS);
     put(format!("{stem}.{frame}.png"), "");
     put(format!("{stem}.{frame}.clean.png"), "");
+    // The clean twin keeps a status of its own whose body lies over `brown`: read as a frame, it would be counted
+    // (and over the letters), so the walk's exclusion of the twin is what the counts below hold.
+    put(
+        format!("{stem}.{frame}.clean.status.txt"),
+        "trail style=\"rainbow kitty pet\" pet_body=250,320,88,132 pet_focus=typing word_icons=none\n",
+    );
     put(
         format!("{stem}.{frame}.text.txt"),
         "\n\n\n\n$ echo the quick brown fox\n",
@@ -168,6 +178,11 @@ fn a_gallery_tree_is_read_end_to_end() {
     assert_eq!(int("with_body"), Some(3));
     assert_eq!(int("companion_over_letters"), Some(2));
     assert_eq!(int("on_letters"), Some(1));
+    assert_eq!(
+        int("shaved"),
+        Some(1),
+        "the body over `brown` meets it past the shave"
+    );
     assert_eq!(int("on_icons"), Some(1));
     assert_eq!(
         int("icons_unread"),
@@ -193,6 +208,129 @@ fn a_gallery_tree_is_read_end_to_end() {
         "two frames over --max 1 fail"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn report_of(path: &Path, max: Option<i64>) -> Result<J, String> {
+    let mut args = vec![path.to_string_lossy().into_owned()];
+    if let Some(m) = max {
+        args.extend(["--max".into(), m.to_string()]);
+    }
+    report(&parse_args(&args).expect("args"))
+}
+
+#[test]
+fn a_path_with_no_frame_is_an_error_not_a_pass() {
+    let dir = scratch("empty");
+    assert!(
+        report_of(&dir.join("no-such-gallery"), Some(0)).is_err(),
+        "a typo'd path is a file error (exit 2)"
+    );
+    assert!(
+        report_of(&dir, Some(0)).is_err(),
+        "a tree with no frame is no evidence"
+    );
+    std::fs::write(dir.join("x-dark.t0.png"), "").expect("a frame");
+    assert!(
+        report_of(&dir, Some(0)).is_err(),
+        "a frame without its status is no evidence"
+    );
+    // Negative control: the same tree once it holds a frame read whole reports, and passes.
+    write_frame(
+        &dir,
+        "rainbow-kitty-pet-dark",
+        "t0",
+        "404,474,88,132",
+        Some("none"),
+    );
+    let out = report_of(&dir, Some(0)).expect("a report");
+    assert_eq!(out.get("frames").and_then(J::as_i64), Some(1));
+    assert_eq!(
+        out.get("failures").and_then(J::as_arr).map(<[J]>::len),
+        Some(0)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_frame_not_read_is_never_counted_clean() {
+    let stem = "rainbow-dog-dark";
+    // A body over `brown`, the frame's text, caret or status then left unread as a gallery can leave it.
+    let frame = |tag: &str, unread: &dyn Fn(&Path)| {
+        let dir = scratch(tag);
+        write_frame(&dir, stem, "t0", "250,320,88,132", Some("none"));
+        unread(&dir);
+        let out = report_of(&dir, Some(0)).expect("a report");
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    };
+    let int = |out: &J, k: &str| out.get(k).and_then(J::as_i64);
+    let failed = |out: &J| {
+        out.get("failures")
+            .and_then(J::as_arr)
+            .map_or(0, <[J]>::len)
+    };
+    // Negative control: read whole, the frame is over the letters and fails --max 0 on that alone.
+    let whole = frame("whole", &|_| {});
+    assert_eq!(
+        int(&whole, "companion_over_letters"),
+        Some(1),
+        "{}",
+        render(&whole)
+    );
+    assert_eq!(failed(&whole), 1, "{}", render(&whole));
+    let rm = |dir: &Path, suffix: &str| {
+        std::fs::remove_file(dir.join(format!("{stem}.t0{suffix}"))).expect("a sidecar");
+    };
+    let no_text = frame("no-text", &|d| rm(d, ".text.txt"));
+    assert_eq!(
+        int(&no_text, "text_unread"),
+        Some(1),
+        "{}",
+        render(&no_text)
+    );
+    assert_eq!(int(&no_text, "companion_over_letters"), Some(0));
+    assert_eq!(
+        failed(&no_text),
+        1,
+        "an unread frame fails --max: {}",
+        render(&no_text)
+    );
+    let no_caret = frame("no-caret", &|d| rm(d, ".cursor.txt"));
+    assert_eq!(
+        int(&no_caret, "caret_unread"),
+        Some(1),
+        "{}",
+        render(&no_caret)
+    );
+    assert_eq!(failed(&no_caret), 1, "{}", render(&no_caret));
+    let failed_status = frame("err-status", &|d| {
+        let put = |suffix: &str, text: &str| {
+            std::fs::write(d.join(format!("{stem}.t0{suffix}")), text).expect("a sidecar");
+        };
+        put(".status.txt", "");
+        put(".status.txt.stderr", "ERR no focused window\n");
+    });
+    assert_eq!(
+        int(&failed_status, "status_unread"),
+        Some(1),
+        "{}",
+        render(&failed_status)
+    );
+    assert_eq!(int(&failed_status, "frames"), Some(1));
+    assert_eq!(failed(&failed_status), 1, "{}", render(&failed_status));
+    // The open redraw-stall frame: its text and caret deliberately unread, counted apart and not failed.
+    let open = frame("open", &|d| {
+        rm(d, ".text.txt");
+        rm(d, ".cursor.txt");
+        std::fs::write(
+            d.join(format!("{stem}.t0.read-notes.txt")),
+            "cursor/text were not requested\n",
+        )
+        .expect("a note");
+    });
+    assert_eq!(int(&open, "open"), Some(1), "{}", render(&open));
+    assert_eq!(int(&open, "text_unread"), Some(0));
+    assert_eq!(failed(&open), 0, "{}", render(&open));
 }
 
 /// looks10 L10: nyan's flying head names its drawn body in `head_body=`, and the verb reads it as it reads the pet's.

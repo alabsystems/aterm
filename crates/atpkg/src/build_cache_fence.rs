@@ -34,6 +34,7 @@ fn unused(scan: std::io::Result<PathScan>) -> Result<(), Blocked> {
         let how = match user.how {
             "cwd" => "working directory",
             "exe" => "executable",
+            "map" => "mapped file",
             _ => "open file",
         };
         return Err(Blocked::Used(user.pid, how));

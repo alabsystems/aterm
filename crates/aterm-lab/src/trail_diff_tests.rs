@@ -29,7 +29,7 @@ fn frame(edits: &[(&str, &str)]) -> String {
 
 /// A dump of one script with one run of `frames`, renumbered from 0.
 fn dump(frames: &[String]) -> String {
-    let mut out = String::from("P dark/typing.trail\nS -\n");
+    let mut out = String::from("P light/typing.trail\nS -\n");
     for (n, f) in frames.iter().enumerate() {
         out.push_str(&f.replacen("F 0 t=0.000", &format!("F {n} t={n}.000"), 1));
     }
@@ -54,7 +54,7 @@ fn equal_dumps_report_nothing_and_exit_0() {
     let r = report(&d, &d);
     assert_eq!(
         r.totals(),
-        "scripts=1 frames=3 differing_compared=0 arm_frames=0 state_differing=0"
+        "scripts=1 frames=3 differing_compared=0 arm_frames=0 state_differing=0 dark_arms=0"
     );
     assert!(r.firsts.is_empty() && r.arms.is_empty(), "{r:?}");
     assert_eq!(verdict(&r, None), (0, None));
@@ -80,7 +80,7 @@ fn a_differing_frame_on_which_an_arm_drew_passes_when_the_difference_is_confined
     assert_eq!(r.state_differing, 0, "{r:?}");
     assert_eq!(
         r.arms,
-        ["arms dark/typing.trail S - glass:glow_under+glow_under_ramps: F1"]
+        ["arms light/typing.trail S - glass:glow_under+glow_under_ramps: F1"]
     );
     assert_eq!(verdict(&r, None).0, 0);
 }
@@ -96,7 +96,7 @@ fn on_an_arm_frame_a_difference_in_a_stream_no_arm_touched_fails() {
     assert_eq!((r.differing_compared, r.arm_frames), (1, 1), "{r:?}");
     assert_eq!(
         r.firsts,
-        ["differs dark/typing.trail S - F0 t=0.000: fx_layers head=2:6667 base=1:6666"]
+        ["differs light/typing.trail S - F0 t=0.000: fx_layers head=2:6667 base=1:6666"]
     );
     assert_eq!(verdict(&r, None).0, 1);
 }
@@ -134,6 +134,56 @@ fn light_bits_and_light_words_alone_are_never_a_difference() {
     let base = dump(&[frame(&[])]);
     let r = report(&head, &base);
     assert!(!r.differs(), "{r:?}");
+}
+
+/// §15.0.2(b)'s arms are light code: an arm a build drew on a frame whose own light bits are off
+/// there fails, whatever the streams say, and so does any arm in a script under a `dark` folder,
+/// light bits on or not; the same arm on a lit frame of a light script is listed and passes
+/// (the negative control).
+#[test]
+fn a_light_arm_on_a_dark_ground_fails() {
+    let unlit = frame(&[("light=0 arms=-", "light=0 arms=glass:glow_under")]);
+    let lit = frame(&[("light=0 arms=-", "light=3 arms=glass:glow_under")]);
+    let plain = dump(&[frame(&[])]);
+    // A light script's lit frame: listed, not a failure.
+    let r = report(&dump(std::slice::from_ref(&lit)), &plain);
+    assert_eq!((r.arm_frames, r.dark_arms), (1, 0), "{r:?}");
+    assert!(!r.differs(), "{r:?}");
+    // The same arm with the build's light bits off on that frame, in either build.
+    for (head, base) in [
+        (dump(std::slice::from_ref(&unlit)), plain.clone()),
+        (plain.clone(), dump(std::slice::from_ref(&unlit))),
+    ] {
+        let r = report(&head, &base);
+        assert_eq!(
+            (r.differing_compared, r.state_differing, r.dark_arms),
+            (0, 0, 1),
+            "{r:?}"
+        );
+        assert!(r.firsts[0].contains("arms on a dark ground"), "{r:?}");
+        assert_eq!(verdict(&r, None).0, 1);
+    }
+    // Any arm in a dark script, its light bits on or not.
+    let dark = |f: &str| dump(&[f.to_string()]).replacen("P light/", "P dark/schemes/", 1);
+    let r = report(&dark(&lit), &dark(&frame(&[])));
+    assert_eq!(r.dark_arms, 1, "{r:?}");
+    assert_eq!(
+        r.firsts,
+        [
+            "differs dark/schemes/typing.trail S - F0 t=0.000: arms on a dark ground \
+          head=light=3 arms=glass:glow_under base=light=0 arms="
+        ]
+    );
+    assert!(r.totals().ends_with(" dark_arms=1"), "{}", r.totals());
+    // A dark script's frames with no arm pass; a script merely named for the dark does not
+    // count as one.
+    let r = report(&dark(&frame(&[])), &dark(&frame(&[])));
+    assert!(!r.differs(), "{r:?}");
+    let named = dump(&[lit]).replacen("P light/typing", "P flip/light-to-dark", 1);
+    let r = report(&named, &named);
+    assert_eq!((r.arm_frames, r.dark_arms), (1, 0), "{r:?}");
+    assert!(dark_script("crates/x/trail-diff/dark/split.trail"));
+    assert!(!dark_script("dark.trail") && !dark_script("glass/flip-dark-to-light.trail"));
 }
 
 #[test]
@@ -187,7 +237,7 @@ fn the_ledger_compares_as_a_stream_where_no_arm_touched_the_under_stream() {
     );
     assert_eq!(
         r.firsts,
-        ["differs dark/typing.trail S - F0 t=0.000: ledger.ink head=dddd base=ddde"]
+        ["differs light/typing.trail S - F0 t=0.000: ledger.ink head=dddd base=ddde"]
     );
     for under in [
         "light=1 arms=glass:glow_under",
@@ -284,22 +334,23 @@ fn each_script_prints_its_first_difference_and_its_arm_frames_as_ranges() {
     assert_eq!(
         r.firsts,
         [
-            "differs dark/typing.trail S - F3 t=3.000: state.stardust head=aaab base=aaaa",
+            "differs light/typing.trail S - F3 t=3.000: state.stardust head=aaab base=aaaa",
             "differs light/flip.trail S Default Light F0 t=0.000: px head=80x40:7 base=80x40:9999",
         ]
     );
     assert_eq!(
         r.arms,
-        ["arms dark/typing.trail S - glass:glow_under: F0-F2 F4"]
+        ["arms light/typing.trail S - glass:glow_under: F0-F2 F4"]
     );
     assert_eq!(
         r.totals(),
-        "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1"
+        "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1 dark_arms=0"
     );
     let printed = r.render();
     assert!(
-        printed
-            .ends_with("scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1\n"),
+        printed.ends_with(
+            "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1 dark_arms=0\n"
+        ),
         "{printed}"
     );
 }
@@ -311,10 +362,10 @@ fn a_run_or_script_one_build_lacks_differs() {
     let r = report(&two, &one);
     assert_eq!(r.differing_compared, 1, "{r:?}");
     assert!(r.firsts[0].contains("run head=Default base=-"), "{r:?}");
-    let r = report(&one, &one.replacen("dark/typing", "dark/other", 1));
+    let r = report(&one, &one.replacen("light/typing", "light/other", 1));
     assert_eq!(r.differing_compared, 1, "{r:?}");
     assert!(
-        r.firsts[0].contains("script head=dark/typing.trail"),
+        r.firsts[0].contains("script head=light/typing.trail"),
         "{r:?}"
     );
 }
@@ -508,6 +559,8 @@ fn the_base_is_the_parent_unless_named() {
     assert_eq!((a.base, a.jobs), (Base::Ref("abc123".into()), Some(3)));
     let a = parse_args(&args(&["--control", "plant"])).expect("ok");
     assert_eq!(a.control, Some(Control::Plant));
+    let a = parse_args(&args(&["--control", "dark-arm"])).expect("ok");
+    assert_eq!(a.control, Some(Control::DarkArm));
 }
 
 #[test]
@@ -555,6 +608,28 @@ fn the_exit_says_same_differs_or_whether_a_control_held() {
             .1
             .is_some_and(|l| l.starts_with("control plant: held")),
     );
+    let dark = Report {
+        dark_arms: 4,
+        ..Report::default()
+    };
+    assert_eq!(
+        verdict(&dark, None),
+        (1, None),
+        "an arm on a dark ground fails"
+    );
+    assert_eq!(held(&dark, Control::Same), 1);
+    assert_eq!(held(&dark, Control::DarkArm), 0);
+    assert_eq!(
+        held(&stream, Control::DarkArm),
+        1,
+        "a difference that is no dark arm does not hold the dark-arm control"
+    );
+    assert_eq!(held(&same, Control::DarkArm), 1);
+    assert!(
+        verdict(&dark, Some(Control::DarkArm))
+            .1
+            .is_some_and(|l| l.starts_with("control dark-arm: held") && l.contains("dark_arms=4")),
+    );
     assert_eq!(not_run("x").code, 3);
 }
 
@@ -571,6 +646,36 @@ fn the_plant_lowers_body_frame_top_by_one() {
     let planted = plant(ribbon).expect("ribbon.rs declares BODY_FRAME_TOP");
     assert_ne!(planted, ribbon);
     assert_eq!(planted.len(), ribbon.len(), "one value, one digit lower");
+}
+
+/// The dark-arm plant notes its arm, touching no stream, on the line after the report's own
+/// `ArmsDrawn::NONE`, indented as it is, in the file it plants: `None` where no line or more than
+/// one holds the needle, or the needle sits mid-line.
+#[test]
+fn the_dark_arm_plant_notes_an_arm_on_every_frame() {
+    let text =
+        "fn arms() -> ArmsDrawn {\n        let mut arms = ArmsDrawn::NONE;\n        arms\n}\n";
+    assert_eq!(
+        plant_arm(text).as_deref(),
+        Some(
+            "fn arms() -> ArmsDrawn {\n        let mut arms = ArmsDrawn::NONE;\n        \
+             arms.note(\"planted\", crate::state_words::Streams::NONE);\n        arms\n}\n"
+        )
+    );
+    assert_eq!(plant_arm("fn f() {}\n"), None);
+    assert_eq!(plant_arm(&format!("{text}{text}")), None, "two needles");
+    assert_eq!(
+        plant_arm("x; let mut arms = ArmsDrawn::NONE;\n"),
+        None,
+        "mid-line"
+    );
+    let pipeline = include_str!("../../aterm-effects/src/pipeline_native.rs");
+    let planted = plant_arm(pipeline).expect("pipeline_native.rs reports its arms");
+    assert_eq!(
+        planted.matches("arms.note(\"planted\"").count(),
+        1,
+        "one arm planted"
+    );
 }
 
 #[test]

@@ -6,9 +6,16 @@
 //! Trust grades every passing obligation on three axes (`trust_types::authority_grade`):
 //! `encoding` (where the checked proposition came from), `discharge` (who decided it) and
 //! `premises`. Only `encoding = proven-calculus` (a VC calculus proved sound in the Clean
-//! kernel) makes a proof a claim about the program; no proof authority states it yet, so the
-//! counter starts at 0. The grades ride `targo trust check`'s per-package record
-//! ([`record_path`], read by [`tally`]), never the terminal log or `report.ndjson`.
+//! kernel) makes a proof a claim about the program. One proof authority states it: Trust's
+//! VF5 `CalculusRowProved` (F1's calculus over SemR, `vc_sound_F1`/`compose_F1` admitted
+//! through Clean's reference entry), always as discharge [`CALCULUS_DISCHARGE`] with the
+//! premises [`CALCULUS_PREMISES`]; this counter counts exactly those rows ([`is_calculus_row`])
+//! and refuses a `proven-calculus` line graded any other way. The grades ride `targo trust
+//! check`'s per-package record ([`record_path`], read by [`tally`]), never the terminal log or
+//! `report.ndjson`.
+//!
+//! A calculus row is not `Certified`: Trust reports it `Trusted` until the owner's E4.7 ruling,
+//! and this counter is separate from any `Certified` total.
 //!
 //! The ledger ([`EPOCHS`], [`parse_epochs`]) is versioned rows, the last one current. A row
 //! maps the grade a proof had before it to the grade it is credited at now, and holds the
@@ -16,7 +23,14 @@
 //!
 //! A prover that states no grade (targo 0.11.0, for one) writes obligation lines without the
 //! three fields, and its record reads as ungraded and counts 0 ([`Credit::line`]). A
-//! half-graded line or an unknown encoding is refused: a grade nobody can read is not credit.
+//! half-graded line, and any line Trust's own `trust.obligations.v1` reader refuses or its
+//! writer never writes (an unknown encoding, discharge or premise, premises out of order or
+//! repeated, a pair no authority states, a grade on a status that does not admit it, a key
+//! written twice), is refused: a grade nobody can read is not credit.
+//!
+//! What this cannot check: that Trust wrote the record. Trust's header carries no seal yet
+//! (`"seal": {"absent": "A8"}`), so a file shaped like a record counts as one; the counter
+//! refuses only what Trust would not write.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +43,13 @@ pub const EPOCHS: &str = "crates/aterm-release/trust/credit.tsv";
 pub const RECORD_SCHEMA: &str = "trust.obligations.v1";
 /// The encoding that earns calculus credit.
 pub const CALCULUS: &str = "proven-calculus";
+/// The one discharge Trust's calculus authority (`CalculusRowProved`) states: Clean's fenced
+/// reference entry accepted the row's `RowProved` judgment.
+pub const CALCULUS_DISCHARGE: &str = "kernel-reference-checked";
+/// The premises Trust's calculus authority states, in Trust's declaration order
+/// (`trust_types::authority_grade::CALCULUS_ROW_PREMISES`): SemR's reading of the artifact,
+/// the target κ, and the closed-world entry.
+pub const CALCULUS_PREMISES: [&str; 3] = ["semr-translation", "target-kappa", "closed-world-entry"];
 /// A row no proof authority graded.
 pub const UNGRADED: &str = "ungraded";
 /// The grade of a proof before the first epoch: `proved`, with no axes.
@@ -51,6 +72,40 @@ const DISCHARGES: [&str; 6] = [
     "solver-asserted",
     "compiler-composed",
     "assumed",
+];
+
+/// The premise classes a compiler may state, in Trust's declaration order
+/// (`trust_types::authority_grade::GradePremise`): a written grade lists its premises in this
+/// order with none repeated.
+const PREMISES: [&str; 15] = [
+    "parameter-view",
+    "requires-link",
+    "argument-premise",
+    "type-invariant-certificate",
+    "closed-world-callers",
+    "panic-free-callee-registry",
+    "sibling-rows",
+    "body-proof-group",
+    "requires-assumed-at-entry",
+    "user-assume-total",
+    "sibling-premises",
+    "executor-protocol",
+    "semr-translation",
+    "target-kappa",
+    "closed-world-entry",
+];
+/// The (encoding, discharge) pairs a compiler states (`trust_types::authority_grade::
+/// ADMITTED_AXES`): a record naming any other pair is one Trust's reader refuses.
+const ADMITTED_AXES: [(&str, &str); 9] = [
+    (CALCULUS, CALCULUS_DISCHARGE),
+    ("unvalidated-encoder", "kernel-reference-checked"),
+    ("e6-reflector", "kernel-reference-checked"),
+    ("unvalidated-encoder", "kernel-reconstructed"),
+    ("unvalidated-encoder", "solver-self-checked"),
+    ("unvalidated-encoder", "solver-asserted"),
+    ("unvalidated-encoder", "compiler-composed"),
+    ("e6-reflector", "kernel-reconstructed"),
+    ("not-encoded", "assumed"),
 ];
 
 /// One ledger row.
@@ -192,12 +247,15 @@ struct Line {
 
 /// Count one `trust.obligations.v1` record's proved obligations by grade. The header must
 /// name the schema; `fn` lines are skipped; an obligation line with none of `encoding`,
-/// `discharge`, `premises` is ungraded (a prover that states no grade).
+/// `discharge`, `premises` is ungraded (a prover that states no grade). A graded line is held
+/// to what Trust's own reader (`targo-trust` `check_grade_fields`) and writer allow
+/// ([`check_grade`]), and a key may appear once: Trust writes one line per key (the worst of a
+/// key's rows), so a record that repeats one is not Trust's.
 ///
 /// # Errors
 /// An empty record, another schema, a line that is not JSON, an obligation line with no
-/// status, a line with some but not all of the three grade fields, an encoding or discharge
-/// outside the vocabulary, or a half-`ungraded` triple.
+/// status, a key written twice, a line with some but not all of the three grade fields, or a
+/// grade [`check_grade`] refuses.
 pub fn tally(text: &str) -> Result<Tally, String> {
     let mut t = Tally::default();
     let mut lines = text.lines();
@@ -212,12 +270,18 @@ pub fn tally(text: &str) -> Result<Tally, String> {
             ));
         }
     }
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
     for (i, raw) in lines.enumerate() {
         let n = i + 2;
         let l: Line =
             aterm_json::from_str(raw).map_err(|e| format!("line {n} is not JSON: {e}"))?;
-        if l.key.is_none() {
+        let Some(key) = l.key else {
             continue; // a function's `fn` line
+        };
+        if let Some(first) = keys.insert(key.clone(), n) {
+            return Err(format!(
+                "line {n}: key {key:?} was written on line {first} too, and Trust writes one line per key"
+            ));
         }
         let status = l
             .status
@@ -233,22 +297,8 @@ pub fn tally(text: &str) -> Result<Tally, String> {
         };
         let graded = match &grade {
             None => false,
-            Some((e, d, p)) if e == UNGRADED || d == UNGRADED => {
-                if e != d || !p.is_empty() {
-                    return Err(format!(
-                        "line {n}: an ungraded row is encoding and discharge {UNGRADED} with no premises"
-                    ));
-                }
-                false
-            }
-            Some((e, d, _)) => {
-                if !ENCODINGS.contains(&e.as_str()) {
-                    return Err(format!("line {n}: unknown encoding {e:?}"));
-                }
-                if !DISCHARGES.contains(&d.as_str()) {
-                    return Err(format!("line {n}: unknown discharge {d:?}"));
-                }
-                true
+            Some((e, d, p)) => {
+                check_grade(&status, e, d, p).map_err(|why| format!("line {n}: {why}"))?
             }
         };
         if status != "proved" {
@@ -257,12 +307,85 @@ pub fn tally(text: &str) -> Result<Tally, String> {
         t.proved += 1;
         if graded {
             t.graded += 1;
-            if grade.is_some_and(|(e, _, _)| e == CALCULUS) {
+            if grade.is_some_and(|(e, d, p)| is_calculus_row(&e, &d, &p)) {
                 t.calculus += 1;
             }
         }
     }
     Ok(t)
+}
+
+/// Whether one obligation line's grade is one Trust writes, as its reader
+/// (`targo-trust` `check_grade_fields`, `ObligationGrade::admitted`) decides: `Ok(false)` for
+/// the written `ungraded` triple, `Ok(true)` for a grade.
+///
+/// # Errors
+/// An `ungraded` triple with another field or a premise; an encoding, discharge or premise
+/// outside Trust's vocabulary; premises out of Trust's declaration order or repeated; an
+/// (encoding, discharge) pair no proof authority states ([`ADMITTED_AXES`]); a
+/// [`CALCULUS`] grade that is not the calculus authority's ([`is_calculus_row`]); or a grade
+/// the status does not admit (a `proved` row any grade, an `unknown` row only an `assumed`
+/// one, no other row any).
+fn check_grade(status: &str, e: &str, d: &str, p: &[String]) -> Result<bool, String> {
+    if e == UNGRADED || d == UNGRADED {
+        if e != d || !p.is_empty() {
+            return Err(format!(
+                "an ungraded row is encoding and discharge {UNGRADED} with no premises"
+            ));
+        }
+        return Ok(false);
+    }
+    if !ENCODINGS.contains(&e) {
+        return Err(format!("unknown encoding {e:?}"));
+    }
+    if !DISCHARGES.contains(&d) {
+        return Err(format!("unknown discharge {d:?}"));
+    }
+    let mut at = Vec::with_capacity(p.len());
+    for premise in p {
+        let Some(i) = PREMISES.iter().position(|known| known == premise) else {
+            return Err(format!("unknown grade premise {premise:?}"));
+        };
+        at.push(i);
+    }
+    if !at.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(format!(
+            "grade premises {p:?} are not in Trust's declaration order without repeats"
+        ));
+    }
+    if !ADMITTED_AXES.contains(&(e, d)) {
+        return Err(format!(
+            "no proof authority states encoding {e:?} with discharge {d:?}"
+        ));
+    }
+    if e == CALCULUS && !is_calculus_row(e, d, p) {
+        return Err(format!(
+            "a {CALCULUS} grade is Trust's calculus authority's: discharge \
+             {CALCULUS_DISCHARGE} with premises {}, not {d} with {p:?}",
+            CALCULUS_PREMISES.join(", ")
+        ));
+    }
+    let admits = match status {
+        "proved" => true,
+        "unknown" => d == "assumed",
+        _ => false,
+    };
+    if !admits {
+        return Err(format!("a {status:?} row cannot carry a {d:?} grade"));
+    }
+    Ok(true)
+}
+
+/// Whether a grade is Trust's calculus authority's (`CalculusRowProved`, VF5): encoding
+/// [`CALCULUS`], discharge [`CALCULUS_DISCHARGE`], and every one of [`CALCULUS_PREMISES`]
+/// stated. Only such a proved row is "proved (calculus)".
+#[must_use]
+pub fn is_calculus_row(encoding: &str, discharge: &str, premises: &[String]) -> bool {
+    encoding == CALCULUS
+        && discharge == CALCULUS_DISCHARGE
+        && CALCULUS_PREMISES
+            .iter()
+            .all(|want| premises.iter().any(|p| p == want))
 }
 
 /// What a run's records say, against the current epoch.
@@ -406,7 +529,19 @@ mod tests {
 
     const HEADER: &str = r#"{"schema":"trust.obligations.v1","package":"alpha","lane":"advisory"}"#;
 
+    /// A record of `lines`, the n-th line's key made `alpha::f#n` (Trust writes one line per
+    /// key).
     fn record(lines: &[&str]) -> String {
+        let keyed: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| l.replacen("\"alpha::f#1\"", &format!("\"alpha::f#{}\"", i + 1), 1))
+            .collect();
+        record_raw(&keyed.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// A record of `lines` exactly as given.
+    fn record_raw(lines: &[&str]) -> String {
         let mut s = format!("{HEADER}\n{{\"fn\":\"alpha::f\",\"source\":null}}\n");
         for l in lines {
             s.push_str(l);
@@ -424,9 +559,25 @@ mod tests {
 
     /// An obligation line as a grading targo writes it.
     fn graded(status: &str, encoding: &str, discharge: &str) -> String {
+        graded_with(status, encoding, discharge, &[])
+    }
+
+    /// An obligation line with premises.
+    fn graded_with(status: &str, encoding: &str, discharge: &str, premises: &[&str]) -> String {
+        let premises = premises
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            r#"{{"col":0,"discharge":"{discharge}","encoding":"{encoding}","file":"src/lib.rs","key":"alpha::f#1","kind":"overflow","line":1,"premises":[],"status":"{status}","stop":null}}"#
+            r#"{{"col":0,"discharge":"{discharge}","encoding":"{encoding}","file":"src/lib.rs","key":"alpha::f#1","kind":"overflow","line":1,"premises":[{premises}],"status":"{status}","stop":null}}"#
         )
+    }
+
+    /// A row Trust's VF5 calculus authority (`CalculusRowProved`) graded, as targo-trust writes
+    /// it.
+    fn calculus(status: &str) -> String {
+        graded_with(status, CALCULUS, CALCULUS_DISCHARGE, &CALCULUS_PREMISES)
     }
 
     fn epoch(floor: u64) -> Epoch {
@@ -517,10 +668,11 @@ mod tests {
             "kernel-reference-guessed",
         )]);
         assert!(tally(&text).unwrap_err().contains("unknown discharge"));
-        // Negative control: one row graded proven-calculus is counted, and only when proved.
+        // Negative control: one row graded as Trust's calculus authority grades it is
+        // counted, and only when proved.
         let text = record(&[
-            &graded("proved", CALCULUS, "kernel-reconstructed"),
-            &graded("failed", CALCULUS, "kernel-reconstructed"),
+            &calculus("proved"),
+            &graded("failed", UNGRADED, UNGRADED),
             &graded("proved", "unvalidated-encoder", "solver-asserted"),
         ]);
         let t = tally(&text).unwrap();
@@ -538,6 +690,164 @@ mod tests {
         assert_eq!(
             c.line(Some(&epoch(1))),
             "proved (calculus): 1 of 2 proved [credit epoch 1, floor 1; graded]"
+        );
+    }
+
+    /// Trust VF5: the counter reads the calculus authority's grade off the record, as
+    /// targo-trust writes `CalculusRowProved`'s rows, and nothing else as calculus. A
+    /// `proven-calculus` line with another discharge, or with a premise dropped, is refused:
+    /// Trust states no such grade, so it is a record nobody can read.
+    #[test]
+    fn the_counter_reads_the_vf5_calculus_authority_from_the_record() {
+        let text = record(&[
+            &calculus("proved"),
+            &calculus("proved"),
+            &graded("proved", "unvalidated-encoder", "kernel-reference-checked"),
+            &graded("unknown", UNGRADED, UNGRADED),
+        ]);
+        let t = tally(&text).unwrap();
+        assert_eq!(
+            t,
+            Tally {
+                proved: 3,
+                calculus: 2,
+                graded: 3
+            }
+        );
+        let mut c = Credit::default();
+        c.add("alpha", Some(Ok(t)));
+        assert_eq!(
+            c.line(Some(&epoch(0))),
+            "proved (calculus): 2 of 3 proved [credit epoch 1, floor 0; graded]"
+        );
+        assert!(judge(&epoch(2), &c).is_empty(), "2 holds a floor of 2");
+        assert_eq!(judge(&epoch(3), &c).len(), 1, "and fails a floor of 3");
+
+        for bad in [
+            graded_with(
+                "proved",
+                CALCULUS,
+                "kernel-reconstructed",
+                &CALCULUS_PREMISES,
+            ),
+            graded_with(
+                "proved",
+                CALCULUS,
+                CALCULUS_DISCHARGE,
+                &["semr-translation", "target-kappa"],
+            ),
+            graded("proved", CALCULUS, CALCULUS_DISCHARGE),
+        ] {
+            let why = tally(&record(&[&bad])).unwrap_err();
+            assert!(
+                why.contains("calculus authority") || why.contains("no proof authority"),
+                "{why}"
+            );
+        }
+        assert!(is_calculus_row(
+            CALCULUS,
+            CALCULUS_DISCHARGE,
+            &CALCULUS_PREMISES.map(String::from)
+        ));
+        assert!(!is_calculus_row(
+            "unvalidated-encoder",
+            CALCULUS_DISCHARGE,
+            &CALCULUS_PREMISES.map(String::from)
+        ));
+    }
+
+    /// Review finding 4: a line Trust neither writes nor reads back is refused, not counted.
+    /// One line per key; premises in Trust's declaration order, none repeated, each a premise
+    /// Trust knows; an (encoding, discharge) pair some authority states; and a grade only on a
+    /// status that admits it. Negative controls beside each: the same record as Trust writes it
+    /// counts.
+    #[test]
+    fn a_line_trust_would_not_write_is_refused() {
+        // The same calculus line five times under one key: refused, not 5.
+        let line = calculus("proved");
+        let five = record_raw(&[&line, &line, &line, &line, &line]);
+        assert!(tally(&five).unwrap_err().contains("one line per key"));
+        let keyed = record(&[&line, &line, &line, &line, &line]);
+        assert_eq!(
+            tally(&keyed).unwrap().calculus,
+            5,
+            "control: five keys count five"
+        );
+
+        // Premises reordered, repeated, or unknown.
+        for (premises, want) in [
+            (
+                &["closed-world-entry", "semr-translation", "target-kappa"][..],
+                "declaration order",
+            ),
+            (
+                &[
+                    "target-kappa",
+                    "semr-translation",
+                    "closed-world-entry",
+                    "closed-world-entry",
+                ][..],
+                "declaration order",
+            ),
+            (
+                &[
+                    "semr-translation",
+                    "target-kappa",
+                    "closed-world-entry",
+                    "closed-world-entry",
+                ][..],
+                "declaration order",
+            ),
+            (
+                &[
+                    "semr-translation",
+                    "target-kappa",
+                    "closed-world-entry",
+                    "made-up",
+                ][..],
+                "unknown grade premise",
+            ),
+        ] {
+            let bad = graded_with("proved", CALCULUS, CALCULUS_DISCHARGE, premises);
+            let why = tally(&record(&[&bad])).unwrap_err();
+            assert!(why.contains(want), "{premises:?}: {why}");
+        }
+        assert_eq!(
+            tally(&record(&[&calculus("proved")])).unwrap().calculus,
+            1,
+            "control: the authority's premises in order"
+        );
+
+        // A grade on a status that does not admit it.
+        for status in ["failed", "unknown", "timeout"] {
+            let why = tally(&record(&[&calculus(status)])).unwrap_err();
+            assert!(why.contains("cannot carry"), "{status}: {why}");
+            let kr0 = graded(status, "e6-reflector", "kernel-reference-checked");
+            assert!(
+                tally(&record(&[&kr0]))
+                    .unwrap_err()
+                    .contains("cannot carry")
+            );
+        }
+        let assumed = graded("unknown", "not-encoded", "assumed");
+        assert_eq!(
+            tally(&record(&[&assumed])).unwrap().proved,
+            0,
+            "control: an unknown row may carry an assumed grade"
+        );
+
+        // A pair no authority states.
+        let pair = graded("proved", "e6-reflector", "solver-asserted");
+        assert!(
+            tally(&record(&[&pair]))
+                .unwrap_err()
+                .contains("no proof authority")
+        );
+        let ok = graded("proved", "unvalidated-encoder", "solver-asserted");
+        assert_eq!(
+            tally(&record(&[&ok])).unwrap().graded,
+            1,
+            "control: an admitted pair"
         );
     }
 

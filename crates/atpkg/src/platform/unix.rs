@@ -675,12 +675,27 @@ pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
 /// SIGTERM and SIGHUP armed to pass on to the child [`wait_standing_aside`] waits on, from before that child is spawned ([`arm_forwarding`]).
 pub struct Forwarding {
     previous: [(libc::c_int, libc::sighandler_t); 2],
+    /// This process's turn at its signal dispositions ([`FORWARDING_TURN`]), held until they are
+    /// put back.
+    _turn: std::sync::MutexGuard<'static, ()>,
 }
 
-/// Arm the SIGTERM and SIGHUP forwarding before the child is spawned.
+/// ONE FORWARDING AT A TIME: whatever arms this process's signal dispositions to forward them to a
+/// child it waits on ([`arm_forwarding`], a build's front) holds this until it has put them back.
+/// Two that overlapped would each keep what the other set as the disposition to restore, and the
+/// one that ended last would leave the other's (a SIGINT ignored, a handler with no child) on the
+/// process for good. A process runs one such wait (a lease, a front); a test binary runs many at
+/// once.
+pub static FORWARDING_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Arm the SIGTERM and SIGHUP forwarding before the child is spawned, once no other forwarding is
+/// armed in this process ([`FORWARDING_TURN`]).
 #[must_use]
 pub fn arm_forwarding() -> Forwarding {
     use std::sync::atomic::Ordering;
+    let turn = FORWARDING_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     HELD.store(0, Ordering::SeqCst);
     FORWARD_TO.store(ARMING, Ordering::SeqCst);
     let forward = forward_to_child as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -698,7 +713,10 @@ pub fn arm_forwarding() -> Forwarding {
             unsafe { libc::signal(*sig, libc::SIG_IGN) };
         }
     }
-    Forwarding { previous }
+    Forwarding {
+        previous,
+        _turn: turn,
+    }
 }
 
 impl Drop for Forwarding {
@@ -831,6 +849,10 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
     }
     std::process::ExitCode::from(u8::try_from(128 + sig).unwrap_or(255))
 }
+
+#[cfg(test)]
+#[path = "unix_forwarding_tests.rs"]
+mod forwarding_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

@@ -1426,7 +1426,7 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
             actions.push("Void");
             format!("drain-expired:{why}")
         }
-        Step::Wait(why) => format!("wait:{why}"),
+        Step::Wait(why) | Step::Tell(why) => format!("wait:{why}"),
         Step::Rearm => {
             let why = st.rearm(now);
             actions.push("Rearm");

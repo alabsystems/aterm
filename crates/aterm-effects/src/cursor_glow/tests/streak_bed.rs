@@ -3197,3 +3197,144 @@ fn comet_s_rail_tapers_behind_its_nucleus() {
         "control: laid even, Comet's rail is {eh} px deep at its head and {et} px behind it"
     );
 }
+
+/// Sparkle with its trail colour `pin` typed along [`LINE`] on row [`ROW`] of
+/// `tall_geom` at 80 ms a key through [`CursorGlow::tick`], the trail pin set
+/// (`saturated`: read nowhere, [`CursorGlow::sparkle_pin_saturated`]), on
+/// `page` with `ink` text. Every light it lays, each as its own colour and
+/// bright enough to hold a hue (the additive quads and halos; on paper the
+/// inks too, opaque enough that their colour reads within two levels a
+/// channel; on a dark page the inks are the night grounds that cancel a
+/// tinted page's cast, [`CursorGlow::ground_the_frame`], not lights):
+/// `(the most saturated, how many in Sparkle's gold hues at a gold's
+/// chroma, how many)`.
+fn sparkle_pinned_lights(
+    pin: u32,
+    (page, ink, dark): (u32, u32, bool),
+    saturated: bool,
+) -> (f32, usize, usize) {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let c = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: Some(pin),
+            accent: None,
+            duration_ms: 260,
+            length: 24,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Sparkle), false),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(GlowStyle::Sparkle),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+        },
+        CURSOR,
+        dark,
+        ink,
+        page,
+        0.5,
+    );
+    assert_eq!(
+        c.color & 0x00FF_FFFF,
+        pin,
+        "fixture: the trail colour is the pin"
+    );
+    let mut glow = CursorGlow::default();
+    glow.set_colour_pins(ColourPins {
+        trail: true,
+        accent: false,
+    });
+    glow.sparkle_pin_saturated = saturated;
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    text[0] = '$';
+    let mut t = Instant::now();
+    let (mut most, mut gold, mut lit) = (0.0f32, 0usize, 0usize);
+    let mut judge = |light: u32| {
+        let (h, s, v) = hsv(light);
+        if v < 24.0 / 255.0 {
+            return;
+        }
+        lit += 1;
+        most = most.max(s);
+        gold += usize::from((18.0..=60.0).contains(&h) && s > 0.4);
+    };
+    for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+        if k > 0 {
+            t += Duration::from_millis(80);
+            text[START as usize + k - 1] = ch;
+            glow.note_synthetic_typed(t, 1);
+        }
+        let caret = (ROW, START + k as u16);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for row in rows.iter_mut() {
+            for cell in row.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(ink), rgb(page));
+            }
+        }
+        for (col, cell) in rows[usize::from(ROW)].iter_mut().enumerate() {
+            cell.ch = text[col];
+        }
+        glow.observe_row(caret.0, caret.1, &text, t);
+        glow.observe_frame_text(Some(caret), &rows, t);
+        out.clear();
+        glow.tick(Some(caret), t, &c, g, &mut out);
+        for q in out.iter().chain(glow.under_quads()) {
+            for (color, alpha) in [(q.color, q.alpha), (q.color2, q.alpha2)] {
+                if alpha == 0 && color != 0 {
+                    judge(color & 0x00FF_FFFF);
+                } else if !dark && alpha >= 64 {
+                    judge(straight(color, alpha));
+                }
+            }
+        }
+        // A light laid over the page (paper's stars) is its straight colour.
+        for h in glow.halos().iter().filter(|h| {
+            h.mode == aterm_render::HaloMode::Add
+                || (!dark && h.mode == aterm_render::HaloMode::Over)
+        }) {
+            judge(h.color & 0x00FF_FFFF);
+        }
+    }
+    (most, gold, lit)
+}
+
+/// looks9's review of Q7: A PINNED COLOUR IS SPARKLE'S WHOLE TRAIL. Only the
+/// dark shower read the pin: pinned to `#b0b0c8` (saturation 0.12), the body
+/// and tail still burned the pin brought to the gold's chroma (saturation
+/// 0.73 on dark), and on paper the beads and moon were the fixed golds (951
+/// gold lights, pinned or not), and the stars stayed gold after them (the
+/// gallery's paper frames, review9fix round 1). Typed along a row pinned to `#b0b0c8` on the
+/// reference dark, Solarized Dark and paper, no light Sparkle lays reads
+/// over the pin's saturation by more than 0.04, and none is a gold. Negative
+/// control (`sparkle_pin_saturated`, the pin read nowhere): the trail
+/// reaches saturation 0.5 and more, and on paper lays golds.
+#[test]
+fn a_pinned_colour_is_sparkle_s_whole_trail() {
+    let pin = 0x00B0_B0C8u32;
+    let (_, pin_sat, _) = hsv(pin);
+    for (name, page) in [
+        ("dark", (0x0011_1318u32, 0x00C5_C8C6u32, true)),
+        ("solarized dark", (0x0000_2B36, 0x0083_9496, true)),
+        ("paper", (0x00FF_FFFF, 0x0022_2222, false)),
+    ] {
+        let (most, gold, lit) = sparkle_pinned_lights(pin, page, false);
+        assert!(lit > 100, "{name}: fixture: the trail lights ({lit})");
+        assert!(
+            most <= pin_sat + 0.04,
+            "{name}: a light reaches saturation {most:.2}, the pin's {pin_sat:.2}"
+        );
+        assert_eq!(gold, 0, "{name}: {gold} of {lit} lights are golds");
+        let (old_most, old_gold, _) = sparkle_pinned_lights(pin, page, true);
+        assert!(
+            old_most >= 0.5 && (page.2 || old_gold > 0),
+            "control: {name}: the pin read nowhere, the trail reaches only {old_most:.2} with {old_gold} golds"
+        );
+    }
+}

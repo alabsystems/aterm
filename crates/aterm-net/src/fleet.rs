@@ -1741,6 +1741,31 @@ pub fn serve_lan<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    serve_lan_within(
+        listener,
+        listening,
+        running,
+        HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
+/// [`serve_lan`], each connection's TLS and both proofs given `handshake_within` in place of
+/// [`HANDSHAKE_WITHIN`]: a test's peer, which serves in process and so must finish each
+/// handshake, gives it its hang detector.
+#[cfg(unix)]
+pub fn serve_lan_within<H, E>(
+    listener: crate::lan::Listener,
+    listening: &Listening,
+    running: &AtomicBool,
+    handshake_within: Duration,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
     let locality = Locality::Link(listener.scope);
     let empty = Arc::new(Denied::default());
     serve_inner(
@@ -1751,7 +1776,7 @@ pub fn serve_lan<H, E>(
         None,
         running,
         locality,
-        HANDSHAKE_WITHIN,
+        handshake_within,
         hand_over,
         on_event,
     );
@@ -3442,10 +3467,11 @@ mod tests {
         let serving = {
             let running = Arc::clone(&running);
             std::thread::spawn(move || {
-                serve(
+                serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     |served, _op| served.answer(echo_all),
                     move |event| {
                         let _ = events.lock().unwrap().send(event);
@@ -3555,10 +3581,11 @@ mod tests {
         let serving = {
             let running = Arc::clone(&running);
             std::thread::spawn(move || {
-                serve(
+                serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     move |served: Served, _op| {
                         let (answered, kept) = match end {
                             End::Answered => (
@@ -3655,10 +3682,11 @@ mod tests {
         let serving = {
             let running = Arc::clone(&running);
             std::thread::spawn(move || {
-                serve(
+                serve_with_handshake(
                     &listener,
                     &listening,
                     &running,
+                    HANG,
                     |served: Served, _op| {
                         let (local, answering) = CtlStream::pair()?;
                         let answerer = std::thread::spawn(move || {
@@ -4127,24 +4155,36 @@ mod tests {
         // blocking read on the still-open original descriptor fails at once with `EBADF`.
         let mut control_drained = false;
         let started = std::time::Instant::now();
+        // One pair serves every look that leaves it whole: a fresh pair per look parks a port in
+        // TIME_WAIT each time, and on a loaded machine, where the race shows later, the looks ran
+        // out of ephemeral ports (`EADDRNOTAVAIL`) before the drain showed.
+        let mut pair = None;
         while !control_drained && started.elapsed() < HANG {
-            let pair_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let pair_addr = pair_listener.local_addr().unwrap();
-            let reader = TcpStream::connect_timeout(&pair_addr, HANG).unwrap();
-            let (_writer, _) = pair_listener.accept().unwrap();
-            reader
-                .set_read_timeout(Some(Duration::from_millis(2)))
-                .unwrap();
+            let (reader, _writer) = pair.get_or_insert_with(|| {
+                let pair_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let pair_addr = pair_listener.local_addr().unwrap();
+                let reader = TcpStream::connect_timeout(&pair_addr, HANG).unwrap();
+                let (writer, _) = pair_listener.accept().unwrap();
+                reader
+                    .set_read_timeout(Some(Duration::from_millis(2)))
+                    .unwrap();
+                (reader, writer)
+            });
             for _ in 0..8 {
                 let dup = reader.try_clone().unwrap();
                 drop(dup);
             }
             let mut byte = [0u8; 1];
-            if (&reader)
-                .read(&mut byte)
-                .is_err_and(|e| e.raw_os_error() == Some(libc::EBADF))
-            {
-                control_drained = true;
+            match (&*reader).read(&mut byte) {
+                Err(e) if e.raw_os_error() == Some(libc::EBADF) => control_drained = true,
+                // Still whole: the next look reuses it.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                // Anything else spoils it: the next look opens another.
+                _ => pair = None,
             }
         }
 

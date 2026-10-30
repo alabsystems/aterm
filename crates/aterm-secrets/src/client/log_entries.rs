@@ -95,9 +95,6 @@ pub(super) fn trusted_configured_log(
 }
 
 pub(super) fn trusted_local_log(paths: &Paths, config: &Config) -> crate::Result<Option<Log>> {
-    let Some(_observation) = super::StateLock::observe(paths)? else {
-        return Ok(None);
-    };
     let state = super::load_state(paths)?;
     if state.membership != super::Stored::In || state.failed || !state.pending.is_empty() {
         return Ok(None);
@@ -326,18 +323,53 @@ pub(super) fn addressed_to(envelope: &Envelope, identity: &Identity) -> crate::R
 /// (F15) has no envelope locker, and reads the log; one an admin's rotation left out does not.
 pub(super) fn log_alone_admits(log: &Log, identity: &Identity) -> crate::Result<bool> {
     let me = identity.recipient();
-    let membership = log.membership();
-    let Some((actor, _)) = membership
-        .members()
-        .iter()
-        .find(|(_, member)| member.binding.recipient() == me)
-    else {
+    if log.recipient_is_removed(&me)
+        || log.audience_left_out_recipient(&EpochAudience::Everyone, &me)
+    {
         return Ok(false);
-    };
+    }
+    let membership = log.membership();
+    let has_active_seat = membership.members().values().any(|member| {
+        member.binding.recipient() == me
+            && !member.node_key.is_some_and(|nk| {
+                nk != [0; 32]
+                    && matches!(
+                        membership.node(&nk),
+                        crate::membership_log::NodeStanding::Removed(_)
+                    )
+            })
+    });
+    let has_unproved_seat = !has_active_seat
+        && membership.unproved().iter().any(|f| {
+            f.recipient == me
+                && !f.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+        });
+    if !has_active_seat && !has_unproved_seat {
+        return Ok(false);
+    }
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(false);
     };
-    Ok(!log.left_out(&opened, &EpochAudience::Everyone, actor))
+    if has_active_seat {
+        return Ok(membership.members().iter().any(|(actor, member)| {
+            member.binding.recipient() == me
+                && !member.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                && !log.left_out(&opened, &EpochAudience::Everyone, actor)
+        }));
+    }
+    Ok(true)
 }
 
 /// How a seeded log stands to an envelope: whether it holds every record the envelope's entries
@@ -538,9 +570,9 @@ pub(super) fn seed_log_from_document_with_commons_generation(
     Ok(minted)
 }
 
-/// Overlay the winning entries from `log` across every [`Audience`] fully unwrapped by `identity`
-/// onto `doc`, leaving audiences `identity` cannot unwrap untouched. Returns whether `doc` changed.
-pub(super) fn overlay_log_onto_document(
+/// Overlay Commons membership and `aterm-commons-control-v1` from `log` onto `doc` without
+/// touching ordinary secret entries. Returns whether `doc` changed.
+pub(super) fn overlay_log_commons_onto_document(
     log: &Log,
     identity: &Identity,
     doc: &mut Document,
@@ -548,21 +580,40 @@ pub(super) fn overlay_log_onto_document(
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(false);
     };
-    let mut changed = false;
+    overlay_log_commons_with_opened(log, &opened, doc)
+}
 
+fn overlay_log_commons_with_opened(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    doc: &mut Document,
+) -> crate::Result<bool> {
+    let mut changed = false;
+    let roster = roster_from_doc_or_opened(Some(doc), Some(opened), Some(log));
     let initial_doc_recipients: BTreeSet<Recipient> = doc
         .machines()
         .into_iter()
         .filter_map(|m| Recipient::parse(&m.recipient).ok())
         .collect();
     if log.has_commons_epochs() {
+        let membership = log.membership();
         let mut admins: BTreeSet<String> = doc.admins().into_iter().collect();
         for machine in doc.machines() {
             if admins.contains(&machine.name) && admins.len() <= 1 {
                 continue;
             }
             if let Ok(recipient) = Recipient::parse(&machine.recipient)
-                && log.recipient_is_removed(&recipient)
+                && (log.recipient_is_removed(&recipient)
+                    || membership.members().values().any(|m| {
+                        m.binding.recipient() == recipient
+                            && m.node_key.is_some_and(|nk| {
+                                nk != [0; 32]
+                                    && matches!(
+                                        membership.node(&nk),
+                                        crate::membership_log::NodeStanding::Removed(_)
+                                    )
+                            })
+                    }))
                 && doc.remove_machine(&machine.name, true) == Ok(true)
             {
                 admins.remove(&machine.name);
@@ -577,11 +628,22 @@ pub(super) fn overlay_log_onto_document(
             .collect();
         let mut existing_names: BTreeSet<String> =
             doc.machines().into_iter().map(|m| m.name).collect();
-        for (actor, member) in log.membership().members() {
+        for (actor, member) in membership.members() {
             let recipient = member.binding.recipient();
             if existing_recipients.contains(&recipient)
                 || code_only.contains(&recipient.to_bech32())
-                || log.left_out(&opened, &EpochAudience::Everyone, actor)
+                || log.recipient_is_removed(&recipient)
+                || member.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                || log.left_out(opened, &EpochAudience::Everyone, actor)
+                || roster
+                    .as_ref()
+                    .is_some_and(|r| member_denied_by_roster(r, member))
             {
                 continue;
             }
@@ -625,7 +687,19 @@ pub(super) fn overlay_log_onto_document(
         let log_commons_recipients: BTreeSet<Recipient> = membership
             .members()
             .iter()
-            .filter(|(actor, _)| !log.left_out(&opened, &EpochAudience::Commons, actor))
+            .filter(|(actor, member)| {
+                !member.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                }) && !log.left_out(opened, &EpochAudience::Commons, actor)
+                    && !log.left_out(opened, &EpochAudience::Everyone, actor)
+                    && !roster
+                        .as_ref()
+                        .is_some_and(|r| member_denied_by_roster(r, member))
+            })
             .map(|(_, member)| member.binding.recipient())
             .filter(|r| {
                 !code_only.contains(&r.to_bech32())
@@ -641,6 +715,12 @@ pub(super) fn overlay_log_onto_document(
                     return false;
                 };
                 !log.recipient_is_removed(&r)
+                    && !log.audience_left_out_recipient(&EpochAudience::Commons, &r)
+                    && !log.audience_left_out_recipient(&EpochAudience::Everyone, &r)
+                    && !recipient_denied_by_roster_or_log(roster.as_ref(), log, &r)
+                    && !roster
+                        .as_ref()
+                        .is_some_and(|ros| ros.is_label_denied(&m.name))
                     && (cur_host_set.contains(&m.name) || log_commons_recipients.contains(&r))
             })
             .map(|m| m.name)
@@ -658,6 +738,20 @@ pub(super) fn overlay_log_onto_document(
             }
         }
     }
+    Ok(changed)
+}
+
+/// Overlay the winning entries from `log` across every [`Audience`] fully unwrapped by `identity`
+/// onto `doc`, leaving audiences `identity` cannot unwrap untouched. Returns whether `doc` changed.
+pub(super) fn overlay_log_onto_document(
+    log: &Log,
+    identity: &Identity,
+    doc: &mut Document,
+) -> crate::Result<bool> {
+    let Some(opened) = log.open_audience_entries(identity)? else {
+        return Ok(false);
+    };
+    let mut changed = overlay_log_commons_with_opened(log, &opened, doc)?;
 
     if opened.fully_unwrapped_audiences.is_empty() {
         return Ok(changed);
@@ -796,6 +890,154 @@ pub(super) fn overlay_log_onto_document(
     Ok(changed)
 }
 
+pub(crate) fn member_denied_by_roster(
+    roster: &crate::swarm_roster::SwarmRoster,
+    member: &crate::membership_log::Member,
+) -> bool {
+    let rec_str = member.binding.recipient().to_bech32();
+    roster.is_label_denied(&member.label)
+        || roster.is_label_denied(&member.name)
+        || member.node_key.is_some_and(|nk| {
+            nk != [0; 32] && roster.is_node_denied(&aterm_codec::hex::encode_lower(&nk))
+        })
+        || roster.members.iter().any(|row| {
+            row.recipient.trim() == rec_str
+                && super::steward::member_is_denied_in_roster(roster, row)
+        })
+}
+
+pub(super) fn recipient_denied_by_roster_or_log(
+    roster: Option<&crate::swarm_roster::SwarmRoster>,
+    log: &Log,
+    recipient: &Recipient,
+) -> bool {
+    let rec_str = recipient.to_bech32();
+    let membership = log.membership();
+    let newest_seat = membership
+        .members()
+        .iter()
+        .filter(|(_, mem)| mem.binding.recipient() == *recipient)
+        .max_by_key(|(actor, mem)| (log.record_index(&mem.entry).unwrap_or(0), *actor))
+        .map(|(_, mem)| mem);
+    roster.is_some_and(|ros| {
+        ros.members.iter().any(|row| {
+            row.recipient.trim() == rec_str && super::steward::member_is_denied_in_roster(ros, row)
+        })
+    }) || newest_seat.is_some_and(|mem| {
+        mem.node_key.is_some_and(|nk| {
+            nk != [0; 32]
+                && matches!(
+                    membership.node(&nk),
+                    crate::membership_log::NodeStanding::Removed(_)
+                )
+        }) || roster.is_some_and(|ros| member_denied_by_roster(ros, mem))
+    }) || (newest_seat.is_none()
+        && membership.unproved().iter().any(|f| {
+            f.recipient == *recipient
+                && (f.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                }) || roster.is_some_and(|ros| {
+                    ros.is_label_denied(&f.label)
+                        || ros.is_label_denied(&f.name)
+                        || f.node_key.is_some_and(|nk| {
+                            nk != [0; 32]
+                                && ros.is_node_denied(&aterm_codec::hex::encode_lower(&nk))
+                        })
+                }))
+        }))
+}
+
+fn merge_swarm_roster(
+    acc: &mut crate::swarm_roster::SwarmRoster,
+    other: crate::swarm_roster::SwarmRoster,
+) {
+    acc.deny_labels.extend(other.deny_labels);
+    acc.deny_nodes.extend(other.deny_nodes);
+    for m in other.members {
+        if let Some(existing) = acc
+            .members
+            .iter_mut()
+            .find(|row| row.recipient == m.recipient)
+        {
+            if existing.node_id.is_none() {
+                existing.node_id = m.node_id;
+            }
+            if existing.node_key.is_none() {
+                existing.node_key = m.node_key;
+            }
+            if existing.label != m.label && !existing.aliases.contains(&m.label) {
+                existing.aliases.push(m.label);
+            }
+            for alias in m.aliases {
+                if !existing.aliases.contains(&alias) {
+                    existing.aliases.push(alias);
+                }
+            }
+        } else {
+            acc.members.push(m);
+        }
+    }
+    acc.canonicalize();
+}
+
+pub(super) fn roster_from_doc_or_opened(
+    doc: Option<&Document>,
+    opened: Option<&crate::membership_log::entries::OpenedAudienceEntries>,
+    log: Option<&Log>,
+) -> Option<crate::swarm_roster::SwarmRoster> {
+    let mut combined: Option<crate::swarm_roster::SwarmRoster> = None;
+    let doc_bytes = doc
+        .and_then(|d| d.entry(&Audience::Everyone, crate::swarm_roster::ROSTER_ENTRY))
+        .map(|e| e.value.clone());
+    let opened_bytes = opened
+        .and_then(|o| {
+            o.by_audience
+                .get(&Audience::Everyone)?
+                .get(crate::swarm_roster::ROSTER_ENTRY)
+        })
+        .map(|e| e.value.clone());
+    for bytes in [doc_bytes, opened_bytes].into_iter().flatten() {
+        let Ok(text) = std::str::from_utf8(bytes.as_slice()) else {
+            continue;
+        };
+        let Ok(roster) = crate::swarm_roster::SwarmRoster::from_toml(text) else {
+            continue;
+        };
+        match &mut combined {
+            None => combined = Some(roster),
+            Some(acc) => merge_swarm_roster(acc, roster),
+        }
+    }
+    if let (Some(log), Some(roster)) = (log, &mut combined) {
+        let _ = super::roster::lift_restored_from_roster(log, roster);
+    }
+    combined
+}
+
+pub fn local_swarm_roster_for_log(
+    paths: &Paths,
+    log: &Log,
+) -> Option<crate::swarm_roster::SwarmRoster> {
+    let mut combined = super::roster::base_swarm_roster(paths).ok().flatten();
+    if let Ok(Some(identity)) = super::read_identity(paths)
+        && let Ok(Some(opened)) = log.open_audience_entries(&identity)
+        && let Some(r) = roster_from_doc_or_opened(None, Some(&opened), Some(log))
+    {
+        match &mut combined {
+            None => combined = Some(r),
+            Some(acc) => merge_swarm_roster(acc, r),
+        }
+    }
+    let mut roster = combined.unwrap_or_default();
+    super::roster::overlay_log_membership(log, &mut roster);
+    (!roster.members.is_empty() || !roster.deny_labels.is_empty() || !roster.deny_nodes.is_empty())
+        .then_some(roster)
+}
+
 pub(super) fn open_local_member_signer(
     paths: &Paths,
     log: &Log,
@@ -817,7 +1059,28 @@ pub(super) fn open_local_member_signer(
     let Some(member) = membership.members().get(&actor) else {
         return Ok(None);
     };
-    if &member.binding != req.binding() || log.audience_left_out(&EpochAudience::Everyone, &actor) {
+    if &member.binding != req.binding()
+        || log.recipient_is_removed(&member.binding.recipient())
+        || member.node_key.is_some_and(|nk| {
+            nk != [0; 32]
+                && matches!(
+                    membership.node(&nk),
+                    crate::membership_log::NodeStanding::Removed(_)
+                )
+        })
+        || log.audience_left_out(&EpochAudience::Everyone, &actor)
+        || log.audience_left_out_recipient(&EpochAudience::Everyone, &member.binding.recipient())
+        || super::local_recipient_denied_in_roster(paths)
+    {
+        return Ok(None);
+    }
+    if local_swarm_roster_for_log(paths, log).is_some_and(|roster| {
+        member_denied_by_roster(&roster, member)
+            || super::config(paths)
+                .ok()
+                .flatten()
+                .is_some_and(|cfg| roster.is_label_denied(&cfg.host))
+    }) {
         return Ok(None);
     }
     Ok(Some((actor, device, incarnation)))
@@ -830,11 +1093,25 @@ pub(super) fn open_local_member_signer(
 fn log_member_recipients(
     membership: &crate::membership_log::Membership,
     doc: &Document,
+    roster: Option<&crate::swarm_roster::SwarmRoster>,
 ) -> BTreeSet<Recipient> {
     let code_only: BTreeSet<String> = doc.code_only().into_iter().collect();
     membership
         .members()
         .values()
+        .filter(|member| {
+            !membership
+                .removed_recipients()
+                .contains(&member.binding.recipient())
+                && !member.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                && !roster.is_some_and(|r| member_denied_by_roster(r, member))
+        })
         .map(|member| member.binding.recipient())
         .filter(|recipient| !code_only.contains(&recipient.to_bech32()))
         .collect()
@@ -1090,7 +1367,8 @@ pub(super) fn keep_drafted(paths: &Paths, drafted: &Drafted, urls: &[String]) ->
     Ok(())
 }
 
-/// The recipients of each locker `doc` seals, by audience, less any `log` removed.
+/// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
+/// `[everyone]`.
 fn plan_recipients_of(
     doc: &Document,
     log: &Log,
@@ -1100,7 +1378,9 @@ fn plan_recipients_of(
         let mut recipients = BTreeSet::new();
         for text in &plan.recipients {
             let recipient = Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?;
-            if !log.recipient_is_removed(&recipient) {
+            if !log.recipient_is_removed(&recipient)
+                && !log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+            {
                 recipients.insert(recipient);
             }
         }
@@ -1270,11 +1550,25 @@ pub(super) fn draft_document_diff(
         .flat_map(Document::machines)
         .filter_map(|m| Recipient::parse(&m.recipient).ok())
         .collect();
-    let log_recipients = log_member_recipients(&membership, doc);
+    let roster = roster_from_doc_or_opened(Some(doc), Some(&opened), Some(&log));
+    let log_recipients = log_member_recipients(&membership, doc, roster.as_ref());
     let everyone_log_recipients: BTreeSet<Recipient> = membership
         .members()
         .iter()
-        .filter(|(m_actor, _)| !log.left_out(&opened, &EpochAudience::Everyone, m_actor))
+        .filter(|(m_actor, m)| {
+            !log.recipient_is_removed(&m.binding.recipient())
+                && !m.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                && !roster
+                    .as_ref()
+                    .is_some_and(|r| member_denied_by_roster(r, m))
+        })
         .map(|(_, m)| m.binding.recipient())
         .filter(|r| {
             !code_only.contains(&r.to_bech32())
@@ -1326,7 +1620,9 @@ pub(super) fn draft_document_diff(
             for text in &plan.recipients {
                 let recipient =
                     Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?;
-                if !log.recipient_is_removed(&recipient) {
+                if !log.recipient_is_removed(&recipient)
+                    && !log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+                {
                     plan_recipients.insert(recipient);
                 }
             }
@@ -1538,9 +1834,20 @@ pub(super) fn draft_document_diff(
             let mut commons_recipients: BTreeSet<Recipient> = membership
                 .members()
                 .iter()
-                .filter(|(m_actor, _)| {
-                    !log.left_out(&opened, &EpochAudience::Commons, m_actor)
+                .filter(|(m_actor, m)| {
+                    !log.recipient_is_removed(&m.binding.recipient())
+                        && !m.node_key.is_some_and(|nk| {
+                            nk != [0; 32]
+                                && matches!(
+                                    membership.node(&nk),
+                                    crate::membership_log::NodeStanding::Removed(_)
+                                )
+                        })
+                        && !log.left_out(&opened, &EpochAudience::Commons, m_actor)
                         && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                        && !roster
+                            .as_ref()
+                            .is_some_and(|r| member_denied_by_roster(r, m))
                 })
                 .map(|(_, m)| m.binding.recipient())
                 .filter(|r| {
@@ -1562,6 +1869,10 @@ pub(super) fn draft_document_diff(
                 for host in hosts {
                     if let Some(&r) = by_name.get(host)
                         && !log.recipient_is_removed(&r)
+                        && !log.audience_left_out_recipient(&EpochAudience::Commons, &r)
+                        && !log.audience_left_out_recipient(&EpochAudience::Everyone, &r)
+                        && !recipient_denied_by_roster_or_log(roster.as_ref(), &log, &r)
+                        && !roster.as_ref().is_some_and(|ros| ros.is_label_denied(host))
                     {
                         commons_recipients.insert(r);
                     }
@@ -1815,7 +2126,8 @@ fn trusted_commons_log_from_store(
 struct RecordsAuthorLock(std::fs::File);
 
 impl RecordsAuthorLock {
-    fn take(paths: &Paths) -> crate::Result<Self> {
+    fn open_lock_file(paths: &Paths) -> crate::Result<(std::path::PathBuf, std::fs::File)> {
+        use std::os::unix::fs::OpenOptionsExt;
         fsx::ensure_private_dir(&paths.dir)?;
         let path = paths.dir.join(".records.author.lock");
         let file = std::fs::OpenOptions::new()
@@ -1823,8 +2135,27 @@ impl RecordsAuthorLock {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
             .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::new(format!(
+                "{}: not a regular file",
+                path.display()
+            )));
+        }
+        aterm_uds::keep_out_of_children(&file)
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        Ok((path, file))
+    }
+
+    fn take(paths: &Paths) -> crate::Result<Self> {
+        let (path, file) = Self::open_lock_file(paths)?;
+        let file: std::fs::File = file;
         #[expect(
             clippy::disallowed_methods,
             reason = "the take of RecordsAuthorLock, whose Drop releases by LOCK_UN (File::unlock)"
@@ -1835,15 +2166,8 @@ impl RecordsAuthorLock {
     }
 
     fn try_take(paths: &Paths) -> crate::Result<Option<Self>> {
-        fsx::ensure_private_dir(&paths.dir)?;
-        let path = paths.dir.join(".records.author.lock");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let (path, file) = Self::open_lock_file(paths)?;
+        let file: std::fs::File = file;
         #[expect(
             clippy::disallowed_methods,
             reason = "the non-blocking take of RecordsAuthorLock, whose Drop releases by LOCK_UN (File::unlock)"
@@ -1882,7 +2206,7 @@ impl Drop for RecordsAuthorLock {
 /// Serialize local membership-log authoring under [`RecordsAuthorLock`] and commit `minted`
 /// records under [`StateLock`], re-drafting up to 3 times if concurrent peer ingress extended
 /// `paths.records_file()` while signing.
-fn author_and_commit_records<T>(
+pub(super) fn author_and_commit_records<T>(
     paths: &Paths,
     mut draft: impl FnMut(&Store) -> crate::Result<(Vec<Record>, T)>,
 ) -> crate::Result<(Vec<Record>, Store, T)> {
@@ -1973,7 +2297,7 @@ pub(super) fn genesis_signer_matches_local_lineage(
     Ok(true)
 }
 
-fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
+pub(super) fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
     if let Ok(Some(cfg)) = super::config(paths)
         && let Source::Url(url) = &cfg.source
     {
@@ -1981,11 +2305,11 @@ fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
     }
 }
 
-struct AuthorCtx<'a> {
-    actor: &'a MemberId,
-    writer_seed: &'a [u8; 32],
-    incarnation: [u8; 16],
-    authored_ms: u64,
+pub(super) struct AuthorCtx<'a> {
+    pub(super) actor: &'a MemberId,
+    pub(super) writer_seed: &'a [u8; 32],
+    pub(super) incarnation: [u8; 16],
+    pub(super) authored_ms: u64,
 }
 
 fn wrap_unwrapped_commons_and_everyone(
@@ -2059,7 +2383,7 @@ fn wrap_unwrapped_commons_and_everyone(
 pub fn publish_local_node_key(
     paths: &Paths,
     node_key: [u8; 32],
-    sign_proof: impl FnOnce(&RecordId, &MemberId) -> [u8; 64],
+    mut sign_proof: impl FnMut(&RecordId, &MemberId) -> [u8; 64],
 ) -> crate::Result<Option<Record>> {
     if node_key == [0; 32] {
         return Ok(None);
@@ -2074,8 +2398,8 @@ pub fn publish_local_node_key(
     if log.membership().get(&actor).and_then(|m| m.node_key) == Some(node_key) {
         return Ok(None);
     }
-    let mut sign_opt = Some(sign_proof);
-    let (minted, _, ()) = author_and_commit_records(paths, |store| {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let Some((minted, _, ())) = author_and_commit_records_until(paths, deadline, |store| {
         let Some(mut log) = store.log().cloned() else {
             return Ok((Vec::new(), ()));
         };
@@ -2085,10 +2409,7 @@ pub fn publish_local_node_key(
         if log.membership().get(&actor).and_then(|m| m.node_key) == Some(node_key) {
             return Ok((Vec::new(), ()));
         }
-        let Some(sign_fn) = sign_opt.take() else {
-            return Ok((Vec::new(), ()));
-        };
-        let proof = sign_fn(log.network(), &actor);
+        let proof = sign_proof(log.network(), &actor);
         let authored_ms = aterm_time::unix_millis().unwrap_or(0);
         let mut minted = Vec::new();
         device.with_seed(|writer_seed| -> crate::Result<()> {
@@ -2100,9 +2421,12 @@ pub fn publish_local_node_key(
             Ok(())
         })?;
         Ok((minted, ()))
-    })?;
+    })?
+    else {
+        return Ok(None);
+    };
     if !minted.is_empty() {
-        post_records_best_effort(paths, &encode_records(&minted));
+        post_records_aside(paths, encode_records(&minted));
     }
     Ok(minted.into_iter().next())
 }
@@ -2159,14 +2483,22 @@ fn draft_admit_member_in_log(
     let entrant_recipient = entrant.request.binding().recipient();
     let entrant_actor = entrant.member();
     let membership = log.membership();
-    if membership.removal(&entrant_actor).is_some() || log.recipient_is_removed(&entrant_recipient)
+    if membership.removal(&entrant_actor).is_some()
+        || log.recipient_is_removed(&entrant_recipient)
+        || (entrant.node_key != [0; 32]
+            && matches!(
+                membership.nodes().get(&entrant.node_key),
+                Some(crate::membership_log::NodeStanding::Removed(_))
+            ))
     {
         return Err(Error::new(
             "the vault removed this Mac, and an Admit does not let a removed Mac back in",
         ));
     }
     if membership.members().iter().any(|(m_actor, m)| {
-        (*m_actor == entrant_actor || m.binding.recipient() == entrant_recipient)
+        (*m_actor == entrant_actor
+            || m.binding.recipient() == entrant_recipient
+            || (entrant.node_key != [0; 32] && m.node_key == Some(entrant.node_key)))
             && log.left_out(&opened, &EpochAudience::Everyone, m_actor)
     }) || log.audience_left_out_recipient(&EpochAudience::Everyone, &entrant_recipient)
     {
@@ -2174,8 +2506,27 @@ fn draft_admit_member_in_log(
             "the vault's newest key leaves this Mac out on purpose, and an Admit does not let it back in",
         ));
     }
+    let local_roster = local_swarm_roster_for_log(paths, &log);
+    let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
+    let node_hex = aterm_codec::hex::encode_lower(&entrant.node_key);
+    let denied_by_roster = [local_roster.as_ref(), opened_roster.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|roster| {
+            roster.is_label_denied(&entrant.label)
+                || roster.is_label_denied(&entrant.name)
+                || (entrant.node_key != [0; 32] && roster.is_node_denied(&node_hex))
+                || recipient_denied_by_roster_or_log(Some(roster), &log, &entrant_recipient)
+        });
+    if denied_by_roster || recipient_denied_by_roster_or_log(None, &log, &entrant_recipient) {
+        return Err(Error::new(
+            "this Mac is on the swarm deny-list, and an Admit does not let a denied Mac back in",
+        ));
+    }
     if membership.members().iter().any(|(m_actor, m)| {
-        (*m_actor == entrant_actor || m.binding.recipient() == entrant_recipient)
+        (*m_actor == entrant_actor
+            || m.binding.recipient() == entrant_recipient
+            || (entrant.node_key != [0; 32] && m.node_key == Some(entrant.node_key)))
             && &m.binding != entrant.request.binding()
     }) {
         return Err(Error::new(
@@ -2224,37 +2575,23 @@ fn draft_admit_member_in_log(
     Ok(minted)
 }
 
-/// Sign [`Body::Remove`] for `target` with this member's Commons device key and rotate both
-/// [`EpochAudience::Everyone`] and [`EpochAudience::Commons`] epochs to the remaining active
-/// members (`F18`, `§3.3.7`).
+/// Sign [`Body::Remove`] for `target` with this member's Commons device key and mint a new epoch
+/// for every audience it was in that this Mac opens (`[everyone]` with the revoke cascade,
+/// Commons, and each host list whose newest epoch wraps it), wrapped to the members who remain
+/// (`F16`, `§3.3.7`): [`super::remove_member`] by actor, posted to the vault's source. Where
+/// another member's removal of `target` is here already, it signs this Mac's share at that
+/// removal's cutoff instead, so the two form a quorum `Remove`, and a repeat signs nothing.
 ///
 /// # Errors
 /// Local custody holds no seeded log, this Mac is not an active bound member, or `target` has no
 /// entry in the log.
 pub fn remove_member_in_log(paths: &Paths, target: MemberId) -> crate::Result<Vec<Record>> {
-    let minted = remove_member_in_log_local(paths, target, true)?;
+    let minted = super::remove::remove_actor(paths, target)?;
     if !minted.is_empty() {
         let wire = encode_records(&minted);
         post_records_best_effort(paths, &wire);
     }
     Ok(minted)
-}
-
-pub(super) fn remove_member_in_log_local(
-    paths: &Paths,
-    target: MemberId,
-    take_state_lock: bool,
-) -> crate::Result<Vec<Record>> {
-    if take_state_lock {
-        let (minted, _, ()) = author_and_commit_records(paths, |store| {
-            Ok((
-                draft_retire_in_log(paths, store, &[target], &BTreeSet::new())?,
-                (),
-            ))
-        })?;
-        return Ok(minted);
-    }
-    retire_recipients_in_log_local(paths, &[target], &BTreeSet::new())
 }
 
 pub(super) fn retire_recipients_in_log_local(
@@ -2273,7 +2610,7 @@ pub(super) fn retire_recipients_in_log_local(
     Ok(minted)
 }
 
-fn draft_retire_in_log(
+pub(super) fn draft_retire_in_log(
     paths: &Paths,
     store: &Store,
     targets: &[MemberId],
@@ -2420,7 +2757,7 @@ fn draft_retire_in_log(
     Ok(minted)
 }
 
-fn carried_audience_recipients(
+pub(super) fn carried_audience_recipients(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     audience: &EpochAudience,
@@ -2428,16 +2765,22 @@ fn carried_audience_recipients(
     exclude_recipients: &BTreeSet<Recipient>,
 ) -> BTreeSet<Recipient> {
     let removed = log.removed_recipients();
+    let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
     let left_out_recipients: BTreeSet<Recipient> = log
         .membership()
         .members()
         .iter()
-        .filter(|(actor, _)| {
+        .filter(|(actor, m)| {
             log.left_out(opened, audience, actor)
                 || log.left_out(opened, &EpochAudience::Everyone, actor)
+                || roster
+                    .as_ref()
+                    .is_some_and(|r| member_denied_by_roster(r, m))
         })
         .map(|(_, m)| m.binding.recipient())
         .collect();
+    let recipient_denied_by_roster =
+        |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), log, r);
     let mut out: BTreeSet<Recipient> = active_members
         .iter()
         .copied()
@@ -2445,6 +2788,9 @@ fn carried_audience_recipients(
             !removed.contains(r)
                 && !exclude_recipients.contains(r)
                 && !left_out_recipients.contains(r)
+                && !recipient_denied_by_roster(r)
+                && !log.audience_left_out_recipient(audience, r)
+                && !log.audience_left_out_recipient(&EpochAudience::Everyone, r)
         })
         .collect();
     if let Some(max_ids) = opened.maximal_epochs.get(audience)
@@ -2455,6 +2801,9 @@ fn carried_audience_recipients(
             if !removed.contains(&r)
                 && !exclude_recipients.contains(&r)
                 && !left_out_recipients.contains(&r)
+                && !recipient_denied_by_roster(&r)
+                && !log.audience_left_out_recipient(audience, &r)
+                && !log.audience_left_out_recipient(&EpochAudience::Everyone, &r)
                 && rest.iter().all(|ep_id| {
                     opened
                         .wrapped_recipients
@@ -2476,15 +2825,68 @@ fn rotate_epochs_after_remove(
     exclude_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
 ) -> crate::Result<()> {
+    rotate_after_removal(
+        log,
+        opened,
+        author,
+        exclude_recipients,
+        &Rotation::default(),
+        minted,
+    )
+    .map(|_| ())
+}
+
+/// What [`rotate_after_removal`] reseals beyond `[everyone]` and Commons.
+#[derive(Default)]
+pub(super) struct Rotation<'a> {
+    /// The `[everyone]` entries to put under the new epoch, where they differ from the opened
+    /// ones (a member's removal writes its cascade there, F16).
+    pub(super) everyone: Option<&'a BTreeMap<String, Entry>>,
+    /// Also rotate each host list this Mac opens whose newest epoch wraps a Mac the log removed
+    /// (F16: a removal mints a new epoch for every audience the Mac was in, §3.3.7).
+    pub(super) hosts: bool,
+}
+
+/// Mint a new epoch for `[everyone]` (where the log has one), for Commons (where the log has
+/// Commons epochs) and, with `rotation.hosts`, for each host list this Mac opens whose newest
+/// epoch wraps a removed Mac; wrap each to the members who remain in it and reseal its current
+/// entries under it (§3.3.7). Returns the audiences it rotated, as `everyone`, `commons` or the
+/// host list's header.
+///
+/// # Errors
+/// A record fails to draft, sign or insert.
+pub(super) fn rotate_after_removal(
+    log: &mut Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    author: &AuthorCtx<'_>,
+    exclude_recipients: &BTreeSet<Recipient>,
+    rotation: &Rotation<'_>,
+    minted: &mut Vec<Record>,
+) -> crate::Result<Vec<String>> {
+    let mut rotated = Vec::new();
     let membership = log.membership();
+    let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
     let remaining_members: BTreeSet<Recipient> = membership
         .members()
         .values()
+        .filter(|m| {
+            !log.recipient_is_removed(&m.binding.recipient())
+                && !m.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                && !roster
+                    .as_ref()
+                    .is_some_and(|r| member_denied_by_roster(r, m))
+        })
         .map(|m| m.binding.recipient())
         .filter(|r| !exclude_recipients.contains(r))
         .collect();
     if remaining_members.is_empty() {
-        return Ok(());
+        return Ok(rotated);
     }
     let everyone_recipients = carried_audience_recipients(
         log,
@@ -2526,7 +2928,10 @@ fn rotate_epochs_after_remove(
             let _ = log.insert(wrap_rec.clone())?;
             minted.push(wrap_rec);
         }
-        if let Some(everyone_entries) = opened.by_audience.get(&Audience::Everyone) {
+        let everyone_entries = rotation
+            .everyone
+            .or_else(|| opened.by_audience.get(&Audience::Everyone));
+        if let Some(everyone_entries) = everyone_entries {
             for entry in everyone_entries.values() {
                 let put_rec = log
                     .draft_put(author.actor, author.authored_ms, ep_id, &ep_key, entry)?
@@ -2535,8 +2940,22 @@ fn rotate_epochs_after_remove(
                 minted.push(put_rec);
             }
         }
+        rotated.push("everyone".to_owned());
     }
 
+    if rotation.hosts {
+        rotated.extend(rotate_host_lists(
+            log,
+            opened,
+            author,
+            exclude_recipients,
+            minted,
+        )?);
+    }
+
+    if !opened.max_generation.contains_key(&EpochAudience::Commons) {
+        return Ok(rotated);
+    }
     let next_commons_gen = opened
         .max_generation
         .get(&EpochAudience::Commons)
@@ -2574,7 +2993,89 @@ fn rotate_epochs_after_remove(
         let _ = log.insert(put_rec.clone())?;
         minted.push(put_rec);
     }
-    Ok(())
+    rotated.push("commons".to_owned());
+    Ok(rotated)
+}
+
+/// Mint the next epoch of every host list this Mac opens whose newest epoch is still wrapped to a
+/// Mac the log removed, or that has two or more newest epochs (the coverage rule, §3.3.7): wrapped
+/// to the recipients it carries over and resealing the list's current entries. Returns each
+/// rotated list's header. A list this Mac cannot open is left to its own members
+/// ([`super::tend_epochs`]).
+///
+/// # Errors
+/// A record fails to draft, sign or insert.
+pub(super) fn rotate_host_lists(
+    log: &mut Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    author: &AuthorCtx<'_>,
+    exclude_recipients: &BTreeSet<Recipient>,
+    minted: &mut Vec<Record>,
+) -> crate::Result<Vec<String>> {
+    let mut rotated = Vec::new();
+    let removed = log.removed_recipients();
+    let lists: Vec<(Vec<String>, Vec<RecordId>)> = opened
+        .maximal_epochs
+        .iter()
+        .filter_map(|(audience, max_ids)| match audience {
+            EpochAudience::Hosts(hosts) => Some((hosts.clone(), max_ids.clone())),
+            _ => None,
+        })
+        .collect();
+    for (hosts, max_ids) in lists {
+        let opens_all = max_ids
+            .iter()
+            .all(|id| opened.unwrapped_keys.contains_key(id));
+        let wraps_removed = max_ids.iter().any(|id| {
+            opened
+                .wrapped_recipients
+                .get(id)
+                .is_some_and(|set| !set.is_disjoint(&removed))
+        });
+        if !opens_all || !(wraps_removed || max_ids.len() > 1) {
+            continue;
+        }
+        let audience = EpochAudience::Hosts(hosts.clone());
+        let recipients = carried_audience_recipients(
+            log,
+            opened,
+            &audience,
+            &BTreeSet::new(),
+            exclude_recipients,
+        );
+        let next_gen = opened
+            .max_generation
+            .get(&audience)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let (ep_draft, ep_key) =
+            log.draft_epoch(author.actor, author.authored_ms, audience, next_gen)?;
+        let ep_rec = ep_draft.sign(author.writer_seed, author.incarnation)?;
+        let ep_id = *ep_rec.id();
+        let _ = log.insert(ep_rec.clone())?;
+        minted.push(ep_rec);
+        for &recipient in &recipients {
+            let wrap_rec = log
+                .draft_wrap(author.actor, author.authored_ms, ep_id, &ep_key, recipient)?
+                .sign(author.writer_seed, author.incarnation)?;
+            let _ = log.insert(wrap_rec.clone())?;
+            minted.push(wrap_rec);
+        }
+        let text_audience = Audience::Hosts(hosts);
+        if let Some(entries) = opened.by_audience.get(&text_audience) {
+            for entry in entries.values() {
+                let put_rec = log
+                    .draft_put(author.actor, author.authored_ms, ep_id, &ep_key, entry)?
+                    .sign(author.writer_seed, author.incarnation)?;
+                let _ = log.insert(put_rec.clone())?;
+                minted.push(put_rec);
+            }
+        }
+        rotated.push(text_audience.header());
+    }
+    Ok(rotated)
 }
 
 /// Self-close missing [`Body::Wrap`]s for active members (`§3.3.6`), and when `allow_coalesce` is
@@ -2631,11 +3132,28 @@ fn draft_reconcile_commons_log(
     let Some(identity) = super::read_identity(paths)? else {
         return Ok(Vec::new());
     };
+    let local_roster = local_swarm_roster_for_log(paths, &log);
     let active_recipients: BTreeSet<Recipient> = log
         .membership()
         .members()
-        .values()
-        .map(|m| m.binding.recipient())
+        .iter()
+        .filter(|(m_actor, m)| {
+            !log.recipient_is_removed(&m.binding.recipient())
+                && !m.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            log.membership().node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                && !log.audience_left_out(&EpochAudience::Everyone, m_actor)
+                && !log
+                    .audience_left_out_recipient(&EpochAudience::Everyone, &m.binding.recipient())
+                && !local_roster
+                    .as_ref()
+                    .is_some_and(|r| member_denied_by_roster(r, m))
+        })
+        .map(|(_, m)| m.binding.recipient())
         .collect();
     if !log.needs_commons_reconcile(&identity.recipient(), &active_recipients, allow_coalesce) {
         return Ok(Vec::new());
@@ -2645,6 +3163,15 @@ fn draft_reconcile_commons_log(
     };
     let Some(mut opened) = log.open_audience_entries(&identity)? else {
         return Ok(Vec::new());
+    };
+    let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
+    let roster_denies = |m: &crate::membership_log::Member| {
+        local_roster
+            .as_ref()
+            .is_some_and(|r| member_denied_by_roster(r, m))
+            || opened_roster
+                .as_ref()
+                .is_some_and(|r| member_denied_by_roster(r, m))
     };
 
     let authored_ms = aterm_time::unix_millis().unwrap_or(0);
@@ -2675,19 +3202,39 @@ fn draft_reconcile_commons_log(
             }
         }
         let membership = log.membership();
+        let active_member = |m: &crate::membership_log::Member| {
+            !log.recipient_is_removed(&m.binding.recipient())
+                && !m.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                && !log
+                    .audience_left_out_recipient(&EpochAudience::Everyone, &m.binding.recipient())
+                && !roster_denies(m)
+        };
         let commons_recipients: BTreeSet<Recipient> = membership
             .members()
             .iter()
-            .filter(|(m_actor, _)| {
-                !log.left_out(&opened, &EpochAudience::Commons, m_actor)
+            .filter(|(m_actor, m)| {
+                active_member(m)
+                    && !log.left_out(&opened, &EpochAudience::Commons, m_actor)
                     && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                    && !log.audience_left_out_recipient(
+                        &EpochAudience::Commons,
+                        &m.binding.recipient(),
+                    )
             })
             .map(|(_, m)| m.binding.recipient())
             .collect();
         let everyone_recipients: BTreeSet<Recipient> = membership
             .members()
             .iter()
-            .filter(|(m_actor, _)| !log.left_out(&opened, &EpochAudience::Everyone, m_actor))
+            .filter(|(m_actor, m)| {
+                active_member(m) && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+            })
             .map(|(_, m)| m.binding.recipient())
             .collect();
         wrap_unwrapped_commons_and_everyone(
@@ -2703,7 +3250,7 @@ fn draft_reconcile_commons_log(
     Ok(minted)
 }
 
-fn coalesce_concurrent_commons_epochs(
+pub(super) fn coalesce_concurrent_commons_epochs(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     author: &AuthorCtx<'_>,
@@ -2869,11 +3416,54 @@ enum LogEnrollPlan {
     },
 }
 
+fn is_enrollment_denied_by_roster(
+    paths: &Paths,
+    log: &Log,
+    recipient: &Recipient,
+    labels: &[&str],
+    node_key: Option<&[u8; 32]>,
+) -> bool {
+    let Some(roster) = local_swarm_roster_for_log(paths, log) else {
+        return false;
+    };
+    if labels.iter().any(|l| roster.is_label_denied(l)) {
+        return true;
+    }
+    if let Some(key) = node_key
+        && *key != [0; 32]
+        && roster.is_node_denied(&aterm_codec::hex::encode_lower(key))
+    {
+        return true;
+    }
+    let rec_str = recipient.to_bech32();
+    roster
+        .members
+        .iter()
+        .filter(|m| {
+            m.recipient.trim() == rec_str
+                || labels.iter().any(|l| {
+                    m.label.eq_ignore_ascii_case(l)
+                        || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(l))
+                })
+        })
+        .any(|m| {
+            roster.is_label_denied(&m.label)
+                || m.aliases.iter().any(|a| roster.is_label_denied(a))
+                || m.node_id
+                    .as_deref()
+                    .is_some_and(|n| roster.is_node_denied(n))
+                || m.node_key
+                    .as_deref()
+                    .is_some_and(|k| roster.is_node_denied(k))
+        })
+}
+
 fn plan_log_enrollment(
     paths: &Paths,
     log: &Log,
     trust: crate::commons::journal::Trust,
     binding: &crate::commons::binding::Binding,
+    already_locked: bool,
 ) -> crate::Result<LogEnrollPlan> {
     if *binding.network() != trust.network || *binding.authority() != trust.authority {
         return Err(Error::new("Commons enrollment has another local root"));
@@ -2887,7 +3477,8 @@ fn plan_log_enrollment(
     if let Some((actor, existing)) = membership
         .members()
         .iter()
-        .find(|(_, m)| m.binding.recipient() == binding.recipient())
+        .filter(|(_, m)| m.binding.recipient() == binding.recipient())
+        .max_by_key(|(actor, m)| (log.record_index(&m.entry).unwrap_or(0), *actor))
     {
         if &existing.binding != binding {
             return Err(Error::new(
@@ -2896,6 +3487,22 @@ fn plan_log_enrollment(
         }
         if log.audience_left_out(&EpochAudience::Commons, actor)
             || log.audience_left_out(&EpochAudience::Everyone, actor)
+            || log.audience_left_out_recipient(&EpochAudience::Commons, &binding.recipient())
+            || log.audience_left_out_recipient(&EpochAudience::Everyone, &binding.recipient())
+            || existing.node_key.is_some_and(|nk| {
+                nk != [0; 32]
+                    && matches!(
+                        membership.node(&nk),
+                        crate::membership_log::NodeStanding::Removed(_)
+                    )
+            })
+            || is_enrollment_denied_by_roster(
+                paths,
+                log,
+                &binding.recipient(),
+                &[&existing.label, &existing.name],
+                existing.node_key.as_ref(),
+            )
         {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
@@ -2907,7 +3514,22 @@ fn plan_log_enrollment(
         .find(|f| f.recipient == binding.recipient())
     {
         if !log.wraps_maximal_audience_to(&EpochAudience::Commons, &founder.recipient)
+            || log.audience_left_out_recipient(&EpochAudience::Commons, &founder.recipient)
             || log.audience_left_out_recipient(&EpochAudience::Everyone, &founder.recipient)
+            || founder.node_key.is_some_and(|nk| {
+                nk != [0; 32]
+                    && matches!(
+                        membership.node(&nk),
+                        crate::membership_log::NodeStanding::Removed(_)
+                    )
+            })
+            || is_enrollment_denied_by_roster(
+                paths,
+                log,
+                &binding.recipient(),
+                &[&founder.label, &founder.name],
+                founder.node_key.as_ref(),
+            )
         {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
@@ -2920,8 +3542,12 @@ fn plan_log_enrollment(
     // Pre-F15 fallback: allow a non-removed, durably admitted recipient listed in the cached
     // vault's `[machines]` when the local member can read it, signing with the member's device
     // key (never authority).
-    if let Ok(admin) =
+    let cached_admin = if already_locked {
+        super::enrollment::admin_cached_unlocked(paths)
+    } else {
         super::enrollment::admin_cached_until(paths, Instant::now() + Duration::from_secs(5))
+    };
+    if let Ok(admin) = cached_admin
         && admin.admissions.permits(trust, &binding.recipient())
         && let Some(machine) = admin
             .published_doc
@@ -2941,6 +3567,15 @@ fn plan_log_enrollment(
         let label = log
             .next_label(&machine.name, &BTreeSet::new(), &BTreeSet::new())
             .ok_or_else(|| Error::new("no m<N> label up to m99999 is free"))?;
+        if is_enrollment_denied_by_roster(
+            paths,
+            log,
+            &binding.recipient(),
+            &[&machine.name, &label],
+            None,
+        ) {
+            return Err(Error::new("Commons enrollment recipient is not admitted"));
+        }
         return Ok(LogEnrollPlan::VaultMachine {
             name: machine.name,
             label,
@@ -2969,7 +3604,7 @@ pub fn check_log_commons_enrollment(
     if log.audience_left_out(&EpochAudience::Commons, &actor) {
         return Err(Error::new("this peer is not an active Commons log member"));
     }
-    let _ = plan_log_enrollment(paths, &log, trust, binding)?;
+    let _ = plan_log_enrollment(paths, &log, trust, binding, false)?;
     Ok(())
 }
 
@@ -3027,7 +3662,7 @@ fn draft_enroll_commons_member(
         return Err(Error::new("this peer cannot open membership log epochs"));
     };
     let binding = request.binding().clone();
-    let plan = plan_log_enrollment(paths, &log, trust, &binding)?;
+    let plan = plan_log_enrollment(paths, &log, trust, &binding, true)?;
     let authored_ms = aterm_time::unix_millis().unwrap_or(0);
     let mut minted = Vec::new();
     let entry_id = device.with_seed(|writer_seed| -> crate::Result<RecordId> {
@@ -3185,7 +3820,9 @@ pub(super) fn mirror_log_to_servers(
     if let Some((store, _)) = trusted_seeded_store(paths, &config, &signer_pub, &merged.handoff)?
         && let Some(log) = store.log()
     {
-        if log.removes(&identity.recipient()) {
+        if log.removes(&identity.recipient())
+            || log.audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())
+        {
             return Ok(None);
         }
         // The log speaks for the envelope only where it holds every head's records. A head whose
@@ -3220,6 +3857,13 @@ pub(super) fn mirror_log_to_servers(
             }
         } else {
             import = true;
+            if overlay_log_commons_onto_document(log, &identity, &mut merged.doc)? {
+                log_changed_doc = true;
+                if merged.diverged {
+                    ledger_publish::reconcile_merged_metadata(&mut merged.doc, &heads)?;
+                }
+                merged.admissions = merged.admissions.retained(&merged.doc)?;
+            }
         }
     }
     if !merged.diverged && !log_changed_doc && !import {
@@ -3429,6 +4073,7 @@ pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<R
     if !wrap_gaps_pass(paths, now_ms, false)?.0 {
         return Ok(Vec::new());
     }
+    let _author = RecordsAuthorLock::take(paths)?;
     let _lock = StateLock::take(paths)?;
     Ok(wrap_gaps_pass(paths, now_ms, true)?.1)
 }
@@ -3443,12 +4088,17 @@ fn wrap_gaps_pass(paths: &Paths, now_ms: u64, sign: bool) -> crate::Result<(bool
     let Some(config) = super::config(paths)? else {
         return nothing;
     };
-    let Some(pin) = config.signer else {
+    if config.signer.is_none() {
+        return nothing;
+    }
+    let mut store = super::load_records(paths)?;
+    let Some(log_ref) = store.log() else {
         return nothing;
     };
-    let Some((mut store, digest)) = trusted_seeded_store(paths, &config, &pin, &[])? else {
+    if !log_ref.has_epochs() || !commons_log_matches_local_lineage(paths, log_ref)? {
         return nothing;
-    };
+    }
+    let digest = records_heads_digest(log_ref);
     let earlier = match read_gap_mark(paths) {
         Some(mark) if mark.digest == digest && (mark.due == 0 || now_ms < mark.due) => {
             return nothing;
@@ -3471,11 +4121,26 @@ fn wrap_gaps_pass(paths: &Paths, now_ms: u64, sign: bool) -> crate::Result<(bool
         write_gap_mark(paths, &digest, 0, &none_seen)?;
         return nothing;
     };
+    let local_roster = local_swarm_roster_for_log(paths, &log);
+    let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
+    let membership = log.membership();
     let audiences = crate::membership_log::admission_audiences(&opened);
     let mut due_now = Vec::new();
     let mut next_due: Option<u64> = None;
     let mut seen = BTreeMap::new();
     for gap in log.wrap_gaps(&opened, &audiences) {
+        if membership.get(&gap.member).is_some_and(|m| {
+            local_roster
+                .as_ref()
+                .is_some_and(|r| member_denied_by_roster(r, m))
+                || opened_roster
+                    .as_ref()
+                    .is_some_and(|r| member_denied_by_roster(r, m))
+        }) || recipient_denied_by_roster_or_log(local_roster.as_ref(), &log, &gap.recipient)
+            || recipient_denied_by_roster_or_log(opened_roster.as_ref(), &log, &gap.recipient)
+        {
+            continue;
+        }
         let Some(rank) = log.gap_rank(&opened, &gap, &actor) else {
             continue;
         };

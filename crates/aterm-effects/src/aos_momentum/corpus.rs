@@ -227,6 +227,8 @@ impl Look {
             block: self.block,
             glyph_span: Some((0, col as i32)),
             light_vivid: false,
+            chosen_hue: false,
+            chosen_base: false,
         };
         Presentation::of(Some((row, col)), &s0_geom(), &cfg)
     }

@@ -271,6 +271,8 @@ pub(super) const fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
         block: true,
         glyph_span: None,
         light_vivid: false,
+        chosen_hue: false,
+        chosen_base: false,
     }
 }
 

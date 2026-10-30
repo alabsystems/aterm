@@ -131,13 +131,18 @@ fn capture_bounded_impl(
     }
     #[cfg(unix)]
     cmd.process_group(0);
-    let deadline = Instant::now() + budget;
+    let after_now = |d: Duration| {
+        let now = Instant::now();
+        now.checked_add(d)
+            .unwrap_or_else(|| now + Duration::from_secs(3600))
+    };
+    let deadline = after_now(budget);
     #[cfg(all(test, unix))]
     observed_step(&observer, |o| &o.before_spawn);
     let mut child = cmd.spawn().map_err(|e| format!("it will not run: {e}"))?;
     #[cfg(all(test, unix))]
     let deadline = if observed_step(&observer, |o| &o.after_spawn) {
-        Instant::now() + budget
+        after_now(budget)
     } else {
         deadline
     };

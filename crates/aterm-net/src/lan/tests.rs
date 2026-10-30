@@ -88,7 +88,7 @@ fn bounded_fleet_listener_applies_link_policy_before_tls() {
             let running = running.clone();
             let delivered = delivered.clone();
             thread::spawn(move || {
-                fleet::serve_lan(
+                fleet::serve_lan_within(
                     listener,
                     &Listening {
                         secret: FleetSecret::new(&[7; 32]).unwrap(),
@@ -100,6 +100,7 @@ fn bounded_fleet_listener_applies_link_policy_before_tls() {
                         lifetime: within,
                     },
                     &running,
+                    within,
                     move |served, _| {
                         delivered.fetch_add(1, Ordering::SeqCst);
                         served.answer(|stream| {

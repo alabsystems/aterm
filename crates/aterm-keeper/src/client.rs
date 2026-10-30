@@ -358,10 +358,10 @@ impl KeeperClient {
     /// Read every frame already waiting, keeping only a SYNC answer; returns `false` once the keeper is gone.
     #[must_use]
     pub fn drain(&self) -> bool {
-        self.drain_with_refusals(|_| {})
+        self.drain_with_refusals(|_, _| {})
     }
 
-    fn drain_with_refusals(&self, mut refused: impl FnMut(u64)) -> bool {
+    fn drain_with_refusals(&self, mut refused: impl FnMut(u64, u64)) -> bool {
         use std::os::fd::AsRawFd as _;
         loop {
             let mut fds = [crate::sys::PollFd {
@@ -385,7 +385,7 @@ impl KeeperClient {
                 Ok(Some(Incoming {
                     frame: Frame::Refused { rdev, .. },
                     ..
-                })) => refused(rdev),
+                })) => refused(rdev, self.synced.get()),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return false,
             }
@@ -471,17 +471,34 @@ impl CompanionReceipt {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompanionFence {
+    after: u64,
+    until: u64,
+    refused: bool,
+}
+
 #[derive(Debug)]
 struct CompanionRead {
     receipt: std::sync::Arc<CompanionReceipt>,
-    sync: Option<u64>,
+    fence: Option<CompanionFence>,
 }
 
-fn confirm_companion(read: &mut Option<CompanionRead>, synced: u64, refused: bool) {
-    if !refused
-        && read
-            .as_ref()
-            .is_some_and(|r| r.sync.is_some_and(|n| n <= synced))
+const fn note_companion_refusal(read: &mut Option<CompanionRead>, synced: u64) {
+    if let Some(CompanionRead {
+        fence: Some(fence), ..
+    }) = read
+        && synced >= fence.after
+        && synced < fence.until
+    {
+        fence.refused = true;
+    }
+}
+
+fn confirm_companion(read: &mut Option<CompanionRead>, synced: u64) {
+    if read
+        .as_ref()
+        .is_some_and(|r| r.fence.is_some_and(|f| !f.refused && f.until <= synced))
         && let Some(read) = read.take()
     {
         read.receipt.confirm();
@@ -1010,9 +1027,6 @@ struct HeldMaster {
     header: MasterHeader,
     tag: Vec<u8>,
     journal: HeldJournal,
-    /// A refusal for this master on this connection prevents using its SYNC as
-    /// acceptance evidence.
-    companion_refused: bool,
 }
 
 /// Where a held master's crash-restore journal stands, as the keeper is told it (and told again
@@ -1078,16 +1092,20 @@ fn link_worker(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         if let Some(c) = &client {
-            let open = c.drain_with_refusals(|rdev| {
-                if let Some(h) = held.get_mut(&rdev) {
-                    h.companion_refused = true;
+            let open = c.drain_with_refusals(|rdev, synced_before| {
+                if let Some(HeldMaster {
+                    journal: HeldJournal::Region { read, .. },
+                    ..
+                }) = held.get_mut(&rdev)
+                {
+                    note_companion_refusal(read, synced_before);
                 }
             });
             let synced = c.synced();
             owed.retain(|_, sync| sync.is_none_or(|n| n > synced));
             for h in held.values_mut() {
                 if let HeldJournal::Region { read, .. } = &mut h.journal {
-                    confirm_companion(read, synced, h.companion_refused);
+                    confirm_companion(read, synced);
                 }
             }
             if !open {
@@ -1112,7 +1130,6 @@ fn link_worker(
                         header,
                         tag,
                         journal: HeldJournal::Unsaid,
-                        companion_refused: false,
                     },
                 );
                 Some(Send::Register(header.rdev))
@@ -1146,7 +1163,7 @@ fn link_worker(
                     len,
                     read: receipt.map(|receipt| CompanionRead {
                         receipt,
-                        sync: None,
+                        fence: None,
                     }),
                 };
                 peer.journal.then_some(Send::Companion(rdev))
@@ -1195,22 +1212,15 @@ fn link_worker(
             {
                 Ok(())
             }
-            Send::Companion(rdev) => match held.get(rdev) {
+            Send::Companion(rdev) => match held.get_mut(rdev) {
                 Some(HeldMaster {
-                    journal: HeldJournal::Region { region, len, .. },
+                    journal: HeldJournal::Region { region, len, read },
                     ..
-                }) => c.companion(*rdev, region, *len),
+                }) => send_companion(c, *rdev, region, *len, read),
                 _ => Ok(()),
             },
             Send::Frame(frame) => c.send(frame, None),
         };
-        if sent.is_ok()
-            && peer.journal
-            && matches!(&send, Send::Companion(_))
-            && let Err(e) = sync_companions(c, &mut held)
-        {
-            sent = Err(e);
-        }
         if sent.is_ok()
             && let Some(rdev) = must_reach
             && c.keeper_syncs()
@@ -1255,7 +1265,7 @@ fn unconfirm(owed: &mut Owed) {
 
 const fn unconfirm_companion(read: &mut Option<CompanionRead>) {
     if let Some(read) = read {
-        read.sync = None;
+        read.fence = None;
     }
 }
 
@@ -1267,30 +1277,32 @@ fn unconfirm_companions(held: &mut Held) {
     }
 }
 
-fn sync_companions(c: &KeeperClient, held: &mut Held) -> io::Result<()> {
-    // An older keeper gives no read evidence. Leave the receipt pending rather than
-    // treating a write, or absence of the capability, as permission to drop its region.
-    if !c.keeper_journals() || !c.keeper_syncs() {
+fn send_companion(
+    c: &KeeperClient,
+    rdev: u64,
+    region: &OwnedFd,
+    len: u64,
+    read: &mut Option<CompanionRead>,
+) -> io::Result<()> {
+    if !c.keeper_journals() {
         return Ok(());
     }
-    let pending = held.values().any(|h| {
-        matches!(
-            &h.journal, HeldJournal::Region { read: Some(read), .. } if read.sync.is_none()
-        )
-    });
-    if pending {
-        let n = c.sync()?;
-        for h in held.values_mut() {
-            if let HeldJournal::Region {
-                read: Some(read), ..
-            } = &mut h.journal
-                && read.sync.is_none()
-            {
-                read.sync = Some(n);
-            }
-        }
+    // An older keeper gives no read evidence. Leave the receipt pending rather than
+    // treating a write, or absence of the capability, as permission to drop its region.
+    if let Some(read) = read.as_mut()
+        && c.keeper_syncs()
+    {
+        let after = c.sync()?;
+        c.companion(rdev, region, len)?;
+        let until = c.sync()?;
+        read.fence = Some(CompanionFence {
+            after,
+            until,
+            refused: false,
+        });
+        return Ok(());
     }
-    Ok(())
+    c.companion(rdev, region, len)
 }
 
 fn reconnect(
@@ -1299,18 +1311,31 @@ fn reconnect(
     metas: &std::collections::BTreeMap<u64, Vec<u8>>,
     owed: &mut Owed,
 ) -> Option<KeeperClient> {
+    let out = reconnect_inner(peer, held, metas, owed);
+    if out.is_none() {
+        unconfirm_companions(held);
+    }
+    out
+}
+
+fn reconnect_inner(
+    peer: &LinkPeer,
+    held: &mut Held,
+    metas: &std::collections::BTreeMap<u64, Vec<u8>>,
+    owed: &mut Owed,
+) -> Option<KeeperClient> {
+    unconfirm_companions(held);
     let c = KeeperClient::connect(&peer.path, &peer.identity, Duration::from_secs(2)).ok()?;
     c.hello_link(&peer.build, peer.marker.clone(), peer.journal)
         .ok()?;
     let journals = peer.journal && c.keeper_journals();
-    for h in held.values_mut() {
-        h.companion_refused = false;
-    }
-    for (rdev, h) in held.iter() {
+    for (rdev, h) in held.iter_mut() {
         c.register(&h.master, h.header, h.tag.clone()).ok()?;
         if journals {
-            match &h.journal {
-                HeldJournal::Region { region, len, .. } => c.companion(*rdev, region, *len).ok()?,
+            match &mut h.journal {
+                HeldJournal::Region { region, len, read } => {
+                    send_companion(&c, *rdev, region, *len, read).ok()?;
+                }
                 HeldJournal::Released => c.companion_release(*rdev).ok()?,
                 HeldJournal::Unsaid => {}
             }
@@ -1336,9 +1361,6 @@ fn reconnect(
         for sync in owed.values_mut() {
             *sync = Some(n);
         }
-    }
-    if journals {
-        sync_companions(&c, held).ok()?;
     }
     Some(c)
 }
@@ -2110,6 +2132,62 @@ mod tests {
         );
         link.shutdown();
     }
+
+    #[test]
+    fn a_refused_companion_does_not_poison_a_later_valid_companion_on_the_same_link() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("akl-rc-")
+            .tempdir_in("/tmp")
+            .expect("exclusive fixture");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (rdev, register) = register_op("/dev/null", 1);
+        let link =
+            KeeperLink::start_marked(sock, Identity::same_uid(), "t".into(), None, None, true)
+                .expect("link");
+        assert!(link.enqueue(register));
+        let len = aterm_uds::shm::PAGE;
+        let bad_fd = OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null"));
+        let refused_receipt = std::sync::Arc::new(CompanionReceipt::default());
+        assert!(link.enqueue(LinkOp::Companion {
+            rdev,
+            region: bad_fd,
+            len: len as u64,
+            receipt: Some(std::sync::Arc::clone(&refused_receipt)),
+        }));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the window makes the region the keeper is sent"
+        )]
+        // SAFETY: this fixture's link and keeper only transfer/hold/query custody, never reopen, map, write or resize it; `_good` remains inert until it is dropped.
+        let (_good, good_custody) =
+            unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
+        let accepted_receipt = std::sync::Arc::new(CompanionReceipt::default());
+        assert!(link.enqueue(LinkOp::Companion {
+            rdev,
+            region: good_custody,
+            len: len as u64,
+            receipt: Some(std::sync::Arc::clone(&accepted_receipt)),
+        }));
+        step_until(
+            &mut server,
+            "the valid replacement companion after a refusal is confirmed",
+            |_| accepted_receipt.confirmed(),
+        );
+        assert!(
+            !refused_receipt.confirmed(),
+            "the refused companion's receipt is never confirmed"
+        );
+        assert!(
+            server
+                .core()
+                .companion_view(rdev)
+                .is_some_and(|v| v.offered.is_some()),
+            "the keeper holds the accepted replacement region"
+        );
+        link.shutdown();
+        drop(server);
+    }
 }
 
 /// What a full or ended link does with an op, on any unix (no keeper is reached).
@@ -2162,33 +2240,44 @@ mod offer_tests {
         ));
         let mut read = Some(CompanionRead {
             receipt: std::sync::Arc::clone(&receipt),
-            sync: None,
+            fence: None,
         });
-        confirm_companion(&mut read, u64::MAX, false);
+        confirm_companion(&mut read, u64::MAX);
         assert!(!receipt.confirmed() && read.is_some());
-        read.as_mut().expect("pending").sync = Some(7);
-        confirm_companion(&mut read, 6, false);
+        read.as_mut().expect("pending").fence = Some(CompanionFence {
+            after: 6,
+            until: 7,
+            refused: false,
+        });
+        note_companion_refusal(&mut read, 5);
+        note_companion_refusal(&mut read, 7);
+        confirm_companion(&mut read, 6);
         assert!(!receipt.confirmed() && read.is_some());
-        confirm_companion(&mut read, 7, true);
+        note_companion_refusal(&mut read, 6);
+        confirm_companion(&mut read, 7);
         assert!(!observer.load(std::sync::atomic::Ordering::Acquire));
         assert!(
             !receipt.confirmed() && read.is_some(),
             "a refusal is not acceptance"
         );
         unconfirm_companion(&mut read);
-        confirm_companion(&mut read, 7, false);
+        confirm_companion(&mut read, 7);
         assert!(!observer.load(std::sync::atomic::Ordering::Acquire));
         assert!(
             !receipt.confirmed() && read.is_some(),
             "the disconnected op is unsent"
         );
-        read.as_mut().expect("pending").sync = Some(1);
-        confirm_companion(&mut read, 0, false);
+        read.as_mut().expect("pending").fence = Some(CompanionFence {
+            after: 0,
+            until: 1,
+            refused: false,
+        });
+        confirm_companion(&mut read, 0);
         assert!(
             !receipt.confirmed() && read.is_some(),
             "reconnected but unanswered"
         );
-        confirm_companion(&mut read, 1, false);
+        confirm_companion(&mut read, 1);
         assert!(receipt.confirmed() && read.is_none());
         assert!(observer.load(std::sync::atomic::Ordering::Acquire));
 

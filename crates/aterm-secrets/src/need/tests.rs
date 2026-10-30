@@ -855,6 +855,46 @@ fn give_then_satisfied_fulfils_and_takes_the_ask_down() {
 }
 
 #[test]
+fn notary_requests_use_only_the_release_entry() {
+    let vault = vault();
+    crate::need::test_alab_policy(&vault.member);
+    let want = Want::parse("notary").unwrap();
+    assert_eq!(want.entry().as_deref(), Some("release-notary"));
+    assert_eq!(
+        want.hold_path(&vault.member.home),
+        Some(vault.member.home.join(".secrets/release-notary"))
+    );
+    let raised = raise(&vault.member, want.clone(), Purpose::ReleaseNotary).unwrap();
+    assert!(raised.line.contains("release-notary"), "{}", raised.line);
+
+    publish(&vault.admin, |doc| {
+        doc.set_entry(
+            &crate::text::Audience::Everyone,
+            "notary",
+            b"old credential",
+        )
+        .unwrap();
+    });
+    client::sync(&vault.member, None).unwrap();
+    assert!(
+        !list(&vault.member).unwrap()[0].got,
+        "the legacy entry cannot fulfill the typed request"
+    );
+
+    publish(&vault.admin, |doc| {
+        doc.set_entry(
+            &crate::text::Audience::Hosts(vec![HOST.into()]),
+            "release-notary",
+            b"new credential",
+        )
+        .unwrap();
+    });
+    client::sync(&vault.member, None).unwrap();
+    let sight = client::sight(&vault.member).unwrap().unwrap();
+    assert!(sight.held.contains("release-notary"));
+}
+
+#[test]
 fn a_decline_retires_with_its_note_and_files_no_entry() {
     let vault = vault();
     crate::need::test_alab_policy(&vault.member);

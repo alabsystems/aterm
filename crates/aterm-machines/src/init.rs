@@ -46,7 +46,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   restores, the ALab toolset and the Command Line Tools if missing (one sudo password). Then,
   on this Mac's console account (remote or another login defers; preferences need a person):
     {spotlight}
-    {secrets} (asking only the ALab vault's join password, or --vault's)
+    {secrets} (open default ALab joins automatically on the LAN; --vault may ask for a password)
     {permissions} (a row for each grant to switch on)
   and these three, all of them unless a flag names the ones to run:
     --profile   {profile}

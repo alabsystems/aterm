@@ -16,7 +16,7 @@ use astream_wire::{CausalCut, CausalEdge, CutViolation, Filter, Offset as WireOf
 pub type Offset = u64;
 use std::fmt;
 use std::io;
-#[cfg(feature = "identity")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +82,8 @@ pub struct FederationEndpoint {
     /// Capabilities attached immediately after connecting on guarded brokers.
     #[cfg(feature = "cap")]
     pub caps: Vec<astream_cap::Capability>,
+    /// Raw `(grant, tag)` pairs (as read from `capfile`) attached on connect.
+    pub grant_tags: Vec<(String, [u8; 32])>,
 }
 
 impl FederationEndpoint {
@@ -95,6 +97,7 @@ impl FederationEndpoint {
             io_timeout: Some(Duration::from_secs(10)),
             #[cfg(feature = "cap")]
             caps: Vec::new(),
+            grant_tags: Vec::new(),
         }
     }
 
@@ -116,6 +119,7 @@ impl FederationEndpoint {
             io_timeout: Some(Duration::from_secs(10)),
             #[cfg(feature = "cap")]
             caps: Vec::new(),
+            grant_tags: Vec::new(),
         }
     }
 
@@ -124,6 +128,13 @@ impl FederationEndpoint {
     #[must_use]
     pub fn with_caps(mut self, caps: Vec<astream_cap::Capability>) -> Self {
         self.caps = caps;
+        self
+    }
+
+    /// Attach raw `(grant, tag)` lines (e.g. loaded from `--cap-file`) presented on every dial.
+    #[must_use]
+    pub fn with_grant_tags(mut self, grant_tags: Vec<(String, [u8; 32])>) -> Self {
+        self.grant_tags = grant_tags;
         self
     }
 
@@ -163,6 +174,13 @@ impl FederationEndpoint {
             let mut ring: Vec<(&str, &[u8])> = Vec::with_capacity(self.caps.len().min(64));
             for cap in &self.caps {
                 ring.push((cap.filter.as_str(), cap.tag.as_slice()));
+            }
+            client.attach_all(ring)?;
+        }
+        if !self.grant_tags.is_empty() {
+            let mut ring: Vec<(&str, &[u8])> = Vec::with_capacity(self.grant_tags.len().min(64));
+            for (grant, tag) in &self.grant_tags {
+                ring.push((grant.as_str(), tag.as_slice()));
             }
             client.attach_all(ring)?;
         }
@@ -928,4 +946,448 @@ fn collect_edges(links: &[FederationLink]) -> Vec<CausalEdge<LogIdentity>> {
         out.push(link.causal_edge());
     }
     out
+}
+
+/// Maximum number of subtree rules in a single [`FederationRunner`] or `--rules-file`.
+pub const MAX_FEDERATION_RULES: usize = 64;
+
+/// Default batch size per rule in [`FederationRule`] (`128`, bounded by `256`).
+pub const DEFAULT_FEDERATION_BATCH: usize = 128;
+
+/// Declarative per-subtree federation rule parsed by [`parse_federation_rules`] and executed
+/// by [`FederationRunner`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FederationRule {
+    /// Durable consumer-group name on `source` (must be a valid non-reserved `Subject`).
+    pub group: String,
+    /// Subscription [`Filter`] selecting records on `source`.
+    pub filter: String,
+    /// Subject prefix transformation and loop-prevention policy.
+    pub rewrite: SubjectRewrite,
+    /// Optional per-rule override for `producer_id` on `dest` (`None` inherits runner default).
+    pub producer_id: Option<u64>,
+    /// Maximum batch size per `sync_once` tick (`1..=256`).
+    pub batch_size: usize,
+}
+
+/// Parse a `<strip>=><add>` or `passthrough` rewrite specification into [`SubjectRewrite`].
+pub fn parse_rewrite_spec(spec: &str) -> Result<SubjectRewrite, String> {
+    if spec == "passthrough" {
+        return Ok(SubjectRewrite::passthrough());
+    }
+    let Some((strip, add)) = spec.split_once("=>") else {
+        return Err(format!(
+            "rewrite {:?} must be `passthrough` or `<strip_prefix>=><add_prefix>`",
+            spec
+        ));
+    };
+    SubjectRewrite::prefix_map(strip, add)
+}
+
+/// Parse a declarative multi-link federation ruleset (`#` comments and blank lines skipped).
+///
+/// Line grammar (`key=value` whitespace-separated tokens):
+/// `group=<subject> filter=<filter> [rewrite=passthrough|<strip>=><add>] [exclude=<p1,p2>] [hops=<cur>/<max>] [id=<u64>] [batch=<1..=256>]`
+pub fn parse_federation_rules(text: &str) -> Result<Vec<FederationRule>, String> {
+    let mut rules: Vec<FederationRule> = Vec::new();
+    let mut line_no = 0usize;
+
+    for raw_line in text.lines() {
+        line_no = line_no.saturating_add(1);
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if rules.len() >= MAX_FEDERATION_RULES {
+            return Err(format!(
+                "line {line_no}: exceeds MAX_FEDERATION_RULES ({MAX_FEDERATION_RULES})"
+            ));
+        }
+
+        let mut group: Option<String> = None;
+        let mut filter: Option<String> = None;
+        let mut rewrite: Option<SubjectRewrite> = None;
+        let mut excludes: Vec<String> = Vec::new();
+        let mut hop_pair: Option<(u8, u8)> = None;
+        let mut producer_id: Option<u64> = None;
+        let mut batch_size: Option<usize> = None;
+
+        for tok in trimmed.split_ascii_whitespace() {
+            let Some((key, val)) = tok.split_once('=') else {
+                return Err(format!(
+                    "line {line_no}: expected `key=value` token, got {tok:?}"
+                ));
+            };
+            if val.is_empty() && key != "rewrite" {
+                return Err(format!("line {line_no}: empty value for `{key}=`"));
+            }
+            if key == "group" {
+                if group.is_some() {
+                    return Err(format!("line {line_no}: duplicate `group=`"));
+                }
+                if Subject::new(val).is_err() || is_hidden_subject(val) {
+                    return Err(format!(
+                        "line {line_no}: group {val:?} must be a valid non-reserved Subject"
+                    ));
+                }
+                group = Some(val.to_string());
+            } else if key == "filter" {
+                if filter.is_some() {
+                    return Err(format!("line {line_no}: duplicate `filter=`"));
+                }
+                if Filter::new(val).is_err() {
+                    return Err(format!(
+                        "line {line_no}: filter {val:?} is not a valid Filter"
+                    ));
+                }
+                filter = Some(val.to_string());
+            } else if key == "rewrite" {
+                if rewrite.is_some() {
+                    return Err(format!("line {line_no}: duplicate `rewrite=`"));
+                }
+                let parsed = match parse_rewrite_spec(val) {
+                    Ok(rw) => rw,
+                    Err(msg) => return Err(format!("line {line_no}: {msg}")),
+                };
+                rewrite = Some(parsed);
+            } else if key == "exclude" {
+                for item in val.split(',') {
+                    if item.is_empty() {
+                        return Err(format!("line {line_no}: empty prefix in `exclude={val}`"));
+                    }
+                    excludes.push(item.to_string());
+                }
+            } else if key == "hops" {
+                if hop_pair.is_some() {
+                    return Err(format!("line {line_no}: duplicate `hops=`"));
+                }
+                let Some((cur_s, max_s)) = val.split_once('/') else {
+                    return Err(format!(
+                        "line {line_no}: `hops={val}` must be `<cur>/<max>`"
+                    ));
+                };
+                let Ok(cur_h) = cur_s.parse::<u8>() else {
+                    return Err(format!("line {line_no}: invalid hop count {cur_s:?}"));
+                };
+                let Ok(max_h) = max_s.parse::<u8>() else {
+                    return Err(format!("line {line_no}: invalid max_hops {max_s:?}"));
+                };
+                hop_pair = Some((cur_h, max_h));
+            } else if key == "id" || key == "producer_id" {
+                if producer_id.is_some() {
+                    return Err(format!("line {line_no}: duplicate `{key}=`"));
+                }
+                let Ok(pid) = val.parse::<u64>() else {
+                    return Err(format!(
+                        "line {line_no}: `{key}={val}` expects an unsigned 64-bit integer"
+                    ));
+                };
+                producer_id = Some(pid);
+            } else if key == "batch" {
+                if batch_size.is_some() {
+                    return Err(format!("line {line_no}: duplicate `batch=`"));
+                }
+                let Ok(bsz) = val.parse::<usize>() else {
+                    return Err(format!("line {line_no}: invalid `batch={val}`"));
+                };
+                if bsz == 0 || bsz > FEDERATION_BATCH_CAP {
+                    return Err(format!(
+                        "line {line_no}: `batch={bsz}` must be in 1..={FEDERATION_BATCH_CAP}"
+                    ));
+                }
+                batch_size = Some(bsz);
+            } else {
+                return Err(format!("line {line_no}: unknown rule key {key:?}"));
+            }
+        }
+
+        let Some(group_val) = group else {
+            return Err(format!(
+                "line {line_no}: missing required `group=<subject>`"
+            ));
+        };
+        let Some(filter_val) = filter else {
+            return Err(format!(
+                "line {line_no}: missing required `filter=<filter>`"
+            ));
+        };
+        for existing in &rules {
+            if existing.group == group_val {
+                return Err(format!(
+                    "line {line_no}: duplicate consumer group {group_val:?} across rules"
+                ));
+            }
+        }
+
+        let mut rw = match rewrite {
+            Some(r) => r,
+            None => SubjectRewrite::passthrough(),
+        };
+        for ex in &excludes {
+            rw = match rw.with_excluded_prefix(ex) {
+                Ok(next) => next,
+                Err(msg) => return Err(format!("line {line_no}: {msg}")),
+            };
+        }
+        if let Some((cur_h, max_h)) = hop_pair {
+            rw = rw.with_hop_budget(cur_h, max_h);
+        }
+
+        rules.push(FederationRule {
+            group: group_val,
+            filter: filter_val,
+            rewrite: rw,
+            producer_id,
+            batch_size: batch_size.unwrap_or(DEFAULT_FEDERATION_BATCH),
+        });
+    }
+
+    if rules.is_empty() {
+        return Err("federation rules file holds no rules".to_string());
+    }
+    Ok(rules)
+}
+
+/// Thread-safe cooperative stop handle for [`FederationRunner`].
+#[derive(Clone, Debug)]
+pub struct FederationRunnerCloser {
+    stopped: Arc<AtomicBool>,
+}
+
+impl FederationRunnerCloser {
+    /// Signal the [`FederationRunner`] to stop before its next rule/poll step.
+    pub fn close(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::close`] has been invoked.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
+/// Multi-link cross-broker federation coordinator managing `1..=64` [`FederationBridge`]
+/// instances between a source and destination [`FederationEndpoint`].
+pub struct FederationRunner {
+    rules: Vec<FederationRule>,
+    bridges: Vec<FederationBridge>,
+    src_log: LogIdentity,
+    dst_log: LogIdentity,
+    stopped: Arc<AtomicBool>,
+}
+
+impl FederationRunner {
+    /// Validate `rules`, open a [`FederationBridge`] per rule, and verify all rules agree on
+    /// the pinned `(src_log, dst_log)` [`LogIdentity`] pair.
+    pub fn open(
+        source: FederationEndpoint,
+        dest: FederationEndpoint,
+        default_producer_id: u64,
+        rules: Vec<FederationRule>,
+    ) -> Result<Self, FederationError> {
+        if rules.is_empty() {
+            return Err(FederationError::Config(
+                "FederationRunner requires at least one FederationRule".to_string(),
+            ));
+        }
+        if rules.len() > MAX_FEDERATION_RULES {
+            return Err(FederationError::Config(format!(
+                "FederationRunner rules ({}) exceed MAX_FEDERATION_RULES ({MAX_FEDERATION_RULES})",
+                rules.len()
+            )));
+        }
+        let mut bridges: Vec<FederationBridge> =
+            Vec::with_capacity(rules.len().min(MAX_FEDERATION_RULES));
+        let mut pinned_pair: Option<(LogIdentity, LogIdentity)> = None;
+
+        for rule in &rules {
+            let cfg = FederationConfig {
+                source: source.clone(),
+                dest: dest.clone(),
+                group: rule.group.clone(),
+                filter: rule.filter.clone(),
+                producer_id: rule.producer_id.unwrap_or(default_producer_id),
+                rewrite: rule.rewrite.clone(),
+            };
+            let bridge = FederationBridge::open(cfg)?;
+            let s_id = bridge.source_identity();
+            let d_id = bridge.dest_identity();
+            match pinned_pair {
+                None => pinned_pair = Some((s_id, d_id)),
+                Some((exp_s, exp_d)) => {
+                    if s_id != exp_s {
+                        return Err(FederationError::SourceLogDiverged {
+                            expected: exp_s,
+                            found: s_id,
+                            cursor: bridge.cursor(),
+                        });
+                    }
+                    if d_id != exp_d {
+                        return Err(FederationError::DestLogChanged {
+                            expected: exp_d,
+                            found: d_id,
+                        });
+                    }
+                }
+            }
+            bridges.push(bridge);
+        }
+
+        let Some((src_log, dst_log)) = pinned_pair else {
+            return Err(FederationError::Config(
+                "FederationRunner opened zero bridges".to_string(),
+            ));
+        };
+
+        Ok(Self {
+            rules,
+            bridges,
+            src_log,
+            dst_log,
+            stopped: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Return a thread-safe handle that stops continuous polling loops cleanly.
+    #[must_use]
+    pub fn closer(&self) -> FederationRunnerCloser {
+        FederationRunnerCloser {
+            stopped: Arc::clone(&self.stopped),
+        }
+    }
+
+    /// Whether [`FederationRunnerCloser::close`] has been signaled.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Pinned [`LogIdentity`] of the source broker.
+    #[must_use]
+    pub const fn source_identity(&self) -> LogIdentity {
+        self.src_log
+    }
+
+    /// Pinned [`LogIdentity`] of the destination broker.
+    #[must_use]
+    pub const fn dest_identity(&self) -> LogIdentity {
+        self.dst_log
+    }
+
+    /// Number of active [`FederationRule`] bridges.
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Configured [`FederationRule`] slice.
+    #[must_use]
+    pub fn rules(&self) -> &[FederationRule] {
+        &self.rules
+    }
+
+    /// Reconnect all underlying [`FederationBridge`] instances, verifying [`LogIdentity`]
+    /// lineage continuity across every rule cursor.
+    pub fn reconnect_all(&mut self) -> Result<(), FederationError> {
+        for bridge in &mut self.bridges {
+            bridge.reconnect()?;
+            self.src_log = bridge.source_identity();
+        }
+        Ok(())
+    }
+
+    /// Step every configured bridge once (`rule.batch_size` records max per rule), returning
+    /// `(group, report)` in rule declaration order.
+    pub fn sync_all_once(&mut self) -> Result<Vec<(String, FederationReport)>, FederationError> {
+        let mut out = Vec::with_capacity(self.rules.len().min(MAX_FEDERATION_RULES));
+        let mut idx = 0usize;
+        while idx < self.bridges.len() {
+            if self.is_stopped() {
+                break;
+            }
+            let Some(rule) = self.rules.get(idx) else {
+                break;
+            };
+            let Some(bridge) = self.bridges.get_mut(idx) else {
+                break;
+            };
+            let rep = bridge.sync_once(rule.batch_size)?;
+            out.push((rule.group.clone(), rep));
+            idx = idx.saturating_add(1);
+        }
+        Ok(out)
+    }
+
+    /// Drain every configured bridge for up to `max_rounds` (`1..=4096`) rounds per rule until
+    /// caught up (`fetched == 0`), returning one aggregated [`FederationReport`] per rule.
+    pub fn drain_until_caught_up(
+        &mut self,
+        max_rounds: usize,
+    ) -> Result<Vec<(String, FederationReport)>, FederationError> {
+        let round_cap = max_rounds.clamp(1, 4096);
+        let mut out = Vec::with_capacity(self.rules.len().min(MAX_FEDERATION_RULES));
+        let mut idx = 0usize;
+        while idx < self.bridges.len() {
+            if self.is_stopped() {
+                break;
+            }
+            let Some(rule) = self.rules.get(idx) else {
+                break;
+            };
+            let Some(bridge) = self.bridges.get_mut(idx) else {
+                break;
+            };
+            let mut agg = FederationReport {
+                next_cursor: bridge.cursor(),
+                ..FederationReport::default()
+            };
+            let mut round = 0usize;
+            while round < round_cap {
+                if self.stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let step = bridge.sync_once(rule.batch_size)?;
+                let step_fetched = step.fetched;
+                agg.fetched = agg.fetched.saturating_add(step.fetched);
+                agg.mirrored = agg.mirrored.saturating_add(step.mirrored);
+                agg.deduped = agg.deduped.saturating_add(step.deduped);
+                agg.skipped = agg.skipped.saturating_add(step.skipped);
+                if let Some(upto) = step.committed_upto {
+                    agg.committed_upto = Some(match agg.committed_upto {
+                        Some(prev) => federation_cursor_advance(prev, upto),
+                        None => upto,
+                    });
+                }
+                agg.next_cursor = federation_cursor_advance(agg.next_cursor, step.next_cursor);
+                agg.links.extend(step.links);
+                round = round.saturating_add(1);
+                if step_fetched == 0 {
+                    break;
+                }
+            }
+            out.push((rule.group.clone(), agg));
+            idx = idx.saturating_add(1);
+        }
+        Ok(out)
+    }
+
+    /// Record all [`FederationReport`] cursors and [`FederationLink`] provenance receipts into
+    /// `cut`, then heal `cut` so it forms a Chandy-Lamport consistent cross-broker cut.
+    pub fn record_into_cut(&self, reports: &[(String, FederationReport)], cut: &mut FederatedCut) {
+        let mut all_links: Vec<FederationLink> = Vec::new();
+        for (_group, rep) in reports {
+            if rep.next_cursor > 0 {
+                cut.advance(self.src_log, rep.next_cursor);
+            }
+            for link in &rep.links {
+                cut.advance(link.src_log, link.src_offset.saturating_add(1));
+                cut.advance(link.dst_log, link.dst_offset.saturating_add(1));
+                all_links.push(link.clone());
+            }
+        }
+        if !all_links.is_empty() {
+            let _ = cut.heal(&all_links);
+        }
+    }
 }

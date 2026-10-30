@@ -38,36 +38,76 @@ fn configured(paths: &Paths) -> Config {
 /// and profile) alongside a separate host-owned `~/.aterm/machine.toml`, and a roster that names
 /// `listed` and revokes `revoked`.
 fn ring(paths: &Paths, listed: &[&str], revoked: &[&str]) {
+    use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
+    let rng = ring::rand::SystemRandom::new();
+    let key = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let master_der = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let master = Ed25519KeyPair::from_pkcs8(master_der.as_ref()).unwrap();
     let aterm = paths.home.join(".aterm");
     let release_ring = aterm.join("release-ring");
     std::fs::create_dir_all(release_ring.join("roster")).unwrap();
     fsx::write_atomic(
         &release_ring.join("release-credentials.toml"),
-        b"signing_key = \"c3ludGhldGlj\"\nmachine_id = \"m22\"\nmachine_roster = \"~/.aterm/release-ring/roster/aterm-machines.toml\"\n",
+        format!("signing_key = \"{}\"\nmachine_id = \"m22\"\nmachine_roster = \"~/.aterm/release-ring/roster/aterm-machines.toml\"\n", crate::b64::encode_padded(key.as_ref())).as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    fsx::write_atomic(&release_ring.join("machine.key"), key.as_ref(), 0o600).unwrap();
+    fsx::write_atomic(
+        &aterm.join("test-master"),
+        crate::b64::encode_padded(master.public_key().as_ref()).as_bytes(),
         0o600,
     )
     .unwrap();
     fsx::write_atomic(&release_ring.join("machine.toml"), b"id = \"m22\"\n", 0o600).unwrap();
     fsx::write_atomic(&aterm.join("machine.toml"), b"id = \"m99\"\n", 0o600).unwrap();
-    let mut roster = format!(
-        "schema = 1\nroster_seq = 1\nvalid_until = \"9999-12-31T00:00:00Z\"\nrevoked = [{}]\n",
-        revoked
+    let roster = Roster {
+        schema: SUPPORTED_SCHEMA,
+        roster_seq: 1,
+        valid_until: "9999-12-31T00:00:00Z".into(),
+        revoked: revoked.iter().map(|id| (*id).to_owned()).collect(),
+        machines: listed
             .iter()
-            .map(|id| format!("\"{id}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    for id in listed {
-        roster.push_str(&format!(
-            "\n[[machine]]\nid = \"{id}\"\npubkey = \"{id}-key\"\n"
-        ));
+            .map(|id| {
+                let other_der = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+                let other = Ed25519KeyPair::from_pkcs8(other_der.as_ref()).unwrap();
+                Machine {
+                    id: (*id).to_owned(),
+                    pubkey: crate::b64::encode_padded(if *id == "m22" {
+                        pair.public_key().as_ref()
+                    } else {
+                        other.public_key().as_ref()
+                    }),
+                    added_at: "1970-01-01T00:00:00Z".into(),
+                    not_after: None,
+                }
+            })
+            .collect(),
     }
+    .to_toml()
+    .unwrap();
     fsx::write_atomic(
         &release_ring.join("roster/aterm-machines.toml"),
         roster.as_bytes(),
         0o644,
     )
     .unwrap();
+    fsx::write_atomic(
+        &release_ring.join("roster/aterm-machines.toml.sig"),
+        master.sign(roster.as_bytes()).as_ref(),
+        0o644,
+    )
+    .unwrap();
+}
+
+fn test_authorized_ring(paths: &Paths) -> bool {
+    let Ok(anchor) = std::fs::read_to_string(paths.home.join(".aterm/test-master")) else {
+        return false;
+    };
+    authorized_ring_with(paths, &[&anchor], 1_000)
 }
 
 fn clt() -> Option<PathBuf> {
@@ -117,6 +157,7 @@ impl Script {
             Ok(())
         };
         let mut tools = Tools {
+            authorized_ring: &test_authorized_ring,
             developer_dir,
             history: &mut history,
             store: &mut store,
@@ -155,7 +196,7 @@ fn parser_binds_required_fields_and_rejects_bad_input() {
 #[test]
 fn an_entry_becomes_the_profile_once_and_an_unchanged_one_runs_nothing() {
     let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
-    ring(&paths, &["m3", "m1"], &[]);
+    ring(&paths, &["m22"], &[]);
     let script = Script::answering(vec![Ok(false), Ok(true)]);
     let mut rounds = NotaryRounds::default();
     assert_eq!(
@@ -199,7 +240,7 @@ fn no_developer_tools_or_no_release_host_runs_nothing() {
         Step::Waits(NOT_RELEASE_HOST),
         "no profile"
     );
-    for (listed, revoked) in [(&["m22", "m3"][..], &[][..]), (&["m1"][..], &["m1"][..])] {
+    for (listed, revoked) in [(&["m1", "m3"][..], &[][..]), (&["m22"][..], &["m22"][..])] {
         ring(&paths, listed, revoked);
         assert_eq!(
             script.step(&mut rounds, &paths, &clt),
@@ -207,7 +248,7 @@ fn no_developer_tools_or_no_release_host_runs_nothing() {
             "listed {listed:?}, revoked {revoked:?}"
         );
     }
-    ring(&paths, &["m1"], &[]);
+    ring(&paths, &["m22"], &[]);
     assert_eq!(
         script.step(&mut rounds, &paths, &no_clt),
         Step::Waits(WAITS_FOR_CLT)
@@ -219,7 +260,7 @@ fn no_developer_tools_or_no_release_host_runs_nothing() {
 #[test]
 fn the_old_notary_name_is_never_read() {
     let (_root, paths) = lab(&[("notary", ENTRY_TEXT)]);
-    ring(&paths, &["m1"], &[]);
+    ring(&paths, &["m22"], &[]);
     let script = Script::answering(Vec::new());
     assert_eq!(
         script.step(&mut NotaryRounds::default(), &paths, &clt),
@@ -232,7 +273,7 @@ fn the_old_notary_name_is_never_read() {
 #[test]
 fn an_absent_entry_runs_nothing() {
     let (_root, paths) = lab(&[]);
-    ring(&paths, &["m1"], &[]);
+    ring(&paths, &["m22"], &[]);
     let script = Script::answering(Vec::new());
     assert_eq!(
         script.step(&mut NotaryRounds::default(), &paths, &clt),
@@ -242,12 +283,11 @@ fn an_absent_entry_runs_nothing() {
 }
 
 /// An unavailable history replaces no profile, and a store that does not authenticate is no
-/// success. A failed entry is not tried again by the same subscriber (no notarytool run every
-/// round), but is by the next one, and nothing is recorded as stored.
+/// success. A failed entry backs off, then recovers in the same subscriber without a restart.
 #[test]
-fn a_failure_never_reads_as_stored_and_is_tried_once_per_subscriber() {
+fn a_failure_never_reads_as_stored_and_retries_after_backoff() {
     let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
-    ring(&paths, &["m1"], &[]);
+    ring(&paths, &["m22"], &[]);
     let script = Script::answering(vec![Err(Error::new("Apple is unavailable"))]);
     let mut rounds = NotaryRounds::default();
     assert!(matches!(
@@ -257,6 +297,14 @@ fn a_failure_never_reads_as_stored_and_is_tried_once_per_subscriber() {
     assert!(script.stored.borrow().is_empty(), "nothing replaced");
     assert_eq!(script.step(&mut rounds, &paths, &clt), Step::Quiet);
     assert_eq!(script.runs(), 1, "tried once by this subscriber");
+    rounds.tried.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(61);
+    let recovered = Script::answering(vec![Ok(true)]);
+    assert!(matches!(
+        recovered.step(&mut rounds, &paths, &clt),
+        Step::Ran(Ok(_))
+    ));
+    assert_eq!(recovered.runs(), 1);
+    std::fs::remove_file(paths.dir.join(APPLIED)).unwrap();
 
     let script = Script::answering(vec![Ok(false), Ok(false)]);
     let mut rounds = NotaryRounds::default();
@@ -267,19 +315,19 @@ fn a_failure_never_reads_as_stored_and_is_tried_once_per_subscriber() {
     assert_eq!(applied(&paths), None, "no success recorded");
 }
 
-/// The subscriber's live round, in a test build, reads no developer directory: it says it waits
-/// for the tools once, however many rounds pass, and runs nothing.
+/// The subscriber's live round never accepts a fixture's master as a release anchor; it says
+/// it waits once, however many rounds pass, and runs no external tools.
 #[test]
 fn the_live_round_says_a_wait_once_and_runs_nothing_in_a_test_build() {
     let (_root, paths) = lab(&[(ENTRY, ENTRY_TEXT)]);
-    ring(&paths, &["m1"], &[]);
+    ring(&paths, &["m22"], &[]);
     let said = RefCell::new(Vec::new());
     let log = |line: &str| said.borrow_mut().push(line.to_owned());
     let mut rounds = NotaryRounds::default();
     for _ in 0..3 {
         rounds.after_round(&paths, &configured(&paths), &log);
     }
-    assert_eq!(*said.borrow(), [WAITS_FOR_CLT]);
+    assert_eq!(*said.borrow(), [NOT_RELEASE_HOST]);
 }
 
 /// xcrun's developer directory, read as xcrun selects it: `DEVELOPER_DIR`, else the choice
@@ -382,26 +430,38 @@ fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
     ring(&paths, &["m22"], &[]);
     let elsewhere = paths.home.join("dist");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    fsx::write_atomic(
-        &elsewhere.join("aterm-machines.toml"),
-        b"schema = 1\n\n[[machine]]\nid = \"m1\"\npubkey = \"k\"\n",
-        0o644,
-    )
-    .unwrap();
-    let profile = |roster: &Path| {
-        fsx::write_atomic(
-            &paths.home.join(RELEASE_PROFILE),
-            format!("machine_roster = \"{}\"\n", roster.display()).as_bytes(),
-            0o600,
+    let original = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE)).unwrap();
+    for name in ["aterm-machines.toml", "aterm-machines.toml.sig"] {
+        std::fs::copy(
+            paths.home.join(".aterm/release-ring/roster").join(name),
+            elsewhere.join(name),
         )
         .unwrap();
+    }
+    let profile = |roster: &Path| {
+        let text = original
+            .lines()
+            .map(|line| {
+                if line.starts_with("machine_roster") {
+                    format!("machine_roster = \"{}\"", roster.display())
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fsx::write_atomic(&paths.home.join(RELEASE_PROFILE), text.as_bytes(), 0o600).unwrap();
     };
     profile(&elsewhere.join("aterm-machines.toml"));
-    assert!(release_host(&paths.home, "m1"), "the profile's roster");
-    assert!(!release_host(&paths.home, "m22"));
+    assert!(test_authorized_ring(&paths), "the profile's signed roster");
     profile(&elsewhere.join("missing.toml"));
-    assert!(release_host(&paths.home, "m22"), "the vault's roster");
-    assert!(!release_host(&paths.home, "m1"));
+    assert!(test_authorized_ring(&paths), "the vault's signed roster");
+    profile(&elsewhere.join("aterm-machines.toml"));
+    std::fs::write(elsewhere.join("aterm-machines.toml.sig"), [0; 64]).unwrap();
+    assert!(
+        !test_authorized_ring(&paths),
+        "no fallback from an invalid named roster"
+    );
 }
 
 /// While an older vault has not yet rotated its path to `~/.aterm/release-ring/`, `release_host`
@@ -415,22 +475,33 @@ fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
 fn legacy_profile_is_read_only_when_release_ring_profile_is_absent_and_fails_closed_on_bad_mode() {
     use std::os::unix::fs::PermissionsExt as _;
     let (_root, paths) = lab(&[]);
+    ring(&paths, &["m22"], &[]);
     let aterm = paths.home.join(".aterm");
     std::fs::create_dir_all(aterm.join("roster")).unwrap();
+    let profile = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE))
+        .unwrap()
+        .replace(".aterm/release-ring/roster", ".aterm/roster");
     fsx::write_atomic(
         &paths.home.join(LEGACY_RELEASE_PROFILE),
-        b"signing_key = \"c3ludGhldGlj\"\nmachine_id = \"m22\"\nmachine_roster = \"~/.aterm/roster/aterm-machines.toml\"\n",
+        profile.as_bytes(),
         0o600,
     )
     .unwrap();
-    fsx::write_atomic(
-        &paths.home.join(LEGACY_VAULT_ROSTER),
-        b"schema = 1\n\n[[machine]]\nid = \"m1\"\npubkey = \"m1-key\"\n",
-        0o644,
+    std::fs::copy(
+        aterm.join("release-ring/machine.key"),
+        aterm.join("machine.key"),
     )
     .unwrap();
+    for name in ["aterm-machines.toml", "aterm-machines.toml.sig"] {
+        std::fs::copy(
+            aterm.join("release-ring/roster").join(name),
+            aterm.join("roster").join(name),
+        )
+        .unwrap();
+    }
+    std::fs::remove_file(paths.home.join(RELEASE_PROFILE)).unwrap();
     assert!(
-        release_host(&paths.home, "m1"),
+        test_authorized_ring(&paths),
         "absent release-ring profile falls back to 0.145 profile"
     );
 
@@ -439,7 +510,7 @@ fn legacy_profile_is_read_only_when_release_ring_profile_is_absent_and_fails_clo
     std::fs::write(&ring_profile, b"signing_key = \"c3ludGhldGlj\"\n").unwrap();
     std::fs::set_permissions(&ring_profile, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(
-        !release_host(&paths.home, "m1"),
+        !test_authorized_ring(&paths),
         "unsafe release-ring profile fails closed without falling back to legacy profile"
     );
 }

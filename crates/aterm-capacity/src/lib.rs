@@ -43,15 +43,18 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub mod admit;
+pub mod book;
 pub mod floor;
 pub mod footprint;
 pub mod ledger;
 pub mod reading;
 pub mod room;
+pub mod tree_meter;
 
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Holder, Pace, Polled, QuietStart, Relief, Reserve, Short,
-    Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, gib, never, reserved, span,
+    Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory, covering,
+    gib, never, reserved, span,
 };
 pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
 pub use ledger::{Held, Ledger, Record};
@@ -118,6 +121,8 @@ pub struct Need {
     pub checkout: Option<String>,
     /// Admit its memory only ALONE ([`Self::alone`]): once no other claim holds memory or waits ahead for it, whatever is available, and while it is held no other memory claim is admitted.
     pub alone: bool,
+    /// Its memory covers the builds its holder's tree starts ([`Self::covers`]).
+    pub covers: bool,
 }
 
 impl Need {
@@ -208,7 +213,37 @@ impl Need {
         self.alone = true;
         self
     }
+
+    /// Its memory covers the builds its holder's process tree starts: a build a test or a script
+    /// runs inside it that would claim (`atpkg::build_admit`, wherever aterm starts a build)
+    /// claims nothing more while this is held by its own process or an ancestor
+    /// ([`covered_memory`], [`COVER_ENV`]). The claim was sized for its tree's work, those
+    /// builds' memory with it (a verify stage's peak is what its own children's groups held), so a
+    /// second claim for them would reserve that memory twice: every other claimant counts both.
+    /// A holder that holds several (verify's stages, the Trust lane's checks) hands each work the
+    /// marker of its own claim, or [`NO_COVER`], so one work's builds are never covered by
+    /// another's claim.
+    /// What verify's stages, the Trust lane's checks and a build's own claim ask; never a VM's,
+    /// whose memory lies outside the tree, nor a disk claim.
+    #[must_use]
+    pub const fn covers(mut self) -> Need {
+        self.covers = true;
+        self
+    }
 }
+
+/// THE COVER MARKER: what a holder of a covering claim ([`Need::covers`]) exports to the work it
+/// starts under that claim: the claim's own name ([`Record::cover_marker`], which carries its
+/// holder's pid), or [`NO_COVER`] for work under none. A build admission inside that work reads
+/// that holder's claims alone, checks the holder is itself or an ancestor, and is covered by the
+/// named claim alone, while it is held ([`covering`]); [`NO_COVER`] covers nothing. A marker of
+/// no claim of its line (another form, a pid outside it) or a child that cleared its environment
+/// leaves the whole ledger to answer.
+pub const COVER_ENV: &str = "ATERM_CAPACITY_COVER";
+
+/// The cover marker ([`COVER_ENV`]) of work its holder runs under no covering claim (a verify
+/// stage that claims no memory): a build inside it is covered by none, and claims for itself.
+pub const NO_COVER: &str = "none";
 
 /// A memory claim made from a measured peak adds a fifth of it ([`peak_claim`]): one library's
 /// recorded Trust check peaks moved by 14% between two runs on one prover (aterm-render, 13.2 GB
@@ -330,6 +365,9 @@ impl Admit {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod coverage_tests;
 
 #[cfg(all(test, unix))]
 mod interrupt_tests;

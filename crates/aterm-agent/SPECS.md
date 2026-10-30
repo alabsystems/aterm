@@ -546,11 +546,12 @@ deadline-totality	contract	upgrade_drive::watch::{due_by,watch_at}, St::from_jso
 watch-refines-progress-look	refinement	upgrade_drive::watch::{watch_with,look_word}, upgrade::held_point, upgrade_status::progress_projection	watch_with moves the record exactly as HarnessUpgradeProgress's Watch, with zero input requests.	1,3,8,10	1/1
 retarget-in-place	contract	upgrade_drive::St::{for_target,promised_model}	A pending round stays pending retargeted; an announced one stays announced with its marker iff the model handed equals the promised one, else is abandoned owing its release.	1,2,3	2/2
 reducer-refines-progress-machine	refinement	upgrade::{requested_step,break_step,quiet_step,held_point}, watch::look_word	StepAtIdle/StepAtBreak are enabled exactly where requested_step acts and land the same phase; the watch's recorded word is the machine's class; negative controls caught.	1,3,5,10	2/2
+quiet-flow-refines-quiet-machine	refinement	upgrade::{quiet_step,tell_due,quiet_move}, upgrade_drive::quiet_projection	At every reachable state of HarnessUpgradeQuiet, and each look that reaches it (a process under the agent, or a status its in-process work keeps busy), TellAtPoint/MoveAtIdle are enabled exactly where the quiet reducer tells or moves a pending round, and a tell lands the machine's tells and rest; quiet_projection(facts(σ)) = σ; a quiet pending round never asks; six negative controls, each caught on its own action.	1,3,5,10	1/1
 classifier-refines-progress-machine	refinement	upgrade_status::{Row::attention,progress_projection,Row::{interrupt,badge,limit_passed}}	progress_projection(row(σ)) = σ; no wait marks a tab; attention is Quiet except a passed limit (Fault) and own work held a day (Digest); every time-only turn falls at an instant next_change names.	1,3,5,10	2/2
 next-change-complete	contract	upgrade_status::{next_change,Row::next_attention_at,Row::attention,behind_words_change_at,Row::age_said}	next_attention_at(now) is the first later instant where the level changes (None iff it never does); next_change = the min over rows and every time-only change; ageless words never wake the host.	1,3,5,7	9/9
 attention-horizons	invariant	upgrade_status::{Row::attention,Attention::level,wait_class,special}	Young records are Quiet; at 100 days never Quiet nor Interrupt; each unclaimed wait turns a Fault at its own horizon; fresh notices keep records quiet; a person's hold or peer refusal never blames aterm.	1,3,5	6/6
 interrupt-only-for-an-ended-agent	invariant	upgrade_status::{Row::attention,Row::interrupt,Row::stall}	Interrupt only for an agent the upgrade ended that is not back, or a goal it paused and could not resume; every interrupt is a stall with its one action.	1,3,5	3/3
-own-work-news	contract	upgrade_status::{Row::attention,Row::behind_since,Row::rests_on_own_work}	Own-work rows are Quiet until a day behind and a whole round asked, then one Digest(own-work) with counts; the class reads own_work_at (remembered across a round's acts, restamped at most every OWN_WORK_RESTAMP_S) so no act flips it.	1,2,3,5	12/12
+own-work-news	contract	upgrade_status::{Row::attention,Row::behind_since,Row::rests_on_own_work}	Own-work rows are Quiet until a day behind and a whole round asked, then one Digest(own-work) with counts; the class reads own_work_at (remembered across a round's acts, restamped at most every OWN_WORK_RESTAMP_S) so no act flips it; once the agent was told what waits on its own work (St::tells for the row's target), the line's step is that fact, not a person's, unless a /goal is in force (only the person ends it).	1,2,3,5	13/13
 aterms-own-fault	contract	upgrade_status::{Row::attention,refused_notice,unwatched,Need::upgrade_cannot_run,fence_fails_under_now}	Unclassified waits, self-refused notices, unwatched records and failing builds are one Fault line each (build-fails keyed by build), never a Digest or mark; upgrade_cannot_run is one bounded sentence with one action.	1,3,5	5/5
 stall-mark-and-remedy	contract	upgrade_status::{Row::stall,remedy,moving,word_in_force,will_ask_again,repeating_stop,person_seen}, now_moves_past	stall = Some only for an upgrade that will not move on its own (held-back, repeating stops, stuck restarts, ended agents); overdue waits mark nothing; --now quiets a stall for NOW_QUIETS_S; remedy is Now exactly where --now moves the wait; a person is named only while seen.	1,3,5	14/14
 wait-class-total-and-stable	table-property	upgrade_status::{wait_class,Row::cause,Row::overdue_cause,claude_wait_words}	Every wait word either lane records has a class (only unknown words are Unclassified) and Claude words fit 64 chars; one stall keeps its class through the notice path's passing words.	1,3	5/5
@@ -822,6 +823,7 @@ upgrade-model-switch-refines-model	refinement	upgrade_models::{model_read_step,l
 footer-window-allocation	other	footer::{facts_for_entry_at,TailCache,rows_back}	Walking an n-byte transcript back allocates exactly ceil(n/TAIL_BYTES) fixed-size window buffers.	1,7,8	1/1
 approval-full-power-presses-every-bash-box	contract	policy::decide_screen, ApprovalCtx, Approve	Every captured 2.1.280 Bash permission box is approved by its one-shot 1 at full power, with Safe's rule when Safe approves and allow-once otherwise.	1,3,5,7	1/1
 steps-measured-builds	contract	harness::steps::{MEASURED_BUILDS,StepState}, harness::codex_steps::CODEX_MEASURED_BUILDS, build.rs measured_builds	MEASURED_BUILDS = the builds the first lines (`# claude <build> · lab reduce …`) of the Claude Code reductions in src/harness/testdata/steps/ name (every `.jsonl` there that is no `codex-` file), sorted and once each, each reduction named `<build>.jsonl`; CODEX_MEASURED_BUILDS is the same function over the `codex-` reductions, of which only the `codex-alab-` ones measure their build; a reduction whose first line names no build fails the build, and a family with none fails it too; a transcript step is exact iff its build is one of them, else partial.	1,8	2/2
+go-ahead-standing-answer	table-property	supervise::policy::go_ahead::{parked,parks,asks_go_ahead,holds,unless_held,Park::said}, supervise::policy::turn_end::{go_ahead_answer,irreversible_ask,TurnEndState::{go_ahead_owed,go_ahead_spent,go_ahead_typed,go_ahead_at_break},classify_said}, supervise::policy::exception::{exception_for,Exception::ends_at_work}, supervise::cruise_carry_loop::cruise_carry	parked(turn_said,tail)=Some(p) ⇔ some NEEDS YOU line or prose sentence of the turn asks a person's consent (families B, C, D) over the agent's own reversible work, no exclusion (person-only, person-first, outward, someone else's, a hold attributed to the person, declined, chooses, an affirmative echo) fires on it, the code it carries or the sentence before it, nothing only a person can give is in the sentence after it, and no prose sentence of the turn names an outward or destructive act tied to the work (beside a push, merge, landing or rebase, as a plan, or asked); every row of fixtures/go-ahead-table.txt reads as its section as written and wrapped at 80/100/120 columns, and dropping any one family or exclusion misreads some row. Under Cruise, and under Land after its instruction while the repository holds unlanded work or the park names its branch, worktree or main, a turn end whose reading parks, more than GO_AHEAD_HELD after the last person's turn (a host's fact or a carry is none; a turn the person's message opened is one, a hand measured or not), and never before the person's next turn where that message holds the go-ahead (holds), with no irreversible ask, types go_ahead_answer (rule go-ahead@v1, ≤ VERBATIM_UNITS, the token or quote, room, drop, others and ack suffixes) within GO_AHEAD_WAIT of the last typed act, and every PARK row gets it or, where classify_said reads Irreversible, REVERSIBLE_ANSWER; answers off escalate with GO_AHEAD_WHY; Off types nothing; after GO_AHEAD_ACTS go-ahead acts on one park (a prose park is the standing one; a kept need counts, whatever room the last act named), or GO_AHEAD_SPAN after the first, the decision is Nothing (go-ahead-refused) and exception_for = refuses_go_ahead (Urgency::Now). A Cruise background break whose turn parks (go_ahead_at_break: its earlier messages too, past the act it opens with), with no irreversible ask and no person's hold, types the go-ahead in the carry's place, counted on the same park; a spent park's break types nothing and raises refuses_go_ahead, which no break of the agent's background work ends (ends_at_work); with answers off a parked break types the carry without NEVER_A_NEED. Within a person's hold the continuation and the carry carry no NEVER_A_NEED. No text the harness types about the go-ahead parks, stops, names a need or claims done; classify_said reads every stop phrase and destructive word as the base did, fences and `without` included, except that a go-ahead stop phrase, or a wait phrase whose object is the go-ahead, stops only where asks_go_ahead holds (each mention, a table row's or a quote's included, judged alone: beside a destructive word any one outside an echo, otherwise one outside an echo that no negation undoes, that reports nothing done and that names no thing).	1,3,7	41/41
 ```
 
 ### 1b. Chunk-6 groups whose statements were not delivered
@@ -1006,6 +1008,7 @@ src/harness/align_tests.rs	a_descendant_holding_stdout_is_killed_with_its_proces
 src/harness/align_tests.rs	escaped_descendant_holding_stdout_cannot_retain_a_reader_thread	align-capture-lifecycle-refines-model	
 src/harness/align_tests.rs	escaped_holder_stage	§4	
 src/harness/align_tests.rs	stdout_is_capped_and_the_exit_code_reported	align-capture-bounded	
+src/harness/stats_tests.rs	a_go_ahead_decision_says_the_owners_standing_go_ahead	go-ahead-standing-answer	
 src/harness/upgrade_drive_tests.rs	a_bounded_reader_requires_complete_successful_utf8_evidence	upgrade-summary-complete	
 src/harness/cli_tests.rs	a_conversation_resumed_outside_aterm_is_never_told_unwatched	cli-upgrade-owner-status	
 src/harness/cli_tests.rs	a_deferral_is_a_span_with_a_unit_within_a_month	cli-parse-defer	
@@ -1664,6 +1667,7 @@ src/harness/upgrade_models.rs	with_nothing_newer_in_its_family_the_list_moves_on
 src/harness/upgrade_progress_tests.rs	the_quiet_upgrades_read_records_what_holds_its_restart	reducer-refines-progress-machine	
 src/harness/upgrade_progress_tests.rs	the_real_quiet_view_is_the_derived_machine_read_quietly	classifier-refines-progress-machine	
 src/harness/upgrade_progress_tests.rs	the_real_reducer_is_the_derived_machine	reducer-refines-progress-machine	
+src/harness/upgrade_quiet_tests.rs	the_quiet_flow_is_the_derived_machine	quiet-flow-refines-quiet-machine	
 src/harness/upgrade_progress_tests.rs	the_real_view_is_the_derived_machine	classifier-refines-progress-machine	
 src/harness/upgrade_progress_tests.rs	the_refused_notices_tell_is_an_instant_the_view_names	next-change-complete	
 src/harness/upgrade_queued_tests.rs	a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point	visit-shell-refines-pure-reducer	
@@ -2053,6 +2057,10 @@ src/supervise/config.rs	the_stuck_break_note_ships_off_and_only_the_root_table_g
 src/supervise/config.rs	usage_credits_ships_off_and_only_the_root_table_turns_it_on	config-reader-never-grants	
 src/supervise/config.rs	usage_notes_ships_off_and_only_the_root_table_turns_it_on	config-reader-never-grants	
 src/supervise/config.rs	usage_tap_ships_on_and_the_root_tables_off_limits_it	config-reader-never-grants	
+src/supervise/cruise_carry_loop_tests.rs	a_break_that_asks_an_irreversible_step_gets_the_carry_not_the_go_ahead	go-ahead-standing-answer	
+src/supervise/cruise_carry_loop_tests.rs	a_break_that_parks_on_a_go_ahead_gets_the_owners_standing_go_ahead	go-ahead-standing-answer	
+src/supervise/cruise_carry_loop_tests.rs	a_break_whose_turn_plans_an_outward_act_gets_the_carry_not_the_go_ahead	go-ahead-standing-answer	
+src/supervise/cruise_carry_loop_tests.rs	a_park_at_breaks_gets_the_go_ahead_its_limit_of_times	go-ahead-standing-answer	
 src/supervise/escalate.rs	a_long_subject_and_reason_are_clipped_and_the_whole_fits_256_bytes	escalate-attention-text	
 src/supervise/escalate.rs	a_question_dialogs_badge_names_its_question	escalate-kind-and-subject	
 src/supervise/escalate.rs	a_question_read_whole_is_badged_by_its_question	escalate-kind-and-subject	
@@ -2289,6 +2297,7 @@ src/supervise/policy/exception_tests.rs	a_cleared_goal_names_its_cause	exception
 src/supervise/policy/exception_tests.rs	a_full_context_three_compacts_leave_full_is_an_exception_with_the_way_back	exception-for-table	
 src/supervise/policy/exception_tests.rs	a_lost_logins_notice_is_what_the_point_decides	exception-for-table	
 src/supervise/policy/exception_tests.rs	a_persons_own_login_is_theirs	exception-for-table	
+src/supervise/policy/exception_tests.rs	a_refused_go_ahead_stands_at_a_break_of_background_work	go-ahead-standing-answer	exception-for-table
 src/supervise/policy/exception_tests.rs	a_spend_wall_with_no_reset_says_so_once_and_the_action_is_the_strings	exception-for-table	
 src/supervise/policy/exception_tests.rs	a_wait_is_never_an_exception	exception-for-table	
 src/supervise/policy/exception_tests.rs	a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile	exception-for-table	
@@ -2320,6 +2329,14 @@ src/supervise/policy/git_config_tests.rs	the_workers_external_diff_is_a_hazard	g
 src/supervise/policy/git_config_tests.rs	the_workers_git_config_variables_are_seen	git-view-refines-git	
 src/supervise/policy/git_config_tests.rs	what_a_git_read_does_beyond_reading_is_read_off_the_line	git-reads-flags	
 src/supervise/policy/git_config_tests.rs	what_only_git_config_reads_does_not_hide_the_effective_config	git-view-refines-git	
+src/supervise/policy/go_ahead_tests.rs	a_park_beside_a_persons_needs_keeps_them_and_names_room	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	a_park_in_an_earlier_message_of_the_turn_parks	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	a_park_is_quoted_without_hidden_characters_and_fits_its_room	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	an_outward_plan_anywhere_in_the_turn_parks_nothing	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	every_family_and_exclusion_holds_some_row	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	every_go_ahead_row_reads_as_its_section_however_it_wraps	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	the_answer_parks_nothing	go-ahead-standing-answer	
+src/supervise/policy/go_ahead_tests.rs	the_incident_reply_parks_on_the_word_it_asked_for	go-ahead-standing-answer	
 src/supervise/policy/guard.rs	a_copy_or_a_swapped_box_does_not_satisfy_the_guard	row-guard-exact	
 src/supervise/policy/guard.rs	a_long_row_is_guarded_by_an_anchored_prefix_that_fits	row-guard-exact	
 src/supervise/policy/guard.rs	a_row_guard_matches_its_row_and_nothing_else_on_the_box	row-guard-exact	
@@ -2431,6 +2448,33 @@ src/supervise/policy/shell_startup_tests.rs	an_alias_fails_only_a_line_that_may_
 src/supervise/policy/shell_startup_tests.rs	an_option_the_models_do_not_assume_fails_every_line_naming_it	snapshot-parse	
 src/supervise/policy/shell_startup_tests.rs	every_snapshot_of_the_tools_shell_is_judged_and_none_is_unknown	startup-read	
 src/supervise/policy/shell_startup_tests.rs	what_runs_before_every_command_besides_the_snapshot_is_read	startup-read	
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_consent_asked_without_a_go_ahead_or_beside_a_fenced_command_keeps_the_guard	go-ahead-standing-answer	te-classify-said
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_go_ahead_asked_with_no_destructive_act_still_stops	go-ahead-standing-answer	te-classify-said
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_go_ahead_beside_a_destructive_act_still_asks_and_a_report_of_one_does_not	go-ahead-standing-answer	te-classify-said
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_go_ahead_beside_a_persons_needs_leaves_them_standing	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_hold_the_person_gave_stands_in_the_replies_after_their_turn	go-ahead-standing-answer	te-person-exchange
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_beside_an_outward_act_the_turn_names_keeps_todays_act	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_held_at_the_same_reply_is_told_as_refusing_the_go_ahead	go-ahead-standing-answer	exception-for-table
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_on_a_need_alone_or_in_an_earlier_message_gets_the_go_ahead	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_standing_an_hour_after_its_first_go_ahead_is_told_now	go-ahead-standing-answer	exception-for-table
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_that_alternates_its_need_and_its_prose_is_told_now_after_three_acts	go-ahead-standing-answer	exception-for-table
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_the_go_ahead_does_not_lift_is_told_now_after_three_acts	go-ahead-standing-answer	exception-for-table
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_park_the_harness_attaches_to_gets_the_go_ahead	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_persons_turn_read_first_after_a_restart_is_theirs	go-ahead-standing-answer	te-person-exchange
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_reply_to_a_host_fact_or_a_carry_still_gets_the_go_ahead	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_report_naming_a_past_wait_gets_no_go_ahead	go-ahead-standing-answer	te-classify-said
+src/supervise/policy/turn_end_go_ahead_tests.rs	a_turn_a_person_prompted_keeps_todays_act	go-ahead-standing-answer	te-person-exchange
+src/supervise/policy/turn_end_go_ahead_tests.rs	an_agent_that_keeps_its_room_need_is_told_now_after_three_acts	go-ahead-standing-answer	exception-for-table
+src/supervise/policy/turn_end_go_ahead_tests.rs	an_agent_that_waits_for_room_as_told_is_never_told_as_refusing	go-ahead-standing-answer	exception-for-table
+src/supervise/policy/turn_end_go_ahead_tests.rs	an_irreversible_ask_keeps_the_reversible_answer	go-ahead-standing-answer	te-answer-policy
+src/supervise/policy/turn_end_go_ahead_tests.rs	answers_off_escalate_a_park_and_off_types_nothing	go-ahead-standing-answer	te-autopilot-off
+src/supervise/policy/turn_end_go_ahead_tests.rs	every_go_ahead_fits_the_typed_budget	go-ahead-standing-answer	te-continue-budget
+src/supervise/policy/turn_end_go_ahead_tests.rs	every_park_row_gets_the_go_ahead_or_the_reversible_answer	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	land_gives_the_go_ahead_only_after_its_instruction_and_over_unlanded_work	go-ahead-standing-answer	te-land-policy
+src/supervise/policy/turn_end_go_ahead_tests.rs	the_agents_own_wakes_starve_no_go_ahead	go-ahead-standing-answer	te-short-streak-backoff
+src/supervise/policy/turn_end_go_ahead_tests.rs	the_go_ahead_texts_and_their_echoes_read_as_nothing	go-ahead-standing-answer	te-classify-said
+src/supervise/policy/turn_end_go_ahead_tests.rs	the_incident_reply_gets_the_owners_standing_go_ahead_with_its_word	go-ahead-standing-answer	
+src/supervise/policy/turn_end_go_ahead_tests.rs	the_room_the_answer_names_is_a_wait_aterm_takes	go-ahead-standing-answer	
 src/supervise/policy/turn_end_tests.rs	a_bucket_no_relaunch_moved_off_is_waited_on_when_its_countdown_ends	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	a_bucket_waited_on_is_taken_up_by_the_loop_that_follows	te-model-bucket	
 src/supervise/policy/turn_end_tests.rs	a_buckets_own_act_is_held_while_usage_credits_carry_the_session	credits-hold	

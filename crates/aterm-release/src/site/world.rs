@@ -465,7 +465,13 @@ mod tests {
         let mut sh = command("/bin/sh");
         sh.args(["-c", "printf 'a\\377b\\n'; printf 'after\\n'; exit 3"]);
         let mut shown = Vec::new();
-        let ran = streamed(&super::super::Plain, &mut sh, &mut shown, DRAIN_AFTER_EXIT).unwrap();
+        let ran = streamed(
+            &super::super::Plain,
+            &mut sh,
+            &mut shown,
+            aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap();
         assert_eq!(ran.code, 3);
         assert_eq!(ran.log, "a\u{fffd}b\nafter\n");
         assert_eq!(String::from_utf8(shown).unwrap(), ran.log);
@@ -484,6 +490,28 @@ mod tests {
         }
     }
 
+    /// What `streamed` copies out, which makes `flag` once it holds `after`: the child's exit
+    /// waits for it, so both lines are read before the exit and the drain bounds only the end
+    /// of a pipe the grandchild keeps open.
+    struct Flagging {
+        seen: Vec<u8>,
+        flag: std::path::PathBuf,
+    }
+
+    impl Write for Flagging {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen.extend_from_slice(buf);
+            if self.seen.ends_with(b"after\n") {
+                std::fs::write(&self.flag, b"")?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_grandchild_holding_the_pipe_is_not_waited_on() {
         const DRAIN: std::time::Duration = std::time::Duration::from_millis(100);
@@ -492,19 +520,26 @@ mod tests {
             .tempdir()
             .unwrap();
         let _daemon = Daemon(dir.path().join("pid"));
+        let flag = dir.path().join("shown");
         let mut cmd = command("/bin/sh");
+        // The exit waits (up to the hang detector) until `after` was copied out.
         cmd.args([
             "-c",
-            "echo before; sleep 600 & echo \"$!\" > \"$1\"; echo after; exit 3",
+            "echo before; sleep 600 & echo \"$!\" > \"$1\"; echo after; i=0; \
+             while [ ! -e \"$2\" ] && [ $i -lt 6000 ]; do sleep 0.01; i=$((i+1)); done; exit 3",
             "sh",
         ])
-        .arg(dir.path().join("pid"));
+        .arg(dir.path().join("pid"))
+        .arg(&flag);
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut out = Vec::new();
+            let mut out = Flagging {
+                seen: Vec::new(),
+                flag,
+            };
             let started = std::time::Instant::now();
             let ran = streamed(&super::super::Plain, &mut cmd, &mut out, DRAIN);
-            let _ = done.send((ran, out, started.elapsed()));
+            let _ = done.send((ran, out.seen, started.elapsed()));
         });
         let (ran, out, took) = finished
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)

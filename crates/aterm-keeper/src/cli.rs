@@ -400,14 +400,27 @@ fn status_miss_line(socket: &std::path::Path, miss: &NoKeeper, replaceable: bool
 
 #[cfg(unix)]
 fn fresh_log(log: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    if let Some(dir) = log.parent() {
-        crate::server::ensure_private_dir(dir)?;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let dir = log
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the log path has no directory"))?;
+    crate::server::ensure_private_dir(dir)?;
+    match std::fs::symlink_metadata(log) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(meta) => {
+            if !meta.file_type().is_file() || meta.uid() != aterm_uds::peer::our_uid() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is not a regular file of ours", log.display()),
+                ));
+            }
+            std::fs::remove_file(log)?;
+        }
     }
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(log)
         .map(drop)
@@ -985,5 +998,42 @@ mod tests {
             .map(OsString::from)
             .collect();
         assert!(parse(&serve).expect("parse").no_relaunch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_log_replaces_only_our_regular_files_and_resets_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("akk-fresh-log-")
+            .tempdir()
+            .expect("exclusive fixture");
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("0700");
+
+        let log = scratch.path().join("k.sock.log");
+        std::fs::write(&log, b"stale").expect("seed log");
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).expect("0644");
+        fresh_log(&log).expect("replace regular log");
+        assert!(std::fs::read(&log).expect("read fresh").is_empty());
+        let mode = std::fs::symlink_metadata(&log)
+            .expect("stat fresh")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let keep = scratch.path().join("keep.txt");
+        std::fs::write(&keep, b"keep").expect("seed target");
+        let link = scratch.path().join("link.log");
+        std::os::unix::fs::symlink(&keep, &link).expect("symlink");
+        let err = fresh_log(&link).expect_err("symlink log must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(std::fs::read(&keep).expect("target untouched"), b"keep");
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+
+        let subdir = scratch.path().join("dir.log");
+        std::fs::create_dir(&subdir).expect("subdir");
+        let err = fresh_log(&subdir).expect_err("directory log must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 }

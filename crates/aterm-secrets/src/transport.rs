@@ -1388,6 +1388,8 @@ pub struct JoinRequest {
     pub code: String,
     /// Unix seconds when the server queued it (listings only).
     pub time: Option<u64>,
+    /// The serving vault observed this request from a LAN address (listings only).
+    pub lan: bool,
     /// A member's signed Allow of it (`crate::members::Allowed`), padded base64.
     pub allowed: Option<String>,
     /// The join-password proof it carried (`crate::join`), padded base64.
@@ -1419,6 +1421,9 @@ impl JoinRequest {
             self.code,
             self.time.unwrap_or(0)
         );
+        if self.lan {
+            line.push_str(" lan=1");
+        }
         if let Some(allowed) = &self.allowed {
             line.push_str(" allowed=");
             line.push_str(allowed);
@@ -1460,6 +1465,11 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
         }
         None => (line, None),
     };
+    let (line, lan) = match line.rsplit_once(" lan=") {
+        Some((rest, "1")) => (rest, true),
+        Some(_) => return Err(Error::new("a join request's LAN marker is invalid")),
+        None => (line, false),
+    };
     let fields: Vec<&str> = line.split(' ').collect();
     let (recipient, host, code, time) = match fields.as_slice() {
         [recipient, host, code] => (*recipient, *host, *code, None),
@@ -1492,11 +1502,15 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
                 .ok_or_else(|| Error::new("a join request's time is not unix seconds"))?,
         ),
     };
+    if lan && time.is_none() {
+        return Err(Error::new("only a server listing carries a LAN marker"));
+    }
     Ok(JoinRequest {
         recipient: recipient.to_owned(),
         host: host.to_owned(),
         code: code.to_owned(),
         time,
+        lan,
         allowed,
         proof,
     })
@@ -2312,11 +2326,13 @@ mod tests {
         assert_eq!(request.host, "m22");
         assert_eq!(request.code, "abcd-ef23-ghij-k234");
         assert_eq!(request.time, None);
+        assert!(!request.lan);
         assert_eq!(request.proof, None);
         assert_eq!(request.line(), line);
         let listed = parse_join_line(&format!("{line} 1792530000")).expect("listed");
         assert_eq!(listed.time, Some(1_792_530_000));
         assert_eq!(listed.listed(), format!("{line} 1792530000"));
+        assert!(!listed.lan, "old server listings carry no LAN assertion");
         let proof = crate::b64::encode_padded(&[7u8; 32]);
         let proved = parse_join_line(&format!("{line} proof={proof}")).expect("proved");
         assert_eq!(proved.proof.as_deref(), Some(proof.as_str()));
@@ -2324,7 +2340,20 @@ mod tests {
         let listed = parse_join_line(&format!("{line} 1792530000 proof={proof}")).expect("listed");
         assert_eq!(listed.time, Some(1_792_530_000));
         assert_eq!(listed.proof.as_deref(), Some(proof.as_str()));
+        let lan_line = format!("{line} 1792530000 lan=1 proof={proof}");
+        let lan = parse_join_line(&lan_line).expect("server LAN listing");
+        assert!(lan.lan);
+        assert_eq!(lan.listed(), lan_line);
+        assert_eq!(
+            lan.line(),
+            proved.line(),
+            "a client cannot send server fields"
+        );
         for bad in [
+            format!("{line} lan=1"),
+            format!("{line} 1792530000 lan=0"),
+            format!("{line} 1792530000 lan=1 lan=1"),
+            format!("{line} 1792530000 lan=true"),
             format!("{line} proof="),
             format!("{line} proof={}", crate::b64::encode_padded(&[7u8; 31])),
             format!("{line} proof={proof} 1792530000"),

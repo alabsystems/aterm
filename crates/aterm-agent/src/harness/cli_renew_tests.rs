@@ -1416,7 +1416,8 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
         ),
     )
     .expect("stand-in");
-    struct StandIn(PathBuf);
+    /// The stand-in claude and the scratch home its renewal reads as `$HOME`.
+    struct StandIn(PathBuf, OsString);
     impl AccountsHost for StandIn {
         fn stdin_is_terminal(&self) -> bool {
             true
@@ -1434,7 +1435,10 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
             0
         }
         fn renew_flow(&self, home: &str, email: &str, b: &RenewBrowser) -> Result<i32, String> {
-            renew_flow_of(self.0.as_os_str(), home, email, b)
+            let user_home = self.1.clone();
+            renew_flow_of(self.0.as_os_str(), home, email, b, &move |name| {
+                (name == "HOME").then(|| user_home.clone())
+            })
         }
         fn status_in_home(&self, home: &str) -> Result<Captured, String> {
             let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
@@ -1446,7 +1450,10 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
             )
         }
     }
-    let host = StandIn(program.clone());
+    let host = StandIn(
+        program.clone(),
+        env.home.clone().expect("a scratch home").into_os_string(),
+    );
     let (code, out, err) = acc(renew(&["main", "work-2"], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let ran = std::fs::read_to_string(tmp.path().join("bin").join("ran")).expect("it ran");
@@ -1523,7 +1530,8 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
         ),
     )
     .expect("stand-in");
-    struct HeadlessMailboxStandIn(PathBuf);
+    /// The stand-in claude and the scratch home its renewal reads as `$HOME`.
+    struct HeadlessMailboxStandIn(PathBuf, OsString);
     impl AccountsHost for HeadlessMailboxStandIn {
         fn stdin_is_terminal(&self) -> bool {
             false
@@ -1544,7 +1552,10 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
             Some(self.0.clone())
         }
         fn renew_flow(&self, home: &str, email: &str, b: &RenewBrowser) -> Result<i32, String> {
-            renew_flow_of(self.0.as_os_str(), home, email, b)
+            let user_home = self.1.clone();
+            renew_flow_of(self.0.as_os_str(), home, email, b, &move |name| {
+                (name == "HOME").then(|| user_home.clone())
+            })
         }
         fn status_in_home(&self, home: &str) -> Result<Captured, String> {
             let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
@@ -1556,7 +1567,10 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
             )
         }
     }
-    let host = HeadlessMailboxStandIn(program);
+    let host = HeadlessMailboxStandIn(
+        program,
+        env.home.clone().expect("a scratch home").into_os_string(),
+    );
     let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let ran = std::fs::read_to_string(tmp.path().join("bin").join("ran")).expect("it ran");

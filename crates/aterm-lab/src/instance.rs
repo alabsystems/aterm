@@ -59,14 +59,22 @@ impl World {
                 dir.display()
             )
         })?;
-        let w = World {
+        Self::lay_out(dir, config, false)
+    }
+
+    fn in_dir(dir: PathBuf, keep: bool) -> Self {
+        Self {
             home: dir.join("home"),
             cfg: dir.join("cfg"),
             run: dir.join("run"),
             sock: dir.join("run/a.sock"),
             dir,
-            keep: false,
-        };
+            keep,
+        }
+    }
+
+    fn lay_out(dir: PathBuf, config: &str, keep: bool) -> Result<Self, String> {
+        let w = Self::in_dir(dir, keep);
         let made = (|| -> std::io::Result<()> {
             use std::os::unix::fs::PermissionsExt as _;
             for d in [&w.home, &w.cfg.join("aterm"), &w.run] {
@@ -80,6 +88,70 @@ impl World {
         })();
         made.map_err(|e| format!("cannot lay out {}: {e}", w.dir.display()))?;
         Ok(w)
+    }
+
+    /// Prepare a fresh private world at `dir`, retaining it for another lab process or host.
+    ///
+    /// # Errors
+    /// The directory already exists, cannot be created privately or resolved, its socket paths
+    /// exceed the platform's address bound, or its profile and marker cannot be written.
+    pub fn create_at(dir: &Path, config: &str) -> Result<Self, String> {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = std::fs::canonicalize(
+            dir.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .map_err(|error| error.to_string())?;
+        let name = dir.file_name().ok_or("lab world needs a directory name")?;
+        let dir = parent.join(name);
+        for suffix in [
+            "run/aterm/aterm-4294967295.sock",
+            "cfg/aterm/network-state/observer.sock",
+            "cfg/aterm/network-state/waiting.sock",
+        ] {
+            std::os::unix::net::SocketAddr::from_pathname(dir.join(suffix)).map_err(|_| {
+                "lab world socket paths are too long; choose a short directory under /tmp/.ubd"
+                    .to_string()
+            })?;
+        }
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|error| format!("cannot create fresh lab world {}: {error}", dir.display()))?;
+        let dir = std::fs::canonicalize(&dir).map_err(|error| error.to_string())?;
+        let world = Self::lay_out(dir, config, true)?;
+        std::fs::set_permissions(&world.cfg, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        aterm_uds::private_file::write_private(&world.dir, "lab-world", b"aterm-lab-world/1\n")
+            .map_err(|error| error.to_string())?;
+        Ok(world)
+    }
+
+    /// Reopen a prepared world without rewriting its configuration, identity or data.
+    /// The world remains on disk when this handle drops.
+    ///
+    /// # Errors
+    /// The root or required profile directories are not private owned directories, the root
+    /// cannot be resolved, or its identifying marker is missing or invalid.
+    pub fn open_at(dir: &Path) -> Result<Self, String> {
+        use aterm_uds::private_file::{check_private_dir, read_private};
+        check_private_dir(dir).map_err(|error| error.to_string())?;
+        let marker = read_private(dir, "lab-world", 64).map_err(|error| error.to_string())?;
+        if marker.as_slice() != b"aterm-lab-world/1\n" {
+            return Err("not a prepared lab world".into());
+        }
+        let dir = std::fs::canonicalize(dir).map_err(|error| error.to_string())?;
+        let world = Self::in_dir(dir, true);
+        for path in [
+            &world.home,
+            &world.cfg,
+            &world.cfg.join("aterm"),
+            &world.run,
+        ] {
+            check_private_dir(path).map_err(|error| error.to_string())?;
+        }
+        Ok(world)
     }
 
     /// Leave the world in place when it drops, and say where.
@@ -140,6 +212,45 @@ impl World {
         ];
         env.extend(seams());
         env
+    }
+}
+
+/// A test's parent folder for [`World::create_at`], under `/tmp` so the world's socket paths fit
+/// `sun_path`: the targo shim runs tests with `TMPDIR` at `$TMPDIR/.ubd/`, a `/var/folders` path
+/// that leaves them too long.
+#[cfg(test)]
+pub(crate) fn world_parent() -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix("w")
+        .tempdir_in("/tmp")
+        .expect("a scratch folder under /tmp")
+}
+
+#[cfg(test)]
+mod prepared_world_tests {
+    use super::{CONFIG_OFF, World, world_parent};
+
+    #[test]
+    fn prepared_world_reopens_without_overwriting_configuration_or_identity() {
+        let parent = world_parent();
+        let root = parent.path().join("world");
+        let world = World::create_at(&root, CONFIG_OFF).unwrap();
+        let config = world.cfg.join("aterm/aterm.toml");
+        let original = std::fs::read(&config).unwrap();
+        let identity = world.home.join("fixture-identity");
+        std::fs::write(&identity, b"retained identity").unwrap();
+        assert!(World::create_at(&root, "different configuration").is_err());
+        drop(world);
+        let reopened = World::open_at(&root).unwrap();
+        assert_eq!(reopened.cfg.join("aterm/aterm.toml"), config);
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert_eq!(std::fs::read(&identity).unwrap(), b"retained identity");
+        assert!(World::open_at(parent.path()).is_err());
+        let long = parent.path().join("x".repeat(100));
+        assert!(World::create_at(&long, CONFIG_OFF).is_err());
+        assert!(!long.exists());
+        drop(reopened);
+        assert!(identity.exists());
     }
 }
 
@@ -496,13 +607,27 @@ impl Instance {
         })
     }
 
-    /// Wait until the control socket answers `version` (at most `limit`).
+    /// Wait until the control socket answers `version` (at most `limit`). An ordinary launch
+    /// waits on its own child process's socket, never a sibling named by the latest alias.
     /// # Errors
     /// Interrupted, the instance exited first, or it never answered (its log tail says why).
     pub fn await_socket(&mut self, limit: Duration) -> Result<(), Fail> {
         let end = Instant::now() + limit;
         loop {
-            if self.sock.exists() && self.ctl(&["version"]).code == 0 {
+            let ordinary = self
+                .sock
+                .file_name()
+                .is_some_and(|name| name == aterm_types::control_socket::LATEST_SOCK_FILE);
+            let ready_socket = if ordinary {
+                self.aterm_pid().is_some_and(|pid| {
+                    self.sock
+                        .set_file_name(aterm_types::control_socket::instance_sock_name(pid as u32));
+                    true
+                })
+            } else {
+                true
+            };
+            if ready_socket && self.sock.exists() && self.ctl(&["version"]).code == 0 {
                 return Ok(());
             }
             if let Some(status) = self.exited() {

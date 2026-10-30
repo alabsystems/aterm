@@ -369,8 +369,9 @@ impl Log {
         let entry_at = membership
             .members()
             .values()
-            .find(|m| m.binding.recipient() == *recipient)
-            .and_then(|seat| self.held.get(&seat.entry).copied());
+            .filter(|m| m.binding.recipient() == *recipient)
+            .filter_map(|seat| self.held.get(&seat.entry).copied())
+            .max();
         let effective = eval::effective_records(&self.order);
         let mut epochs: Vec<(usize, RecordId)> = Vec::new();
         let mut epoch_ids: BTreeSet<RecordId> = BTreeSet::new();

@@ -50,7 +50,12 @@ pub(crate) struct ResetReport {
 }
 
 /// How long the verb waits for the parse stage.
+#[cfg(not(test))]
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// A unit test's parse stage is its own live reader, which answers: a reply a loaded machine
+/// slows is waited for to the hang detector, not answered "timed out".
+#[cfg(test)]
+pub(crate) const REPLY_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The verb's answer when a seamless update was committing the session for its whole wait ([`run_direct`]).
 pub(crate) const RESET_BUSY: &str = "ERR busy update-committing (the reset reached this aterm, \
@@ -649,7 +654,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_reader_that_ends_without_answering_runs_the_reset_directly() {
-        use std::time::Duration;
         let s = crate::stub_session(7);
         let (tx, rx) = std::sync::mpsc::sync_channel::<crate::spawn::GatherMsg>(4);
         let generation = s.ctx.reset_lane.open(tx, None);
@@ -664,7 +668,7 @@ mod tests {
                 &term,
                 &ctx,
                 ResetSource::Verb,
-                Some(Duration::from_secs(4)),
+                Some(aterm_spec::wait::MUST_HAPPEN),
             )
         });
         let msg = rx

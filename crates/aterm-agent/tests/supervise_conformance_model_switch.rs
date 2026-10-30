@@ -57,6 +57,7 @@ fn base_reading() -> TurnEndReading {
         opens_cut: false,
         turn_said: None,
         opened_by: None,
+        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,

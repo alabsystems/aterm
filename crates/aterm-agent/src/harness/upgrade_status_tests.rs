@@ -27,6 +27,7 @@ fn opts(dir: &std::path::Path) -> Opts {
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     }
@@ -5324,6 +5325,63 @@ fn a_limit_whose_named_reset_has_passed_is_told() {
     );
 }
 
+/// Once the agent was told what waits on its own work ([`upgrade::Step::Tell`]), the row says so
+/// (`agent_told=`, `agent_tells`), and the person's digest line says it as a fact, not as a step
+/// of theirs. A tell about another build is none about this one.
+#[test]
+fn a_told_agent_is_on_the_row_and_the_digest_says_it_as_a_fact() {
+    let untold = pending(MOVE_BUDGET_S + 60);
+    let told = Row {
+        agent_tells: 1,
+        agent_told_at: NOW - 600,
+        ..untold.clone()
+    };
+    let field = |row: &Row| {
+        row.line(NOW)
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("agent_told="))
+            .map(str::to_string)
+    };
+    assert_eq!(field(&untold).as_deref(), Some("-"));
+    assert_eq!(field(&told).as_deref(), Some("1/3@10m"));
+    let json = told.to_json(NOW);
+    assert_eq!(json.get("agent_tells").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        json.get("agent_told_at").and_then(Value::as_u64),
+        Some(NOW - 600)
+    );
+    let then = |row: &Row| match row.attention(NOW) {
+        Attention::Digest(need) => need.then,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        then(&told),
+        "aterm told the agent, and it moves once none of its own work runs"
+    );
+    assert_ne!(then(&untold), then(&told));
+    let st = St {
+        phase: Phase::Pending,
+        to: "2.1.283".into(),
+        pending_since: NOW - 3_600,
+        tells: 2,
+        told_at: NOW - 60,
+        told_to: "2.1.282".into(),
+        ..St::default()
+    };
+    assert_eq!(Row::of("s", &st, NOW).agent_tells, 0, "another build's");
+    let st = St {
+        told_to: "2.1.283".into(),
+        ..st
+    };
+    assert_eq!(
+        (
+            Row::of("s", &st, NOW).agent_tells,
+            Row::of("s", &st, NOW).agent_told_at
+        ),
+        (2, NOW - 60)
+    );
+}
+
 #[test]
 fn status_says_what_holds_the_move_and_what_the_owner_is_told() {
     let words = |row: &Row| {
@@ -7275,6 +7333,9 @@ fn the_ask_count_survives_a_retarget_and_the_state_file() {
 
 #[path = "upgrade_progress_tests.rs"]
 mod progress;
+
+#[path = "upgrade_quiet_tests.rs"]
+mod quiet;
 
 #[test]
 fn a_rearmed_rounds_first_looks_are_still_its_rest() {

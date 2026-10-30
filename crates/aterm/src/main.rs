@@ -317,6 +317,8 @@ pub(crate) fn main() -> ExitCode {
     aterm_gui::mark_rust_main_start();
     #[cfg(unix)]
     shared_login::install_automatic();
+    #[cfg(unix)]
+    aterm_agent::harness::account_catalog::install_reader(shared_accounts::read);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     account_claims::install(claims_observation);
     #[cfg(windows)]
@@ -851,7 +853,10 @@ fn park_until_spoke_or_silent_for(
     spoke: &std::sync::atomic::AtomicBool,
     silent: std::time::Duration,
 ) -> bool {
-    let until = std::time::Instant::now() + silent;
+    let now = std::time::Instant::now();
+    let until = now
+        .checked_add(silent)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
     loop {
         if spoke.load(std::sync::atomic::Ordering::Acquire) {
             return true;
@@ -14258,6 +14263,8 @@ fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
     first == "doctor" && !rest.iter().any(|arg| arg == "-h" || arg == "--help")
 }
 
+#[cfg(unix)]
+mod shared_accounts;
 #[cfg(unix)]
 mod shared_login;
 

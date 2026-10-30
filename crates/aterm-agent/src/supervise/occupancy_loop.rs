@@ -1558,6 +1558,38 @@ impl<C: Ctl> Session<'_, C> {
         )
     }
 
+    /// A break of the agent's own background work as the host's step there is told it
+    /// ([`IdleHost::at_background_on`]): the guards a host's fact is judged by, from what the loop
+    /// holds, and a task landed under Land, as at an idle point. With no policy to read a person's
+    /// grace by, any key the loop saw holds it. The person is the loop's last read: a host's step
+    /// that types reads the screen's own key time too (the upgrade's
+    /// [`crate::harness::upgrade::person_seen`]).
+    pub(super) fn break_point(
+        &self,
+        now: Instant,
+        cfg: Option<&SupervisorConfig>,
+        rows: &[String],
+    ) -> IdlePoint {
+        let guards = cfg.map_or_else(
+            || {
+                let (exchange, managed) = self.held_for_others();
+                Guards {
+                    person: self.driver || self.person_at().is_some(),
+                    exchange,
+                    managed,
+                    ..Guards::clear(Autopilot::Off)
+                }
+            },
+            |cfg| self.occupancy_guards(now, cfg, rows),
+        );
+        IdlePoint {
+            done_under_land: cfg.is_some_and(|cfg| self.autopilot_under(cfg) == Autopilot::Land)
+                && self.turn_end.landed(),
+            held: guards.held_host_fact(),
+            theirs: guards.theirs(),
+        }
+    }
+
     /// Whose the session is for as long as they keep it ([`Guards::theirs`]: the person's own
     /// exchange or a manager's wait), as [`Self::occupancy_guards`] reads those guards: nothing is
     /// read for it, neither the screen nor the clock.

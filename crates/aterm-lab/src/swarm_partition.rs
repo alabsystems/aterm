@@ -35,6 +35,8 @@
 //! plane ([`commons`]) drives the production repair exchange in this process on each Mac's own
 //! vault custody, pairing Macs of one island during the cut; the accounts plane ([`accounts`]) is
 //! a model run of main's account claims on two Macs' table replicas on a simulated clock.
+//! After the heal the removals plane ([`removals`]) runs F16's quorum Undo: b2 removes every
+//! other member with the CLI, and the Macs it removed undo it and read a value b2 cannot.
 //!
 //! A run whose cut held is a measurement of the build, whatever it finds, so `--record` writes it
 //! under `docs/measured/` red or green. Only a run whose cut leaked is never recorded there.
@@ -55,6 +57,9 @@ pub mod commons;
 
 #[path = "swarm_partition_accounts.rs"]
 pub mod accounts;
+
+#[path = "swarm_partition_removals.rs"]
+pub mod removals;
 
 /// Hang detector for an event that must happen.
 const HANG: Duration = Duration::from_secs(60);
@@ -420,6 +425,8 @@ pub struct Evidence {
     pub commons: Option<commons::Evidence>,
     /// The accounts plane, where it ran.
     pub accounts: Option<accounts::Evidence>,
+    /// The removals plane (F16's quorum Undo), where it ran.
+    pub removals: Option<removals::Evidence>,
     /// This Mac's 1-minute load average at each mark (`start`, just after bring-up; `cut`, `heal`,
     /// `end`): a
     /// debug aterm starved of a core misses the fleet's 3 s handshake, so a reader weighs a
@@ -463,6 +470,9 @@ pub fn judge(ev: &Evidence) -> Vec<Check> {
     }
     if let Some(a) = &ev.accounts {
         checks.extend(accounts::judge(a));
+    }
+    if let Some(r) = &ev.removals {
+        checks.extend(removals::judge(r));
     }
     checks
 }
@@ -2547,6 +2557,23 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
                 .map_or_else(|| names(&a.rows), |why| format!("nothing ({why})"))
         ));
     }
+    // Removals: b2 turns hostile and removes every other member; the Macs it removed undo it.
+    let removed = removals::run(&plane.macs, &|mac, args| lane.aterm(mac, args, None));
+    lane.say(&match &removed.skipped {
+        Some(why) => format!("removals: not run: {why}"),
+        None => format!(
+            "removals: {} removed {}; {} of {} voters undid it; {}",
+            removals::REMOVER,
+            names(&removed.targets),
+            removed.signed,
+            removed.voters,
+            if removed.minted.is_empty() {
+                "the tender minted nothing".to_owned()
+            } else {
+                removed.minted.join(", ")
+            }
+        ),
+    });
     let accounts = accounts::run();
     mark("end");
     Ok(Evidence {
@@ -2556,6 +2583,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         fleet: f,
         commons: Some(plane.ev),
         accounts: Some(accounts),
+        removals: Some(removed),
         load,
         cut_ms: cut_for_ms,
     })
@@ -2794,6 +2822,24 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
     let _ = writeln!(out);
     match &ev.accounts {
         Some(a) => out.push_str(&accounts::report(a)),
+        None => {
+            let _ = writeln!(out, "- not run");
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Removals");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "- F16's quorum Undo after the heal: {} removes every other member with `aterm members \
+         remove`, the Macs it removed press its Undo row (the call the press makes) until the \
+         quorum takes effect, the lab runs the epoch tender's pass a few gap steps on, and a2 \
+         puts {} under the newest epoch; each Mac is then read from its own records",
+        removals::REMOVER,
+        removals::VALUE_NAME
+    );
+    match &ev.removals {
+        Some(r) => out.push_str(&removals::report(r)),
         None => {
             let _ = writeln!(out, "- not run");
         }

@@ -2047,6 +2047,104 @@ fn a_pass_that_freed_something_but_left_the_volume_short_still_counts() {
 }
 
 #[test]
+fn disk_admission_reset_drops_partial_cycle_and_old_spent_summary_before_repressure() {
+    use aterm_agent::harness::cli::{DiskLook, DiskTick, disk_tick_paged};
+    use aterm_agent::harness::disk::{Config, RUSTC_INFO, discover};
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let home = base.join("home");
+    let state = base.join("state");
+    for n in 0..=discover::MAX_FOUND {
+        let target = home.join(format!("source-{n:03}")).join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(RUSTC_INFO), b"{}").unwrap();
+    }
+    let roots = discover::Roots {
+        home: Some(home.clone()),
+        ..Default::default()
+    };
+    let table = aterm_sysprobe::volumes::table();
+    let gib = 1u64 << 30;
+    let config = Config {
+        dead_build_dirs: false,
+        idle_build_dirs: false,
+        ..Config::default()
+    };
+    let look = DiskLook {
+        state: &state,
+        volume: &home,
+        free: Some(gib),
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: None,
+        now: 1_792_000_000,
+        room: None,
+        table: Some(&table),
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    let mut cursor = discover::Cursor::new();
+    let mut remove =
+        |_: &aterm_agent::harness::disk::Row| panic!("marker-only targets grant no removal");
+    let DiskTick::Reclaimed(first, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(gib), &mut cursor)
+    else {
+        panic!("short");
+    };
+    assert!(!first.ran_out());
+    let mut reset = cursor;
+    reset.reset_cycle();
+    assert_ne!(
+        cursor, reset,
+        "the first product pass must have partial cycle progress"
+    );
+    let runs = DiskRuns::new();
+    *runs.discovery.lock().unwrap() = cursor;
+    let board = Shelf::new();
+    board.publish(|board| {
+        board.last_pass = Some(crate::disk_board::PassSummary {
+            key: aterm_sysprobe::volumes::VolumeKey::Fsid(9),
+            ended_at: Instant::now(),
+            free_after: Some(gib),
+            tiers: Vec::new(),
+            freed: 0,
+            demand: Some(2 * gib),
+            ran_out: true,
+            spent: true,
+            held_back: false,
+            hogs: 0,
+            largest: 0,
+            left: Vec::new(),
+            ended_at_unix: Some(look.now),
+        })
+    });
+    assert!(!runs.admit(false, &board));
+    assert_eq!(
+        *runs.discovery.lock().unwrap(),
+        reset,
+        "the GUI early no-pass path retains only its position"
+    );
+    assert!(
+        board.board_lock().last_pass.is_none(),
+        "an old spent pass cannot open a new episode"
+    );
+    assert!(runs.admit(true, &board));
+    let mut again = *runs.discovery.lock().unwrap();
+    let DiskTick::Reclaimed(repressured, _) =
+        disk_tick_paged(&look, config, &mut remove, &mut || Some(gib), &mut again)
+    else {
+        panic!("short again");
+    };
+    assert!(
+        !repressured.ran_out(),
+        "re-pressure needs a new whole observation cycle"
+    );
+}
+
+#[test]
 fn a_disk_setting_aterm_cannot_read_is_said_and_a_short_volume_still_opens_its_line() {
     let tmp = aterm_tempfile::Builder::new()
         .prefix("aterm-hh-disk-")
@@ -7005,7 +7103,7 @@ impl Acting {
                     }
                     step.to_string()
                 }),
-                notice: Arc::new(move |_, _| {
+                notice: Arc::new(move |_, _, _| {
                     a11.noticed.fetch_add(1, Ordering::SeqCst);
                     a11.notices
                         .lock()
@@ -7014,7 +7112,7 @@ impl Acting {
                         .unwrap_or("wait:background")
                         .to_string()
                 }),
-                step: Arc::new(move |sid, _| {
+                step: Arc::new(move |sid, _, _| {
                     a3.stepped_for.lock().unwrap().push(sid.to_string());
                     a3.stepped.fetch_add(1, Ordering::SeqCst);
                     if let Some(during) = a3.during_step.lock().unwrap().as_ref() {
@@ -7619,7 +7717,7 @@ fn a_settled_carry_on_leaves_a_move_due_beside_it_a_look() {
                 r.store(false, Ordering::SeqCst);
                 "done:resumed".to_string()
             }),
-            step: Arc::new(move |_, _| {
+            step: Arc::new(move |_, _, _| {
                 s.fetch_add(1, Ordering::SeqCst);
                 "wait:settling".to_string()
             }),
@@ -7969,11 +8067,11 @@ fn the_worker_keeps_the_guard_its_loop_withheld_and_the_points_it_offered() {
     let mut hooks = hooks(&world, parking_body(&world));
     hooks.acts = Acts {
         due: Arc::new(|_| Due::No),
-        step: Arc::new(move |_, _| {
+        step: Arc::new(move |_, _, _| {
             s1.lock().unwrap().push("step");
             "announced:1".to_string()
         }),
-        notice: Arc::new(move |_, _| {
+        notice: Arc::new(move |_, _, _| {
             s2.lock().unwrap().push("notice");
             "announced:1".to_string()
         }),
@@ -8286,7 +8384,7 @@ fn a_limit_episode_clears_ownership_and_keeps_its_stamp_past_a_held_lock() {
     let mut hooks = hooks(&world, parking_body(&world));
     hooks.acts = Acts {
         due: Arc::new(|_| Due::Yes),
-        step: Arc::new(move |_, _| {
+        step: Arc::new(move |_, _, _| {
             l1.lock().unwrap().push("step".to_string());
             "announced:1".to_string()
         }),
@@ -18214,7 +18312,7 @@ fn a_break_of_the_agents_background_work_takes_the_notice_alone() {
         h.acts = Acts {
             due: Arc::new(move |_| due),
             owed: Arc::new(move |_, _| owed),
-            notice: Arc::new(move |_, _| {
+            notice: Arc::new(move |_, _, _| {
                 n.fetch_add(1, Ordering::SeqCst);
                 "wait:not-idle".to_string()
             }),
@@ -18521,7 +18619,7 @@ fn attended_worker_with(
     let mut hooks = hooks(world, parking_body(world));
     hooks.acts = Acts {
         due: Arc::new(|_| Due::Yes),
-        step: Arc::new(move |_, g| {
+        step: Arc::new(move |_, g, _| {
             assert_eq!(g, grace, "the worker's grace reaches its step");
             s1.lock().unwrap().pop_front().expect("a scripted step")
         }),
@@ -18535,6 +18633,89 @@ fn attended_worker_with(
     let mut idle = idle_host("s-att", Program::Claude, switched(&on()), hooks);
     idle.grace = grace;
     (idle, paused)
+}
+
+/// What a quiet upgrade round may type the tab's agent reaches the upgrade's step, at an idle
+/// point and at a break ([`WorkerIdle::upgrade_tell`]): nothing with the tab's Autopilot off, its
+/// task landed under Land, or a guard holding a host's fact there (under Cruise, only the person's
+/// grace), and the restart verb only where the tab offers and promises that restart.
+#[test]
+fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() {
+    use upgrade_drive::Tell;
+    let world = Arc::new(World::default());
+    let run = |autopilot: Option<Autopilot>, offered: Option<bool>, point: IdlePoint| {
+        let told: Arc<Mutex<Vec<Tell>>> = Arc::default();
+        let (t1, t2) = (Arc::clone(&told), Arc::clone(&told));
+        let (idle, _) = attended_worker_with(&world, &[], move |hooks| {
+            hooks.acts.step = Arc::new(move |_, _, tell| {
+                t1.lock().unwrap().push(tell);
+                "wait:background".to_string()
+            });
+            hooks.acts.notice = Arc::new(move |_, _, tell| {
+                t2.lock().unwrap().push(tell);
+                "wait:background".to_string()
+            });
+            hooks.acts.offered = Arc::new(move |_| offered);
+            hooks.autopilot = Arc::new(move || {
+                autopilot
+                    .map(|a| std::collections::HashMap::from([("s-att".to_string(), a)]))
+                    .unwrap_or_default()
+            });
+        });
+        let _ = idle.at_idle_on(point);
+        let _ = idle.at_background_on(point);
+        told.lock().unwrap().clone()
+    };
+    let open = IdlePoint::default();
+    assert_eq!(
+        run(None, Some(true), open),
+        [Tell::Verb; 2],
+        "Cruise, offered"
+    );
+    assert_eq!(
+        run(None, Some(false), open),
+        [Tell::Fact; 2],
+        "offered, not promised"
+    );
+    assert_eq!(run(Some(Autopilot::Land), None, open), [Tell::Fact; 2]);
+    assert!(
+        run(Some(Autopilot::Off), Some(true), open)
+            .iter()
+            .all(|t| *t == Tell::Off),
+        "a person reads what is typed"
+    );
+    let landed = IdlePoint {
+        done_under_land: true,
+        ..open
+    };
+    assert_eq!(
+        run(Some(Autopilot::Land), Some(true), landed),
+        [Tell::Off; 2],
+        "nothing after a land's defense"
+    );
+    for guard in [Guard::Person, Guard::Exchange, Guard::Managed] {
+        let held = IdlePoint {
+            held: Some(guard),
+            ..open
+        };
+        assert_eq!(
+            run(Some(Autopilot::Land), Some(true), held),
+            [Tell::Off; 2],
+            "{guard:?}"
+        );
+        // Cruise types its carry into a session its manager waits on, or the person's own
+        // exchange holds: the tell goes there too, and only a person's grace holds it.
+        let cruise = if guard == Guard::Person {
+            Tell::Off
+        } else {
+            Tell::Verb
+        };
+        assert_eq!(
+            run(None, Some(true), held),
+            [cruise; 2],
+            "Cruise, {guard:?}"
+        );
+    }
 }
 
 #[test]
@@ -18724,7 +18905,7 @@ fn a_ready_after_notices_at_breaks_owns_its_settle() {
                 (1..=breaks).map(|n| format!("announced:{n}")).collect(),
             ));
             let typed = Arc::clone(&notices);
-            idle.hooks.acts.notice = Arc::new(move |_, _| {
+            idle.hooks.acts.notice = Arc::new(move |_, _, _| {
                 typed
                     .lock()
                     .unwrap()
@@ -25726,7 +25907,7 @@ impl LookWorld {
                 Behind::Nothing
             }
         });
-        acts.step = Arc::new(move |_, _| {
+        acts.step = Arc::new(move |_, _, _| {
             if !w3.noted.swap(true, Ordering::SeqCst) {
                 w3.aged.store(false, Ordering::SeqCst);
             }
@@ -34101,7 +34282,7 @@ fn an_unnamed_conversations_upgrade_wait_climbs_its_ladder() {
                 })
             }),
             due: Arc::new(|_| Due::Yes),
-            step: Arc::new(|_, _| "wait:failed".to_string()),
+            step: Arc::new(|_, _, _| "wait:failed".to_string()),
             ..Acts::inert()
         };
         hooks.pause = Arc::new(|d| d);
@@ -35173,7 +35354,7 @@ fn a_stuck_program_check_holds_the_worker_and_keeps_what_it_owes() {
         hooks.acts = Acts {
             program_check: board,
             due: Arc::new(|_| Due::Yes),
-            notice: Arc::new(|_, _| "announced:1".to_string()),
+            notice: Arc::new(|_, _, _| "announced:1".to_string()),
             ..Acts::inert()
         };
         let w = idle_host(sid, Program::Claude, switched(&resetting()), hooks);

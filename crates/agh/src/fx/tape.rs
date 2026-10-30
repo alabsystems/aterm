@@ -533,11 +533,24 @@ fn path_word(path: &Path) -> String {
 }
 
 fn in_the_way(path: &Path) -> String {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    const O_NONBLOCK: i32 = 0x0004;
+
     let magic = format!("{MAGIC}\n");
     let mut head = Vec::new();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, O_NONBLOCK);
     let tape = std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-        && std::fs::File::open(path)
+        && options
+            .open(path)
             .and_then(|file| {
+                if !file.metadata()?.is_file() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+                }
                 file.take(u64::try_from(magic.len()).unwrap_or(u64::MAX))
                     .read_to_end(&mut head)
             })

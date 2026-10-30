@@ -11,17 +11,20 @@ use crate::supervise::policy::cruise_carry::{BACKGROUND_CARRY, RULE_BACKGROUND};
 /// A turn that ended with the agent's own dynamic workflows running, its report `said` (each
 /// line under the first in the reply's gutter).
 fn waiting(said: &[&str]) -> Vec<String> {
-    let mut lines: Vec<String> = said
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if i == 0 {
-                format!("⏺ {l}")
-            } else {
-                format!("  {l}")
-            }
-        })
-        .collect();
+    waiting_under(&[], said)
+}
+
+/// [`waiting`] with `before`'s rows drawn above the report: the turn's earlier messages and its
+/// tool rows.
+fn waiting_under(before: &[&str], said: &[&str]) -> Vec<String> {
+    let mut lines: Vec<String> = before.iter().map(ToString::to_string).collect();
+    lines.extend(said.iter().enumerate().map(|(i, l)| {
+        if i == 0 {
+            format!("⏺ {l}")
+        } else {
+            format!("  {l}")
+        }
+    }));
     lines.extend(
         ["", "✻ Waiting for 2 dynamic workflows to finish", ""]
             .iter()
@@ -1249,4 +1252,215 @@ fn a_persons_message_between_the_last_carry_and_a_restart_starts_the_books_again
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+const PARKED: &[&str] = &[
+    "Both workflows are running; the build is waiting on your go-ahead and on disk room.",
+    "NEEDS YOU: say \"rerun the checks\" so I can build and test the branch and push it to main.",
+];
+
+/// The `send` requests the run made, their text after ` -- `.
+fn sent(ran: &Ran) -> Vec<String> {
+    ran.requests()
+        .into_iter()
+        .filter(|r| r.starts_with("send "))
+        .filter_map(|r| r.split_once(" -- ").map(|(_, text)| text.to_string()))
+        .collect()
+}
+
+/// A BREAK THAT PARKS ON A GO-AHEAD (owner, 2026-10-29: "how dare you block on me for go
+/// ahead!"): the owner's standing go-ahead goes in the carry's place, on its ladder, and the need
+/// stays raised until the work runs; with answers off the carry goes as before.
+#[test]
+fn a_break_that_parks_on_a_go_ahead_gets_the_owners_standing_go_ahead() {
+    use crate::supervise::policy::go_ahead::{GO_AHEAD_ANSWER, RULE_GO_AHEAD};
+    let drawn = |_| waiting(PARKED);
+    let cruise = Script {
+        policy: SupervisorConfig {
+            answer_questions: true,
+            ..under(Autopilot::Cruise)
+        },
+        drawn: &drawn,
+        set: &|_| {},
+        ..Script::new("carry-go-ahead", Occupancy::Observe, &[0, 30])
+    }
+    .run(&mut nothing);
+    let sent = sent(&cruise);
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    assert!(
+        sent[0].starts_with(GO_AHEAD_ANSWER)
+            && sent[0]
+                .contains("You asked the owner to say \"rerun the checks\": consider it said."),
+        "{sent:#?}"
+    );
+    assert_eq!(carries(&cruise), 0);
+    assert!(
+        cruise
+            .ledger
+            .contains(&format!("\"rule_id\":\"{RULE_GO_AHEAD}\"")),
+        "{}",
+        cruise.ledger
+    );
+    assert_eq!(raised(&cruise).len(), 1, "{:#?}", cruise.requests());
+    // This harness's policy answers no question: the carry goes as before, without the sentence
+    // that hands a parked agent the go-ahead the person chose to answer themselves (2026-10-29
+    // review 2).
+    let off = ran(
+        "carry-go-ahead-off",
+        Autopilot::Cruise,
+        PARKED,
+        &[0, 30],
+        &|_| {},
+        &mut nothing,
+    );
+    let carried = self::sent(&off);
+    assert_eq!(
+        carried,
+        vec![crate::supervise::policy::go_ahead::unless_held(BACKGROUND_CARRY, true).into_owned()],
+        "{:#?}",
+        off.writes()
+    );
+    assert!(
+        carried
+            .iter()
+            .all(|s| !s.contains(crate::supervise::policy::go_ahead::NEVER_A_NEED)),
+        "{carried:#?}"
+    );
+}
+
+/// A BREAK READS ITS WHOLE TURN, AS A TURN END DOES (2026-10-29 review 2): a plan to delete
+/// release tags in an earlier message of the turn is one the go-ahead would be read as covering,
+/// so the carry goes, not the go-ahead.
+#[test]
+fn a_break_whose_turn_plans_an_outward_act_gets_the_carry_not_the_go_ahead() {
+    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    let drawn = |_| {
+        waiting_under(
+            &[
+                "⏺ Plan: delete the stale release tags on the remote, then push my branch to main. \
+                 Tests are green.",
+                "",
+                "⏺ Bash(git fetch origin)",
+                "  ⎿  (No content)",
+                "",
+            ],
+            &["Waiting for your go-ahead to push."],
+        )
+    };
+    let cruise = Script {
+        policy: SupervisorConfig {
+            answer_questions: true,
+            ..under(Autopilot::Cruise)
+        },
+        drawn: &drawn,
+        set: &|_| {},
+        ..Script::new("carry-go-ahead-planned", Occupancy::Observe, &[0, 30])
+    }
+    .run(&mut nothing);
+    assert!(
+        !cruise
+            .ledger
+            .contains(&format!("\"rule_id\":\"{RULE_GO_AHEAD}\"")),
+        "{}",
+        cruise.ledger
+    );
+    assert!(
+        cruise
+            .ledger
+            .contains(&format!("\"rule_id\":\"{RULE_BACKGROUND}\"")),
+        "{}",
+        cruise.ledger
+    );
+}
+
+/// A BREAK WHOSE REPLY ASKS AN IRREVERSIBLE STEP keeps the carry: the go-ahead goes at a break only
+/// where it would at a turn end (2026-10-29 review).
+#[test]
+fn a_break_that_asks_an_irreversible_step_gets_the_carry_not_the_go_ahead() {
+    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    // The reader parks it (its force-push is negated), and the base reads an irreversible ask.
+    let drawn = |_| {
+        waiting(&[
+            "No force-push and nothing published. I'm still waiting for your go-ahead before \
+             rebuilding.",
+        ])
+    };
+    let cruise = Script {
+        policy: SupervisorConfig {
+            answer_questions: true,
+            ..under(Autopilot::Cruise)
+        },
+        drawn: &drawn,
+        set: &|_| {},
+        ..Script::new("carry-go-ahead-irreversible", Occupancy::Observe, &[0, 30])
+    }
+    .run(&mut nothing);
+    assert_eq!(carries(&cruise), 1, "{:#?}", cruise.writes());
+    assert!(
+        !cruise
+            .ledger
+            .contains(&format!("\"rule_id\":\"{RULE_GO_AHEAD}\"")),
+        "{}",
+        cruise.ledger
+    );
+}
+
+/// THE GO-AHEAD'S BOUND HOLDS AT BREAKS TOO (2026-10-29 review): each go-ahead typed at a break
+/// counts on its park, and once the park is spent no more goes, carry or go-ahead.
+#[test]
+fn a_park_at_breaks_gets_the_go_ahead_its_limit_of_times() {
+    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use crate::supervise::policy::turn_end::GO_AHEAD_ACTS;
+    let cfg = SupervisorConfig {
+        answer_questions: true,
+        ..under(Autopilot::Cruise)
+    };
+    let drawn = |_| waiting(PARKED);
+    let host = Arc::new(DoorHost::default());
+    let ran = Script {
+        policy: cfg.clone(),
+        drawn: &drawn,
+        set: &|_| {},
+        host: Arc::clone(&host),
+        // Each go-ahead is answered ten seconds on, the turn ending on the work again: the
+        // carry's ladder (2, 4, 8, 16 minutes) brings the next break due.
+        ..Script::new(
+            "carry-go-ahead-spent",
+            Occupancy::Observe,
+            &[
+                30, 40, 160, 170, 410, 420, 890, 900, 1850, 1860, 3770, 3780, 5700, 5710, 7600,
+            ],
+        )
+    }
+    .run(&mut |s, i| {
+        if i % 2 == 1 {
+            s.took(7, Some(&cfg), &mut Heard::default());
+        }
+    });
+    let sent = sent(&ran);
+    assert_eq!(
+        sent.len(),
+        usize::try_from(GO_AHEAD_ACTS).expect("small"),
+        "{sent:#?}"
+    );
+    assert!(
+        sent.iter().all(|s| s.starts_with(GO_AHEAD_ANSWER)),
+        "{sent:#?}"
+    );
+    // The spent park is told now, as a turn end tells it (2026-10-29 review 2): the person sees
+    // it on the menu bar, and the agent's breaks after it end nothing.
+    let told: Vec<&String> = ran
+        .noted
+        .iter()
+        .filter(|n| n.starts_with("EXCEPTION ") && n.contains(" kind=stalled when=now "))
+        .collect();
+    assert_eq!(told.len(), 1, "{:#?}", ran.noted);
+    assert_eq!(
+        *host.exceptions.lock().expect("exceptions"),
+        vec![Some(
+            crate::supervise::policy::exception::Exception::refuses_go_ahead().why
+        )],
+        "{:#?}",
+        ran.noted
+    );
 }

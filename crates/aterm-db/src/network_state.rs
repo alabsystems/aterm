@@ -29,7 +29,10 @@ const REACHABLE: Duration = Duration::from_secs(15);
 
 mod relay;
 
-pub(crate) use relay::{read_owner_publication, read_publication as read_live_publication};
+pub(crate) use relay::{
+    error_stage as live_error_stage, read_owner_publication,
+    read_publication as read_live_publication,
+};
 
 /// An observation and its original local monotonic sample time. This lease is
 /// process-local evidence and is never stored in the history journal.

@@ -55,6 +55,37 @@ pub use crate::twins::event_advance_offset_monotone;
 #[cfg(clean_islands)]
 pub use events_island::event_advance_offset_monotone;
 
+#[cfg(clean_islands)]
+#[path = "sync_island.rs"]
+mod sync_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{sync_bytes_clamp, sync_hold_ticks_clamp};
+#[cfg(clean_islands)]
+pub use sync_island::{sync_bytes_clamp, sync_hold_ticks_clamp};
+
+/// Maximum output bytes (`1 MiB`) a single DEC `?2026` synchronized-output frame may
+/// hold before [`Folder::in_sync_update`] / [`EventClassifier::in_sync_update`]
+/// auto-unlatches so a runaway or crashed TUI cannot suppress settle wakes forever.
+pub const MAX_SYNC_OUTPUT_BYTES: usize = 1 << 20;
+
+/// Maximum consecutive debounce intervals (`4`) a live pump holds settle wakes while
+/// [`EventClassifier::in_sync_update`] remains active with no new output arriving.
+pub const MAX_SYNC_HOLD_TICKS: u8 = 4;
+
+contract_fn! {
+    /// Kernel-certified check that accumulated DEC `?2026` synchronized-output bytes
+    /// `sync_bytes` remain strictly below `byte_cap` (`sync_bytes < byte_cap`).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `sync_within_budget_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub const fn sync_within_budget(sync_bytes: u64, byte_cap: u64) -> bool
+    clauses [ensures result == (sync_bytes < byte_cap)]
+    {
+        sync_bytes < byte_cap
+    }
+}
+
 contract_fn! {
     /// Kernel-certified check that a trailing split-OSC carry buffer length `len`
     /// lies within `max_carry` (`len <= max_carry`).
@@ -792,10 +823,51 @@ impl EventClassifier {
         self.folder.reset_escape();
     }
 
+    /// Whether the target is mid-frame inside DEC `?2026` synchronized output
+    /// (`BSU` `\x1b[?2026h` received, `ESU` `\x1b[?2026l` not yet received, and
+    /// accumulated frame bytes remain strictly below [`MAX_SYNC_OUTPUT_BYTES`]).
+    #[must_use]
+    pub const fn in_sync_update(&self) -> bool {
+        self.folder.in_sync_update()
+    }
+
+    /// Settle the screen if and only if the target is **not** currently inside an
+    /// active DEC `?2026` synchronized-output frame (`!self.in_sync_update()`).
+    ///
+    /// Returns `None` while a synchronized frame is still in flight (holding off
+    /// torn mid-redraw `Quiesced` / glyph `PromptReady` wakes), or `Some(events)`
+    /// once `\x1b[?2026l` commits the frame (or [`MAX_SYNC_OUTPUT_BYTES`] /
+    /// [`Self::reset_escape`] auto-unlatches it).
+    pub fn quiesce_if_unsynced(&mut self) -> Option<Vec<SessionEvent>> {
+        if self.in_sync_update() {
+            None
+        } else {
+            Some(self.quiesce())
+        }
+    }
+
+    /// Borrow the underlying [`Folder`].
+    #[must_use]
+    pub const fn folder(&self) -> &Folder {
+        &self.folder
+    }
+
     /// Borrow the folded [`Screen`] accumulated across classified deliveries.
     #[must_use]
     pub const fn screen(&self) -> &Screen {
         self.folder.screen()
+    }
+
+    /// Current sanitized window title (`OSC 0` / `OSC 2`) from the underlying [`Folder`].
+    #[must_use]
+    pub fn title(&self) -> &str {
+        self.folder.title()
+    }
+
+    /// Current decoded working directory (`OSC 7`) from the underlying [`Folder`].
+    #[must_use]
+    pub fn cwd(&self) -> &str {
+        self.folder.cwd()
     }
 
     /// Whether the session has emitted an OSC-133/633 `A`, `C` or `D`

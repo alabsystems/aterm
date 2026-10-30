@@ -59,6 +59,9 @@ pub(crate) struct Redial {
     /// The start record of the process a `--pid` pin names ([`process_started`]).
     pinned: Option<Stamp>,
     bound: Duration,
+    /// The longest one probe of who serves a path waits for its answer: [`PROBE_TIMEOUT`], or a
+    /// test's.
+    probe: Duration,
     /// When a process started.
     started: fn(u32) -> Option<Stamp>,
     /// The clock a hang-up is read on: [`Stamp::now`], or a test's stand-in.
@@ -92,6 +95,7 @@ impl Redial {
             follow,
             pinned,
             bound: SUCCESSOR_BOUND,
+            probe: PROBE_TIMEOUT,
             started: process_started,
             clock: Stamp::now,
             #[cfg(test)]
@@ -131,6 +135,13 @@ impl Redial {
     #[cfg(all(test, unix))]
     pub(crate) fn with_bound(mut self, bound: Duration) -> Self {
         self.bound = bound;
+        self
+    }
+
+    /// The same policy with a different ceiling on each probe (tests).
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_probe(mut self, probe: Duration) -> Self {
+        self.probe = probe;
         self
     }
 
@@ -212,7 +223,7 @@ impl Redial {
         let Some(old) = old else {
             return Hangup::Unknown;
         };
-        let wait = Wait::from_now(self.bound, until);
+        let wait = Wait::from_now(self.bound, self.probe, until);
         if wait
             .probe(dialed)
             .is_some_and(|pid| is_the_same_server(pid, dialed, old, listener))
@@ -224,7 +235,13 @@ impl Redial {
 
     /// Classify a hang-up a forward said was its host's.
     pub(crate) fn after_host_gone(&self, sock: &str, old: u32, until: Option<Instant>) -> Hangup {
-        self.successor(sock, old, None, &Wait::from_now(self.bound, until), false)
+        self.successor(
+            sock,
+            old,
+            None,
+            &Wait::from_now(self.bound, self.probe, until),
+            false,
+        )
     }
 
     fn successor(
@@ -283,22 +300,25 @@ struct Wait {
     deadline: Instant,
     /// The caller's deadline, not the bound, ends it.
     by_deadline: bool,
+    /// The longest one probe waits.
+    ceiling: Duration,
 }
 
 impl Wait {
-    fn from_now(bound: Duration, until: Option<Instant>) -> Self {
+    fn from_now(bound: Duration, ceiling: Duration, until: Option<Instant>) -> Self {
         let started = Instant::now();
         let bound = super::instant_after(started, bound);
         Self {
             started,
             deadline: until.map_or(bound, |until| until.min(bound)),
             by_deadline: until.is_some_and(|until| until < bound),
+            ceiling,
         }
     }
 
     fn probe(&self, path: &str) -> Option<u32> {
         let left = self.deadline.saturating_duration_since(Instant::now());
-        serving_pid_within(path, left.clamp(PROBE_FLOOR, PROBE_TIMEOUT))
+        serving_pid_within(path, left.clamp(PROBE_FLOOR, self.ceiling))
     }
 }
 
@@ -329,8 +349,8 @@ fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
     }
 }
 
-fn answers_at(path: &str, pid: u32, listener: Option<ListenerId>) -> bool {
-    let Some((answered, line)) = version_at(path, PROBE_TIMEOUT) else {
+fn answers_at(path: &str, pid: u32, listener: Option<ListenerId>, within: Duration) -> bool {
+    let Some((answered, line)) = version_at(path, within) else {
         return false;
     };
     (super::is_ok_reply(&line) || is_busy(&line))
@@ -1294,7 +1314,7 @@ pub(crate) fn relay_subscription(
         Leg::Timeout => return Ok(ExitCode::from(super::EXIT_TIMEOUT)),
         Leg::HungUp(seen) => HangupAt { seen, exit },
     };
-    let mut ask_until = Wait::from_now(redial.bound, until).deadline;
+    let mut ask_until = Wait::from_now(redial.bound, redial.probe, until).deadline;
     let original = request;
     let mut request = request.to_string();
     let mut dialed = first.dialed.to_string();
@@ -1375,7 +1395,7 @@ pub(crate) fn relay_subscription(
             let busy = matches!(&answer, Answer::Line(line) if is_busy(line));
             let silent = matches!(&answer, Answer::Gone)
                 || matches!(&answer, Answer::Line(line) if line.is_empty());
-            let live = busy || (silent && answers_at(&path, pid, leg_listener));
+            let live = busy || (silent && answers_at(&path, pid, leg_listener, redial.probe));
             if live && Instant::now() < ask_until {
                 std::thread::sleep(SUCCESSOR_POLL);
                 continue;
@@ -1428,7 +1448,7 @@ pub(crate) fn relay_subscription(
                 Leg::Timeout => return Ok(ExitCode::from(super::EXIT_TIMEOUT)),
                 Leg::HungUp(seen) => HangupAt { seen, exit },
             };
-            ask_until = Wait::from_now(redial.bound, until).deadline;
+            ask_until = Wait::from_now(redial.bound, redial.probe, until).deadline;
             dialed = path;
             server = Some(pid);
             listener = leg_listener;

@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every light scheme (foreach-scheme light: the built-ins and the pack themes) at the build's
+# live level (no `live` line), so the commit that moves prism_glass::LIVE compares its light
+# with main's paper arm: reduced motion: motion goes from full to reduced mid-trail (a config
+# change) and back while typing goes on.
+
+foreach-scheme light {
+  grid 16 80
+  style rainbow kitty
+  hz 60
+
+  at 0 pty "\e[9;1H$ "
+  at 700 key e
+  at 702 pty "e"
+  at 800 key c
+  at 802 pty "c"
+  at 900 key h
+  at 902 pty "h"
+  at 1000 key o
+  at 1002 pty "o"
+  at 1100 key space
+  at 1102 pty " "
+  at 1200 key f
+  at 1202 pty "f"
+  at 1300 key u
+  at 1302 pty "u"
+  at 1400 key l
+  at 1402 pty "l"
+  at 1500 key l
+  at 1502 pty "l"
+  at 1600 key space
+  at 1602 pty " "
+  at 1700 key m
+  at 1702 pty "m"
+  at 1800 key o
+  at 1802 pty "o"
+  at 1900 key t
+  at 1902 pty "t"
+  at 2000 key i
+  at 2002 pty "i"
+  at 2100 key o
+  at 2102 pty "o"
+  at 2200 key n
+  at 2202 pty "n"
+  at 2300 env motion reduced
+  at 2400 key ,
+  at 2402 pty ","
+  at 2500 key space
+  at 2502 pty " "
+  at 2600 key t
+  at 2602 pty "t"
+  at 2700 key h
+  at 2702 pty "h"
+  at 2800 key e
+  at 2802 pty "e"
+  at 2900 key n
+  at 2902 pty "n"
+  at 3000 key space
+  at 3002 pty " "
+  at 3100 key r
+  at 3102 pty "r"
+  at 3200 key e
+  at 3202 pty "e"
+  at 3300 key d
+  at 3302 pty "d"
+  at 3400 key u
+  at 3402 pty "u"
+  at 3500 key c
+  at 3502 pty "c"
+  at 3600 key e
+  at 3602 pty "e"
+  at 3700 key d
+  at 3702 pty "d"
+  at 4400 env motion full
+  at 4500 key ,
+  at 4502 pty ","
+  at 4600 key space
+  at 4602 pty " "
+  at 4700 key t
+  at 4702 pty "t"
+  at 4800 key h
+  at 4802 pty "h"
+  at 4900 key e
+  at 4902 pty "e"
+  at 5000 key n
+  at 5002 pty "n"
+  at 5100 key space
+  at 5102 pty " "
+  at 5200 key f
+  at 5202 pty "f"
+  at 5300 key u
+  at 5302 pty "u"
+  at 5400 key l
+  at 5402 pty "l"
+  at 5500 key l
+  at 5502 pty "l"
+  at 5600 key space
+  at 5602 pty " "
+  at 5700 key a
+  at 5702 pty "a"
+  at 5800 key g
+  at 5802 pty "g"
+  at 5900 key a
+  at 5902 pty "a"
+  at 6000 key i
+  at 6002 pty "i"
+  at 6100 key n
+  at 6102 pty "n"
+  run 7700
+}

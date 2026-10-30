@@ -2856,14 +2856,25 @@ fn live_roster() -> Option<accounts::Roster> {
     if cfg!(test) {
         return None;
     }
-    let roster = accounts::Roster::load(&accounts::default_roster_path()?).ok()?;
+    roster_at(
+        &accounts::default_roster_path()?,
+        crate::harness_host::harness_state,
+    )
+}
+
+/// The roster at `path` (`None` where it does not load): an unconfigured one as it reads, never
+/// asking for the harness's `state`; a configured one bound to the logins kept there, or `None`
+/// where it cannot be.
+fn roster_at(
+    path: &std::path::Path,
+    state: impl FnOnce() -> Option<PathBuf>,
+) -> Option<accounts::Roster> {
+    let roster = accounts::Roster::load(path).ok()?;
     if roster.rows.is_empty() {
         return Some(roster);
     }
     let now = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok())?;
-    accounts::Store::at(&crate::harness_host::harness_state()?)
-        .bound(&roster, now)
-        .ok()
+    accounts::Store::at(&state()?).bound(&roster, now).ok()
 }
 
 /// What a read asks outside Claude Code's own files.
@@ -11384,6 +11395,33 @@ pub(crate) mod rig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unconfigured roster reads as it is, without the harness's state, so a default-home
+    /// footer keeps its own label; a configured one is only one bound to its logins.
+    #[test]
+    fn an_unconfigured_roster_reads_without_the_harness_state() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let unasked = || -> Option<PathBuf> { panic!("an unconfigured roster asks for no state") };
+        assert_eq!(
+            roster_at(&dir.path().join("absent.toml"), unasked),
+            Some(accounts::Roster::default())
+        );
+        let configured = dir.path().join(accounts::ACCOUNTS_FILE);
+        std::fs::write(
+            &configured,
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            accounts::Roster::load(&configured).map(|r| r.rows.len()),
+            Ok(1),
+            "configured"
+        );
+        assert!(
+            roster_at(&configured, || None).is_none(),
+            "no state to bind it in"
+        );
+    }
 
     #[test]
     fn the_switch_and_the_label_give_words_up_in_order() {

@@ -278,7 +278,7 @@ pub struct MemSample {
     pub compressed: Option<u64>,
     /// Reclaimable file cache in bytes.
     pub cached: u64,
-    /// Free (speculative included).
+    /// Free memory in bytes (speculative pages excluded on macOS).
     pub free: u64,
     /// Swap in use.
     pub swap_used: u64,

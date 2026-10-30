@@ -861,6 +861,9 @@ pub struct Job {
     pub need: u64,
     /// Fork `Cargo.lock` state tracked when checking a fork by manifest path ([`fork_lock`]).
     pub lock: Option<ForkLock>,
+    /// The cover marker of the memory claim it was admitted under ([`Admitted::cover`]), which
+    /// its check is handed ([`aterm_capacity::COVER_ENV`]); `None` for none.
+    pub cover: Option<String>,
 }
 
 /// Lockfile path and pre-existence flag for a fork check.
@@ -959,6 +962,13 @@ impl Admitted {
             _claim: Some(claim),
         }
     }
+
+    /// The cover marker of the claim it holds ([`aterm_capacity::Record::cover_marker`]), which
+    /// its check's builds are covered by alone; `None` with no claim.
+    #[must_use]
+    pub fn cover(&self) -> Option<String> {
+        self._claim.as_ref().map(|c| c.record().cover_marker())
+    }
 }
 
 /// THE LAUNCH GATE'S MEMORY ADMISSION (`docs/DESIGN-adaptive-build-2026-10-24.md`, TRUST-MEM):
@@ -1051,7 +1061,9 @@ impl<'m> Admission<'m> {
         if self.head.as_ref().is_some_and(|h| h.name != job.name) {
             self.head = None;
         }
-        let need = aterm_capacity::Need::new(what.clone()).mem(job.need);
+        let need = aterm_capacity::Need::new(what.clone())
+            .mem(job.need)
+            .covers();
         // A need no amount of waiting could meet would hold its place at the head of this
         // run and of every claimant's queue on the machine for good. The plan refused up front
         // every claim not below its bound, so one below it that can never fit now fit when the
@@ -1248,6 +1260,7 @@ pub fn run_slots(
                 break;
             };
             job.slot = slot;
+            job.cover = claim.cover();
             match checks.start(&mut job) {
                 Ok(check) => running.push(Running {
                     job,
@@ -2044,6 +2057,7 @@ fn check_and_conclude(
                 target: PathBuf::new(),
                 need: claim_need(costs.get(&lib.name), prep.mem),
                 lock: None,
+                cover: None,
             }
         })
         .collect();
@@ -3767,6 +3781,12 @@ impl Checks for RealChecks<'_> {
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .env("CARGO_TARGET_DIR", &target)
             .env(CHECK_VAR, &nonce)
+            // Its check's memory claim, held by this process, covers the builds it starts, and
+            // no other check's claim does.
+            .env(
+                aterm_capacity::COVER_ENV,
+                job.cover.as_deref().unwrap_or(aterm_capacity::NO_COVER),
+            )
             .current_dir(self.repo)
             .stdin(Stdio::piped())
             .stdout(log.try_clone()?)
@@ -5883,6 +5903,9 @@ mod tests {
         slots: Vec<usize>,
         /// The held slots: a test's, and each one the lane ended a check in, as a stamp does.
         held: BTreeSet<usize>,
+        /// Each check's cover marker as it started, with the gate ledger's claim that marker
+        /// names then (its `what`), in order.
+        covers: Vec<(String, Option<String>, Option<String>)>,
     }
 
     struct Fake<'m> {
@@ -5946,7 +5969,17 @@ mod tests {
                 return Err(std::io::Error::other("no targo"));
             }
             job.target = PathBuf::from(format!("/slots/j{}", job.slot));
+            let named = job.cover.as_ref().and_then(|marker| {
+                let ledger = self.gate.as_ref()?.ledger.as_ref()?;
+                ledger
+                    .list()
+                    .ok()?
+                    .into_iter()
+                    .find(|r| r.held.is_some() && r.cover_marker() == *marker)
+                    .map(|r| r.need.what)
+            });
             let mut w = self.w.borrow_mut();
+            w.covers.push((job.name.clone(), job.cover.clone(), named));
             w.starts.push(job.name.clone());
             let now = w.now;
             w.started_at.push(now);
@@ -6016,6 +6049,7 @@ mod tests {
             target: PathBuf::new(),
             need: 0,
             lock: None,
+            cover: None,
         }
     }
 
@@ -6288,6 +6322,75 @@ mod tests {
             .0
             .unwrap();
         assert_eq!(g.w.borrow().peak, 2, "15 + 15 GiB fit in 40");
+    }
+
+    /// Each check is handed the cover marker of its own claim (BUILD-ADMIT), so its builds are
+    /// covered by that claim alone, never by another check's this process holds. NEGATIVE
+    /// CONTROL: a check that claims nothing is handed none (its child gets `NO_COVER`).
+    #[test]
+    fn each_check_is_handed_its_own_claims_cover_marker() {
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let mut g = fake(&[("a", 5), ("b", 5), ("free", 5)]);
+        g.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        let jobs = vec![needing("a", 4), needing("b", 4), job("free")];
+        assert_eq!(slots(&mut g, jobs, 3, 100).0, Ok(()));
+        let covers = g.w.borrow().covers.clone();
+        let named: Vec<(String, Option<String>)> = covers
+            .iter()
+            .map(|(n, _, w)| (n.clone(), w.clone()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("a".to_string(), Some("trust check a".to_string())),
+                ("b".to_string(), Some("trust check b".to_string())),
+                ("free".to_string(), None),
+            ]
+        );
+        assert_eq!(covers[2].1, None, "no claim, no marker");
+        assert_eq!(
+            aterm_capacity::Record::marker_holder(covers[0].1.as_deref().expect("a's")),
+            Some(std::process::id())
+        );
+    }
+
+    /// A check's memory claim asks to cover the builds its check starts (BUILD-ADMIT): its record
+    /// says so (`Need::covers`, which `aterm_capacity::covering` reads; its coverage tests hold
+    /// what a covering claim covers). NEGATIVE CONTROL: a plain claim beside it does not.
+    #[test]
+    fn a_checks_memory_claim_covers_the_builds_it_starts() {
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
+        let admitted = g
+            .admit(&needing("a", 2), Duration::ZERO, &mut |_| {})
+            .expect("admitted at its first look");
+        let plain = match aterm_capacity::Waiter::enter(
+            &l,
+            &m,
+            aterm_capacity::Need::new("hold").mem_gib(1),
+        )
+        .unwrap()
+        .poll(&m)
+        {
+            aterm_capacity::Polled::Admitted(c) => c,
+            aterm_capacity::Polled::Waiting(_, short) => panic!("the holder waits: {short}"),
+        };
+        let covers: Vec<(String, bool)> = l
+            .list()
+            .unwrap()
+            .iter()
+            .map(|r| (r.need.what.clone(), r.need.covers))
+            .collect();
+        assert_eq!(
+            covers,
+            [
+                ("trust check a".to_string(), true),
+                ("hold".to_string(), false)
+            ]
+        );
+        drop((admitted, plain));
     }
 
     /// TRUST-MEM's acceptance on an injected machine: another holder's claim leaves

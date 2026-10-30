@@ -203,6 +203,7 @@ fn account_admission_refuses_before_any_filesystem_work() {
         land: false,
         press: None,
         timings: crate::harness::Timings::FAST,
+        tell: crate::harness::upgrade_drive::Tell::Off,
     };
     let rows = roster();
     for case in 0..4 {

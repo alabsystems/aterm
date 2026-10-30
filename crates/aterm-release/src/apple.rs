@@ -478,11 +478,7 @@ fn await_then_install(
             }
             Err(why) => return unlooked(why, key),
             Ok(Look { rejected: seen, .. }) => {
-                let fresh: Vec<PathBuf> = seen
-                    .iter()
-                    .filter(|p| !rejected.contains(p))
-                    .cloned()
-                    .collect();
+                let fresh = take_arrivals(seen, &mut rejected);
                 if let Some(note) = rejected_note(&fresh, Some(upload), watch) {
                     step(
                         APPLE_LABEL,
@@ -490,7 +486,6 @@ fn await_then_install(
                     );
                     step("", &note);
                 }
-                rejected = seen;
             }
         }
         let mins = started.elapsed().as_secs() / 60;
@@ -511,6 +506,18 @@ fn await_then_install(
         ),
     );
     waiting(&rejected)
+}
+
+/// The `.cer` files in `seen` that are not in `rejected`, in `seen`'s order: the wrong ones
+/// that arrived since the last look. `rejected` then becomes `seen`, so each is named once.
+fn take_arrivals(seen: Vec<PathBuf>, rejected: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let fresh = seen
+        .iter()
+        .filter(|p| !rejected.contains(p))
+        .cloned()
+        .collect();
+    *rejected = seen;
+    fresh
 }
 
 /// Whether there is a human to ask.
@@ -1788,34 +1795,7 @@ pub(crate) fn prove_can_sign(
     sha1: &str,
     leave: Leave,
 ) -> Result<Proof, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let keychain = kc.signing_keychain(pins::APPLE_TEAM_ID, sha1, leave)?;
-    if leave == Leave::Look && keychain.is_some() {
-        return Ok(Proof::Opened);
-    }
-    let dir = temp_run_dir("probe")?;
-    let probe = dir.join("probe");
-    let signed = std::fs::read("/bin/echo")
-        .map_err(|e| format!("could not read the probe source: {e}"))
-        .and_then(|bytes| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o700)
-                .open(&probe)
-                .and_then(|mut f| f.write_all(&bytes))
-                .map_err(|e| format!("could not stage a probe: {e}"))
-        })
-        .and_then(|()| {
-            let mut args: Vec<&dyn AsRef<std::ffi::OsStr>> = vec![&"--force", &"--timestamp=none"];
-            if let Some(keychain) = &keychain {
-                args.extend([&"--keychain" as &dyn AsRef<std::ffi::OsStr>, keychain]);
-            }
-            args.extend([&"--sign" as &dyn AsRef<std::ffi::OsStr>, &sha1, &probe]);
-            kc.codesign(&args)
-        });
-    let _ = std::fs::remove_dir_all(&dir);
-    signed.map(|()| Proof::Signed)
+    aterm_secrets::release_keychain::prove_can_sign(kc, sha1, leave)
 }
 
 /// A directory this run alone can hold.
@@ -2616,5 +2596,30 @@ mod tests {
             Some("2027-09-01")
         );
         assert!(enddate_iso("notBefore=Aug 17 16:36:19 2026 GMT").is_none());
+    }
+
+    /// While the errand waits, a wrong `.cer` is named on the look it arrives on and not while it
+    /// stays; one that left the folder leaves what the wait reports and is named again if it
+    /// comes back.
+    #[test]
+    fn a_wrong_certificate_is_named_once_when_it_arrives() {
+        let cer = |name: &str| PathBuf::from(format!("/w/{name}.cer"));
+        let mut first = Vec::new();
+        assert_eq!(take_arrivals(vec![cer("a")], &mut first), [cer("a")]);
+        let mut rejected = vec![cer("a")];
+        assert_eq!(
+            take_arrivals(vec![cer("a"), cer("b")], &mut rejected),
+            [cer("b")]
+        );
+        assert_eq!(rejected, [cer("a"), cer("b")]);
+        assert!(take_arrivals(vec![cer("a"), cer("b")], &mut rejected).is_empty());
+        assert_eq!(rejected, [cer("a"), cer("b")]);
+        assert!(take_arrivals(vec![cer("b")], &mut rejected).is_empty());
+        assert_eq!(rejected, [cer("b")], "a .cer that left is not reported");
+        assert_eq!(
+            take_arrivals(vec![cer("a"), cer("b")], &mut rejected),
+            [cer("a")],
+            "a .cer that came back is named again"
+        );
     }
 }

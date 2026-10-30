@@ -19,7 +19,7 @@ pub const CONTINUE_TEXT: &str = concat!(
     " Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then \
      keep hunting for what would make the work more complete and more correct. Never stop to \
      ask: put what only a person can give on a line starting NEEDS YOU: and carry on with \
-     everything else. ",
+     everything else. A go-ahead for your own reversible work is never a NEEDS YOU item. ",
     super::policy::needs::restart_hint!(),
 );
 

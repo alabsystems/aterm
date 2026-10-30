@@ -247,7 +247,153 @@ pub mod attr {
 }
 
 /// Maximum number of zero-width Unicode combining marks stored inline per [`Cell`].
-pub const MAX_COMBINING: usize = 4;
+pub const MAX_COMBINING: usize = 16;
+
+/// `Emoji=Yes` ranges with `Emoji_Presentation=No` (Unicode 16.0 `Text_Default_Emoji`,
+/// matching `aterm-grapheme::emoji_presentation::TEXT_DEFAULT_EMOJI`): sorted, disjoint
+/// inclusive `(lo, hi)` codepoint ranges widened from 1 to 2 columns by `U+FE0F` (VS16).
+const TEXT_DEFAULT_EMOJI_RANGES: [(u32, u32); 119] = [
+    (0x0023, 0x0023),
+    (0x002A, 0x002A),
+    (0x0030, 0x0039),
+    (0x00A9, 0x00A9),
+    (0x00AE, 0x00AE),
+    (0x203C, 0x203C),
+    (0x2049, 0x2049),
+    (0x2122, 0x2122),
+    (0x2139, 0x2139),
+    (0x2194, 0x2199),
+    (0x21A9, 0x21AA),
+    (0x2328, 0x2328),
+    (0x23CF, 0x23CF),
+    (0x23ED, 0x23EF),
+    (0x23F1, 0x23F2),
+    (0x23F8, 0x23FA),
+    (0x24C2, 0x24C2),
+    (0x25AA, 0x25AB),
+    (0x25B6, 0x25B6),
+    (0x25C0, 0x25C0),
+    (0x25FB, 0x25FC),
+    (0x2600, 0x2604),
+    (0x260E, 0x260E),
+    (0x2611, 0x2611),
+    (0x2618, 0x2618),
+    (0x261D, 0x261D),
+    (0x2620, 0x2620),
+    (0x2622, 0x2623),
+    (0x2626, 0x2626),
+    (0x262A, 0x262A),
+    (0x262E, 0x262F),
+    (0x2638, 0x263A),
+    (0x2640, 0x2640),
+    (0x2642, 0x2642),
+    (0x265F, 0x2660),
+    (0x2663, 0x2663),
+    (0x2665, 0x2666),
+    (0x2668, 0x2668),
+    (0x267B, 0x267B),
+    (0x267E, 0x267E),
+    (0x2692, 0x2692),
+    (0x2694, 0x2697),
+    (0x2699, 0x2699),
+    (0x269B, 0x269C),
+    (0x26A0, 0x26A0),
+    (0x26A7, 0x26A7),
+    (0x26B0, 0x26B1),
+    (0x26C8, 0x26C8),
+    (0x26CF, 0x26CF),
+    (0x26D1, 0x26D1),
+    (0x26D3, 0x26D3),
+    (0x26E9, 0x26E9),
+    (0x26F0, 0x26F1),
+    (0x26F4, 0x26F4),
+    (0x26F7, 0x26F9),
+    (0x2702, 0x2702),
+    (0x2708, 0x2709),
+    (0x270C, 0x270D),
+    (0x270F, 0x270F),
+    (0x2712, 0x2712),
+    (0x2714, 0x2714),
+    (0x2716, 0x2716),
+    (0x271D, 0x271D),
+    (0x2721, 0x2721),
+    (0x2733, 0x2734),
+    (0x2744, 0x2744),
+    (0x2747, 0x2747),
+    (0x2763, 0x2764),
+    (0x27A1, 0x27A1),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0x1F170, 0x1F171),
+    (0x1F17E, 0x1F17F),
+    (0x1F202, 0x1F202),
+    (0x1F237, 0x1F237),
+    (0x1F321, 0x1F321),
+    (0x1F324, 0x1F32C),
+    (0x1F336, 0x1F336),
+    (0x1F37D, 0x1F37D),
+    (0x1F396, 0x1F397),
+    (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F39F),
+    (0x1F3CB, 0x1F3CE),
+    (0x1F3D4, 0x1F3DF),
+    (0x1F3F3, 0x1F3F3),
+    (0x1F3F5, 0x1F3F5),
+    (0x1F3F7, 0x1F3F7),
+    (0x1F43F, 0x1F43F),
+    (0x1F441, 0x1F441),
+    (0x1F4FD, 0x1F4FD),
+    (0x1F549, 0x1F54A),
+    (0x1F56F, 0x1F570),
+    (0x1F573, 0x1F579),
+    (0x1F587, 0x1F587),
+    (0x1F58A, 0x1F58D),
+    (0x1F590, 0x1F590),
+    (0x1F5A5, 0x1F5A5),
+    (0x1F5A8, 0x1F5A8),
+    (0x1F5B1, 0x1F5B2),
+    (0x1F5BC, 0x1F5BC),
+    (0x1F5C2, 0x1F5C4),
+    (0x1F5D1, 0x1F5D3),
+    (0x1F5DC, 0x1F5DE),
+    (0x1F5E1, 0x1F5E1),
+    (0x1F5E3, 0x1F5E3),
+    (0x1F5E8, 0x1F5E8),
+    (0x1F5EF, 0x1F5EF),
+    (0x1F5F3, 0x1F5F3),
+    (0x1F5FA, 0x1F5FA),
+    (0x1F6CB, 0x1F6CB),
+    (0x1F6CD, 0x1F6CF),
+    (0x1F6E0, 0x1F6E5),
+    (0x1F6E9, 0x1F6E9),
+    (0x1F6F0, 0x1F6F0),
+    (0x1F6F3, 0x1F6F3),
+];
+
+/// Returns `true` when `U+FE0F` (VS16) widens narrow base glyph `ch` to two columns
+/// (`Emoji=Yes` & `Emoji_Presentation=No`, matching `aterm-grapheme::is_vs16_emoji_capable`).
+#[must_use]
+pub const fn is_vs16_emoji_capable(ch: char) -> bool {
+    let u = ch as u32;
+    let mut lo = 0usize;
+    let mut hi = TEXT_DEFAULT_EMOJI_RANGES.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (start, end) = TEXT_DEFAULT_EMOJI_RANGES[mid];
+        if u < start {
+            hi = mid;
+        } else if u > end {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
 
 /// The code points that take no column, as aterm's `char_width` measures them
 /// (Unicode 16.0.0): the nonspacing and enclosing marks, the format controls
@@ -884,12 +1030,16 @@ impl Cell {
     }
 
     const fn last_combining(&self) -> Option<char> {
-        match self.combining_len {
-            0 => None,
-            1 => Some(self.combining[0]),
-            2 => Some(self.combining[1]),
-            3 => Some(self.combining[2]),
-            _ => Some(self.combining[3]),
+        let len = self.combining_len as usize;
+        let idx = if len < MAX_COMBINING {
+            len
+        } else {
+            MAX_COMBINING
+        };
+        if idx == 0 {
+            None
+        } else {
+            Some(self.combining[idx - 1])
         }
     }
 
@@ -1087,7 +1237,21 @@ pub struct Screen {
     /// left it). A wrap pending on the last column is `col == cols` instead,
     /// so each pending wrap has one spelling.
     margin_wrap: bool,
+    /// Application cursor keys mode (DECCKM, `?1`).
+    app_cursor_keys: bool,
+    /// Focus-in / focus-out event reporting (`?1004`).
+    focus_events: bool,
+    /// Bracketed paste mode (`?2004`).
+    bracketed_paste: bool,
+    /// DEC `?2026` synchronized output mode (`BSU` `?2026h` .. `ESU` `?2026l`).
+    synchronized_output: bool,
 }
+
+/// Maximum byte length of a sanitized `OSC 0` / `OSC 2` window title retained on [`Folder`].
+pub const MAX_OSC_TITLE_BYTES: usize = 512;
+
+/// Maximum byte length of a decoded `OSC 7` working-directory path retained on [`Folder`].
+pub const MAX_OSC_CWD_BYTES: usize = 1024;
 
 /// Fold an ordered slice of records into the screen they produce.
 ///
@@ -1108,10 +1272,17 @@ pub fn fold(cols: u16, rows: u16, records: &[Record]) -> Screen {
 /// two `Out` records). Cloning a `Folder` at offset `K` and feeding it only the
 /// records after `K` reproduces the same screen as folding the whole log: this
 /// is what makes `/a/state` + log-tail resume exact rather than approximate.
+///
+/// Also tracks out-of-band session metadata (`OSC 0`/`2` window [`title`](Self::title)
+/// and `OSC 7` working directory [`cwd`](Self::cwd)) without perturbing [`Screen`]
+/// visual digests or [`ScreenOp`] projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Folder {
     screen: Screen,
     parser: Parser,
+    title: String,
+    cwd: String,
+    sync_bytes: usize,
 }
 
 impl Folder {
@@ -1120,6 +1291,9 @@ impl Folder {
         Folder {
             screen: Screen::new(cols, rows),
             parser: Parser::new(),
+            title: String::new(),
+            cwd: String::new(),
+            sync_bytes: 0,
         }
     }
 
@@ -1144,22 +1318,35 @@ impl Folder {
     }
 
     /// Discard any partial mid-record VT escape, OSC/DCS string, or multibyte
-    /// UTF-8 sequence in the parser while keeping the painted [`Screen`] and
-    /// any already-recorded [`ScreenOp`]s intact.
+    /// UTF-8 sequence in the parser — and unlatch any mid-frame DEC `?2026`
+    /// synchronized-output hold — while keeping the painted [`Screen`], committed
+    /// [`title`](Self::title) / [`cwd`](Self::cwd), and any already-recorded
+    /// [`ScreenOp`]s intact.
     ///
     /// Call this across a stream discontinuity (such as a broker retention
     /// `Gap`) where intermediate `Out` chunks were dropped: without resetting,
     /// an unterminated pre-gap OSC/DCS (`State::Str`) would swallow post-gap
-    /// printable bytes, and a partial CSI/UTF-8 prefix would splice onto the
-    /// first post-gap byte.
+    /// printable bytes, a dropped `\x1b[?2026l` would keep synchronized output
+    /// latched, and a partial CSI/UTF-8 prefix would splice onto the first
+    /// post-gap byte.
     pub fn reset_escape(&mut self) {
         self.parser.reset_escape();
+        self.screen.synchronized_output = false;
+        self.sync_bytes = 0;
     }
 
     /// Advance by one record. `In`/`Exit` do not paint (only echoed `Out` does).
     pub fn apply(&mut self, record: &Record) {
         match record {
-            Record::Out(bytes) => self.parser.feed(&mut self.screen, bytes),
+            Record::Out(bytes) => {
+                self.parser.feed(
+                    &mut self.screen,
+                    &mut self.title,
+                    &mut self.cwd,
+                    &mut self.sync_bytes,
+                    bytes,
+                );
+            }
             Record::Resize { cols, rows } => {
                 self.screen.resize(*cols, *rows);
                 self.parser.rec(ScreenOp::Resize(*cols, *rows));
@@ -1171,6 +1358,41 @@ impl Folder {
     /// The current screen.
     pub const fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// Whether DEC `?2026` synchronized output is currently active **and** within
+    /// the [`crate::events::MAX_SYNC_OUTPUT_BYTES`] safety budget.
+    #[must_use]
+    pub const fn in_sync_update(&self) -> bool {
+        self.screen.synchronized_output
+            && crate::events::sync_within_budget(
+                self.sync_bytes as u64,
+                crate::events::MAX_SYNC_OUTPUT_BYTES as u64,
+            )
+    }
+
+    /// Number of `Out` bytes accumulated inside the current open DEC `?2026`
+    /// synchronized-output frame (`0` when `?2026` is inactive, clamped at
+    /// [`crate::events::MAX_SYNC_OUTPUT_BYTES`]).
+    #[must_use]
+    pub const fn sync_output_bytes(&self) -> usize {
+        self.sync_bytes
+    }
+
+    /// Current sanitized window title set by `OSC 0;<title>` or `OSC 2;<title>`
+    /// (empty until set, cleared by `ESC c` RIS, C0/C1 controls stripped, capped at
+    /// [`MAX_OSC_TITLE_BYTES`]).
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Current working directory path reported by `OSC 7;<file://host/path>`
+    /// (percent-decoded, empty until set, cleared by `OSC 7;` or `ESC c` RIS, capped at
+    /// [`MAX_OSC_CWD_BYTES`]).
+    #[must_use]
+    pub fn cwd(&self) -> &str {
+        &self.cwd
     }
 
     /// Consume the folder, returning its screen.
@@ -1204,6 +1426,28 @@ mod wide_island;
 pub use crate::twins::{wide_cell_width_clamp, wide_spacer_col_clamp};
 #[cfg(clean_islands)]
 pub use wide_island::{wide_cell_width_clamp, wide_spacer_col_clamp};
+
+#[cfg(clean_islands)]
+#[path = "vs_island.rs"]
+mod vs_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{vs_cursor_advance_clamp, vs_width_clamp};
+#[cfg(clean_islands)]
+pub use vs_island::{vs_cursor_advance_clamp, vs_width_clamp};
+
+contract_fn! {
+    /// Kernel-certified bounds check that a variation-selector cell width `width`
+    /// is at most `max_width` (`width <= max_width`).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `vs_width_valid_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub const fn vs_width_valid(width: u64, max_width: u64) -> bool
+    clauses [ensures result == (width <= max_width)]
+    {
+        width <= max_width
+    }
+}
 
 contract_fn! {
     /// Kernel-certified bounds check that a cell width tag `w` lies in `0..=2`
@@ -1299,6 +1543,10 @@ impl Screen {
             left: 0,
             right: cols.saturating_sub(1),
             margin_wrap: false,
+            app_cursor_keys: false,
+            focus_events: false,
+            bracketed_paste: false,
+            synchronized_output: false,
         }
     }
 
@@ -1339,6 +1587,30 @@ impl Screen {
     /// Whether the alternate screen is active.
     pub const fn is_altscreen(&self) -> bool {
         self.altscreen
+    }
+
+    /// Whether application cursor keys mode (`DECCKM`, `?1`) is active.
+    #[must_use]
+    pub const fn app_cursor_keys(&self) -> bool {
+        self.app_cursor_keys
+    }
+
+    /// Whether focus-event reporting (`?1004`) is active.
+    #[must_use]
+    pub const fn focus_events(&self) -> bool {
+        self.focus_events
+    }
+
+    /// Whether bracketed paste mode (`?2004`) is active.
+    #[must_use]
+    pub const fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Whether DEC `?2026` synchronized output (`BSU` `?2026h` .. `ESU` `?2026l`) is active.
+    #[must_use]
+    pub const fn synchronized_output(&self) -> bool {
+        self.synchronized_output
     }
 
     /// The cell at `(row, col)`, or `None` if out of bounds.
@@ -1538,6 +1810,33 @@ impl Screen {
                 emit_wide_cells(out, cells);
             }
         }
+        // Tag-4 extension trailer for session DEC private modes (`?1` DECCKM,
+        // `?1004` focus reporting, `?2004` bracketed paste, `?2026` synchronized
+        // output): emitted ONLY when at least one mode is set, preserving byte
+        // identity for every reset-mode screen and strict `Eq <=> serialize()`
+        // injectivity across `emit_ops`/`apply_ops` and raw `fold`.
+        let ext_modes = (self.app_cursor_keys as u8)
+            | ((self.focus_events as u8) << 1)
+            | ((self.bracketed_paste as u8) << 2)
+            | ((self.synchronized_output as u8) << 3);
+        if ext_modes != 0 {
+            out.extend_from_slice(&[4, ext_modes]);
+        }
+        // Tag-5 extension trailer for deep inline combining marks (`combining[4..16]` or
+        // `combining_len > 4`): emitted ONLY when some cell carries more than 4 combining
+        // marks, keeping every <=4-mark screen byte-identical to its pinned digest while
+        // preserving strict `Eq <=> serialize()` injectivity up to `MAX_COMBINING = 16`.
+        let inactive_has_deep = match &self.inactive {
+            Some(cells) => slice_has_deep_combining_cells(cells),
+            None => false,
+        };
+        if slice_has_deep_combining_cells(&self.grid) || inactive_has_deep {
+            out.extend_from_slice(&[5]);
+            emit_deep_combining_cells(out, &self.grid);
+            if let Some(cells) = &self.inactive {
+                emit_deep_combining_cells(out, cells);
+            }
+        }
     }
 
     // --- internal mutators ------------------------------------------------
@@ -1665,11 +1964,107 @@ impl Screen {
         }
     }
 
+    /// Widen an `Emoji=Yes, Emoji_Presentation=No` narrow base cell (`width == 1`) to 2
+    /// columns when `U+FE0F` (VS16) attaches (`Astream.Term.TlaVariationWidth::WidenVs16`),
+    /// matching `aterm`'s `widen_previous_cell_for_vs16` and `GridColumns::step`.
+    fn try_widen_vs16(&mut self) -> bool {
+        let has_active_base = self.wrap_pending() || (self.col != self.left && self.col > 0);
+        if !has_active_base || self.cols < 2 {
+            return false;
+        }
+        let target_col = self.active_base_col();
+        let row = self.row;
+        let base_idx = self.idx(row, target_col);
+        let Some(base_copy) = self.grid.get(base_idx).copied() else {
+            return false;
+        };
+        let end = self.line_end(target_col);
+        if base_copy.width != 1 || target_col >= end || !is_vs16_emoji_capable(base_copy.ch) {
+            return false;
+        }
+        let widened_width = vs_width_clamp(2, 2) as u8;
+        let spacer_col =
+            wide_spacer_col_clamp(target_col.saturating_add(1) as u64, end as u64) as u16;
+        self.split_at(row, spacer_col);
+        self.split_at(row, spacer_col.saturating_add(1));
+        let mut lead = base_copy;
+        lead.width = widened_width;
+        lead.push_combining('\u{FE0F}');
+        if let Some(slot) = self.grid.get_mut(base_idx) {
+            *slot = lead;
+        }
+        let spacer = Cell {
+            ch: ' ',
+            fg: base_copy.fg,
+            bg: base_copy.bg,
+            fg_rgb: base_copy.fg_rgb,
+            bg_rgb: base_copy.bg_rgb,
+            attrs: base_copy.attrs,
+            combining: ['\0'; MAX_COMBINING],
+            combining_len: 0,
+            width: 0,
+        };
+        let si = self.idx(row, spacer_col);
+        if let Some(slot) = self.grid.get_mut(si) {
+            *slot = spacer;
+        }
+        if spacer_col >= end {
+            self.set_wrap_at(spacer_col);
+        } else {
+            self.col =
+                vs_cursor_advance_clamp(spacer_col.saturating_add(1) as u64, end as u64) as u16;
+            self.margin_wrap = false;
+        }
+        true
+    }
+
+    /// Narrow a wide base cell (`width == 2`) to 1 column when `U+FE0E` (VS15) attaches
+    /// (`Astream.Term.TlaVariationWidth::NarrowVs15`), matching `aterm`'s
+    /// `narrow_previous_cell_for_vs15` and `GridColumns::step`.
+    fn try_narrow_vs15(&mut self) -> bool {
+        let has_active_base = self.wrap_pending() || (self.col != self.left && self.col > 0);
+        if !has_active_base {
+            return false;
+        }
+        let target_col = self.active_base_col();
+        let row = self.row;
+        let base_idx = self.idx(row, target_col);
+        let Some(base_copy) = self.grid.get(base_idx).copied() else {
+            return false;
+        };
+        let end = self.line_end(target_col);
+        if base_copy.width != 2 || target_col >= end {
+            return false;
+        }
+        let narrowed_width = vs_width_clamp(1, 2) as u8;
+        let mut lead = base_copy;
+        lead.width = narrowed_width;
+        lead.push_combining('\u{FE0E}');
+        if let Some(slot) = self.grid.get_mut(base_idx) {
+            *slot = lead;
+        }
+        let spacer_col =
+            vs_cursor_advance_clamp(target_col.saturating_add(1) as u64, end as u64) as u16;
+        if spacer_col < self.cols && self.width_at(row, spacer_col) == 0 {
+            let si = self.idx(row, spacer_col);
+            if let Some(slot) = self.grid.get_mut(si) {
+                *slot = Cell::BLANK;
+            }
+        }
+        true
+    }
+
     fn put(&mut self, ch: char) {
         // Each codepoint measured alone; the clamp keeps a width the cells can
         // hold (`wide_island`).
         let width = wide_cell_width_clamp(char_display_width(ch) as u64, 2) as u8;
         if width == 0 {
+            if ch == '\u{FE0F}' && self.try_widen_vs16() {
+                return;
+            }
+            if ch == '\u{FE0E}' && self.try_narrow_vs15() {
+                return;
+            }
             let target_col = self.active_base_col();
             let i = self.idx(self.row, target_col);
             if let Some(slot) = self.grid.get_mut(i) {
@@ -2419,6 +2814,7 @@ impl Screen {
     fn set_mode(&mut self, params: &[u16], set: bool) {
         for &p in params {
             match p {
+                1 => self.app_cursor_keys = set,
                 25 => self.cursor_visible = set,
                 // DECOM: either way the cursor homes (xterm `srm_DECOM` runs
                 // `CursorSet(screen, 0, 0, xw->flags)` with the new flag).
@@ -2435,6 +2831,9 @@ impl Screen {
                         self.right = self.cols.saturating_sub(1);
                     }
                 }
+                1004 => self.focus_events = set,
+                2004 => self.bracketed_paste = set,
+                2026 => self.synchronized_output = set,
                 // `?1049` is DECSC + switch + clear on set, switch + DECRC on reset
                 // (xterm `srm_OPT_ALTBUF_CURSOR`), each half unconditional but the
                 // switch: a second set clears again, a stray reset still restores.
@@ -2927,7 +3326,48 @@ fn emit_ext_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
             emit_opt_rgb(out, c.fg_rgb);
             emit_opt_rgb(out, c.bg_rgb);
             out.extend_from_slice(&[c.combining_len]);
-            for &m in &c.combining {
+            for &m in &c.combining[..4] {
+                out.extend_from_slice(&encode_u32_le_bytes(m as u32));
+            }
+        }
+    }
+}
+
+const fn cell_has_deep_combining(c: &Cell) -> bool {
+    if c.combining_len > 4 {
+        return true;
+    }
+    let mut k = 4usize;
+    while k < MAX_COMBINING {
+        if c.combining[k] != '\0' {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+fn slice_has_deep_combining_cells(cells: &[Cell]) -> bool {
+    for c in cells {
+        if cell_has_deep_combining(c) {
+            return true;
+        }
+    }
+    false
+}
+
+fn emit_deep_combining_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
+    let mut count = 0u32;
+    for c in cells {
+        if cell_has_deep_combining(c) {
+            count = count.saturating_add(1);
+        }
+    }
+    out.extend_from_slice(&encode_u32_le_bytes(count));
+    for (idx, c) in cells.iter().enumerate() {
+        if cell_has_deep_combining(c) {
+            out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
+            for &m in &c.combining[4..MAX_COMBINING] {
                 out.extend_from_slice(&encode_u32_le_bytes(m as u32));
             }
         }
@@ -3216,10 +3656,109 @@ enum State {
 /// run of `1;` would otherwise grow it for the life of the session.
 const CSI_PARAM_MAX: usize = 128;
 
+/// Hard cap on raw OSC payload bytes buffered for `OSC 0`/`2` title or `OSC 7` CWD
+/// extraction (`7;` + host + 3x percent-encoded [`MAX_OSC_CWD_BYTES`]). Any longer
+/// OSC (such as an `OSC 52` clipboard blob) drops its buffer immediately and uses
+/// zero additional heap.
+const MAX_OSC_CAPTURE_BYTES: usize = 3350;
+
+const fn osc_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some((b - b'a').saturating_add(10)),
+        b'A'..=b'F' => Some((b - b'A').saturating_add(10)),
+        _ => None,
+    }
+}
+
+fn sanitize_osc_title(raw: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(raw);
+    let mut out = String::new();
+    for ch in lossy.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if out.len().saturating_add(ch.len_utf8()) > MAX_OSC_TITLE_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn decode_osc7_cwd(raw: &[u8]) -> Option<String> {
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    let decoded = if let &[b'f', b'i', b'l', b'e', b':', b'/', b'/', ref after_scheme @ ..] = raw {
+        let mut scan = after_scheme;
+        let mut path_enc: Option<&[u8]> = None;
+        while let &[c, ref tail @ ..] = scan {
+            if c == b'/' {
+                path_enc = Some(scan);
+                break;
+            }
+            scan = tail;
+        }
+        let mut enc = path_enc?;
+        let mut buf = Vec::new();
+        while let &[b0, ref tail @ ..] = enc {
+            if buf.len() >= MAX_OSC_CWD_BYTES {
+                return None;
+            }
+            if b0 == b'%' {
+                let &[h1, h2, ref tail2 @ ..] = tail else {
+                    return None;
+                };
+                let (Some(hi), Some(lo)) = (osc_hex_nibble(h1), osc_hex_nibble(h2)) else {
+                    return None;
+                };
+                buf.push((hi << 4) | lo);
+                enc = tail2;
+            } else {
+                buf.push(b0);
+                enc = tail;
+            }
+        }
+        buf
+    } else if matches!(raw, &[b'/', ..]) {
+        if raw.len() > MAX_OSC_CWD_BYTES {
+            return None;
+        }
+        raw.to_vec()
+    } else {
+        return None;
+    };
+    let Ok(s) = core::str::from_utf8(&decoded) else {
+        return None;
+    };
+    for ch in s.chars() {
+        if ch.is_control() {
+            return None;
+        }
+    }
+    Some(s.to_string())
+}
+
+fn apply_osc_metadata(raw: &[u8], title: &mut String, cwd: &mut String) {
+    match raw {
+        [b'0' | b'2', b';', body @ ..] => {
+            *title = sanitize_osc_title(body);
+        }
+        [b'7', b';', body @ ..] => {
+            if let Some(decoded) = decode_osc7_cwd(body) {
+                *cwd = decoded;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A persistent byte→action state machine. Persisting it across [`Parser::feed`]
 /// calls is what lets an escape sequence (or a multibyte glyph) span two `Out`
 /// records without corrupting the fold. Its state is bounded: a small enum, two
-/// bytes, and at most [`CSI_PARAM_MAX`] parameter bytes.
+/// bytes, at most [`CSI_PARAM_MAX`] parameter bytes, and at most
+/// [`MAX_OSC_CAPTURE_BYTES`] OSC metadata bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Parser {
     state: State,
@@ -3234,6 +3773,11 @@ struct Parser {
     /// `ESC ( 0`), and whether a second one followed it.
     esc_inter: u8,
     esc_inter_more: bool,
+    /// Bounded capture buffer for an in-flight OSC string (`OSC 0`/`2`/`7`).
+    osc_buf: Vec<u8>,
+    osc_active: bool,
+    osc_overflow: bool,
+    osc_esc_pending: bool,
     /// When `true`, each top-level dispatch records its [`ScreenOp`] into `ops`.
     /// Off for the normal fold; on only inside [`emit_ops`].
     recording: bool,
@@ -3249,9 +3793,27 @@ impl Parser {
             csi_ignore: false,
             esc_inter: 0,
             esc_inter_more: false,
+            osc_buf: Vec::new(),
+            osc_active: false,
+            osc_overflow: false,
+            osc_esc_pending: false,
             recording: false,
             ops: Vec::new(),
         }
+    }
+
+    fn clear_osc(&mut self) {
+        self.osc_buf.clear();
+        self.osc_active = false;
+        self.osc_overflow = false;
+        self.osc_esc_pending = false;
+    }
+
+    fn finish_osc(&mut self, title: &mut String, cwd: &mut String) {
+        if self.osc_active && !self.osc_overflow {
+            apply_osc_metadata(&self.osc_buf, title, cwd);
+        }
+        self.clear_osc();
     }
 
     fn reset_escape(&mut self) {
@@ -3261,6 +3823,7 @@ impl Parser {
         self.csi_ignore = false;
         self.esc_inter = 0;
         self.esc_inter_more = false;
+        self.clear_osc();
     }
 
     /// Record one top-level op (no-op unless recording). Internal mutator
@@ -3272,20 +3835,36 @@ impl Parser {
         }
     }
 
-    fn feed(&mut self, screen: &mut Screen, bytes: &[u8]) {
+    fn feed(
+        &mut self,
+        screen: &mut Screen,
+        title: &mut String,
+        cwd: &mut String,
+        sync_bytes: &mut usize,
+        bytes: &[u8],
+    ) {
         for &b in bytes {
+            let was_sync = screen.synchronized_output;
             match self.state {
                 State::Ground => self.ground(screen, b),
-                State::Esc => self.escape(screen, b),
+                State::Esc => self.escape(screen, title, cwd, b),
                 State::EscIntermediate => self.esc_intermediate(screen, b),
                 State::Csi => self.csi(screen, b),
-                State::Str { bel_ends } => self.string(b, bel_ends),
+                State::Str { bel_ends } => self.string(title, cwd, b, bel_ends),
                 State::Utf8 {
                     needed,
                     acc,
                     lo,
                     hi,
                 } => self.utf8_cont(screen, b, needed, acc, (lo, hi)),
+            }
+            if screen.synchronized_output && was_sync {
+                *sync_bytes = crate::events::sync_bytes_clamp(
+                    (*sync_bytes as u64).saturating_add(1),
+                    crate::events::MAX_SYNC_OUTPUT_BYTES as u64,
+                ) as usize;
+            } else {
+                *sync_bytes = 0;
             }
         }
     }
@@ -3399,7 +3978,16 @@ impl Parser {
         self.rec(ScreenOp::Print(ch));
     }
 
-    fn escape(&mut self, screen: &mut Screen, b: u8) {
+    fn escape(&mut self, screen: &mut Screen, title: &mut String, cwd: &mut String, b: u8) {
+        if self.osc_esc_pending {
+            self.osc_esc_pending = false;
+            if b == b'\\' {
+                self.finish_osc(title, cwd);
+                self.state = State::Ground;
+                return;
+            }
+            self.clear_osc();
+        }
         match b {
             b'[' => {
                 self.params.clear();
@@ -3407,8 +3995,15 @@ impl Parser {
                 self.csi_ignore = false;
                 self.state = State::Csi;
             }
-            b']' => self.state = State::Str { bel_ends: true }, // OSC
-            b'P' | b'X' | b'^' | b'_' => self.state = State::Str { bel_ends: false }, // DCS/SOS/PM/APC
+            b']' => {
+                self.clear_osc();
+                self.osc_active = true;
+                self.state = State::Str { bel_ends: true }; // OSC
+            }
+            b'P' | b'X' | b'^' | b'_' => {
+                self.clear_osc();
+                self.state = State::Str { bel_ends: false }; // DCS/SOS/PM/APC
+            }
             // IND is a line feed (xterm `xtermIndex`), NEL a line feed and a
             // carriage return, RI the reverse index.
             b'D' => {
@@ -3440,6 +4035,8 @@ impl Parser {
             }
             b'c' => {
                 screen.reset();
+                title.clear();
+                cwd.clear();
                 self.rec(ScreenOp::Reset);
                 self.state = State::Ground;
             }
@@ -3499,13 +4096,34 @@ impl Parser {
 
     /// An OSC/DCS/APC/PM/SOS string body: swallowed byte by byte. `ESC` ends it
     /// (as `ESC \`, or as the start of a new escape), BEL ends an OSC, CAN/SUB
-    /// abort; nothing is ever painted.
-    fn string(&mut self, b: u8, bel_ends: bool) {
+    /// abort; nothing is ever painted, while bounded `OSC 0`/`2`/`7` payloads are
+    /// extracted into [`Folder::title`] / [`Folder::cwd`].
+    fn string(&mut self, title: &mut String, cwd: &mut String, b: u8, bel_ends: bool) {
         match b {
-            0x1b => self.state = State::Esc,
-            0x07 if bel_ends => self.state = State::Ground,
-            0x18 | 0x1a => self.state = State::Ground,
-            _ => {}
+            0x1b => {
+                if self.osc_active {
+                    self.osc_esc_pending = true;
+                }
+                self.state = State::Esc;
+            }
+            0x07 if bel_ends => {
+                self.finish_osc(title, cwd);
+                self.state = State::Ground;
+            }
+            0x18 | 0x1a => {
+                self.clear_osc();
+                self.state = State::Ground;
+            }
+            _ => {
+                if self.osc_active && !self.osc_overflow {
+                    if self.osc_buf.len() < MAX_OSC_CAPTURE_BYTES {
+                        self.osc_buf.push(b);
+                    } else {
+                        self.osc_overflow = true;
+                        self.osc_buf.clear();
+                    }
+                }
+            }
         }
     }
 

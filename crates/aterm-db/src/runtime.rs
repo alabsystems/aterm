@@ -659,10 +659,9 @@ fn serve_mode(
                     {
                         return Ok(());
                     }
-                    let journal = aterm_secrets::commons::journal::Journal::open_existing_until(
+                    let journal = aterm_secrets::commons::journal::Journal::read_existing(
                         bootstrap.journal_dir(),
                         bootstrap.trust(),
-                        Instant::now() + ADMISSION,
                     )
                     .map_err(|_| Status::Refused)?;
                     if bootstrap
@@ -810,10 +809,9 @@ fn observe_contacts(
     if contacts.is_empty() {
         return;
     }
-    let journal = aterm_secrets::commons::journal::Journal::open_existing_until(
+    let journal = aterm_secrets::commons::journal::Journal::read_existing(
         bootstrap.journal_dir(),
         bootstrap.trust(),
-        Instant::now() + ADMISSION,
     );
     if let Ok(journal) = journal
         && bootstrap.revalidate_custody().is_ok()

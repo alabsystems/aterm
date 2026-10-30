@@ -62,6 +62,118 @@ fn env_at(tmp: &Tmp) -> Env {
     }
 }
 
+#[test]
+fn commons_accounts_are_readable_without_a_spreadsheet_or_local_pool() {
+    let tmp = tmp_dir("commons-account-list");
+    let env = env_at(&tmp);
+    let catalog = Ok(crate::harness::account_catalog::Catalog {
+        table: "shared-table".into(),
+        history_complete: true,
+        rows: vec![crate::harness::account_catalog::Account {
+            key: "shared-account".into(),
+            operation: "operation-one".into(),
+            label: "Shared one".into(),
+            provider: "openai".into(),
+            method: Some("oauth".into()),
+            email: Some("one@example.test".into()),
+            realm: None,
+            secret_reference: true,
+            conflicted: false,
+            stopped: false,
+            import: None,
+        }],
+        ..Default::default()
+    });
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    assert_eq!(
+        run_accounts_source_table_with_catalog(
+            Some(Cli::Codex),
+            &env,
+            true,
+            Some(&catalog),
+            &mut out,
+            &mut err
+        ),
+        ExitCode::SUCCESS
+    );
+    let report: Value = aterm_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["shared_accounts"][0]["catalog"]["accounts"][0]["key"].as_str(),
+        Some("shared-account")
+    );
+    assert_eq!(
+        report["shared_accounts"][0]["catalog"]["accounts"][0]["local_label"],
+        Value::Null
+    );
+    assert!(!env.accounts_roster_for(Cli::Codex).unwrap().exists());
+}
+
+#[test]
+fn shared_import_candidates_remain_visible_without_a_local_cli_or_login() {
+    use crate::harness::account_catalog::{Account, Catalog, ImportOrigin};
+    let tmp = tmp_dir("shared-import-list");
+    let env = env_at(&tmp);
+    let catalog = Ok(Catalog {
+        history_complete: true,
+        rows: vec![Account {
+            key: "import:source:2:4".into(),
+            operation: "source-operation".into(),
+            label: "Source row 2".into(),
+            provider: "google".into(),
+            method: None,
+            email: Some("one@example.test".into()),
+            realm: None,
+            secret_reference: false,
+            conflicted: false,
+            stopped: false,
+            import: Some(ImportOrigin {
+                table: "imports-table".into(),
+                source: "source".into(),
+                record: 2,
+                provider_column: Some(4),
+                presence: Some(true),
+                machine_hint: Some("m1".into()),
+                unclassified_columns: vec![8],
+            }),
+        }],
+        ..Default::default()
+    });
+    let host =
+        FakeHost::new(&|_| panic!("listing a candidate must not query provider authentication"));
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    assert_eq!(
+        run_accounts_all_with_catalog(true, &env, &host, Some(catalog.clone()), &mut out, &mut err),
+        ExitCode::SUCCESS
+    );
+    let all: Value = aterm_json::from_slice(&out).unwrap();
+    assert_eq!(
+        all["shared_catalog"]["accounts"][0]["provider"].as_str(),
+        Some("google")
+    );
+    assert_eq!(all["shared_catalog"]["accounts"][0]["method"], Value::Null);
+    out.clear();
+    assert_eq!(
+        run_accounts_source_table_with_catalog(
+            None,
+            &env,
+            true,
+            Some(&catalog),
+            &mut out,
+            &mut err
+        ),
+        ExitCode::SUCCESS
+    );
+    let table: Value = aterm_json::from_slice(&out).unwrap();
+    assert_eq!(
+        table["shared_catalog"]["accounts"][0]["import"]["record"].as_u64(),
+        Some(2)
+    );
+    assert!(host.asked.borrow().is_empty());
+    assert!(host.logins.borrow().is_empty());
+}
+
 fn go(cmd: &Cmd, env: &Env) -> (bool, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -2559,6 +2671,12 @@ fn a_ledger_cut_is_ordered_ahead_of_its_rename() {
     assert!(bound_ledger(&path, 4, 1).unwrap());
     assert_eq!(recording.take(), [aterm_durable::Flush::Ordered]);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "three\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "cut ledger stays 0600");
+    }
 }
 
 fn idle_now() -> i64 {
@@ -4120,7 +4238,7 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
                 "upgrade tab={tab} session=03396a15 from=2.1.281 to=2.1.282(managed) \
                  phase=pending pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- \
                  next_round=- stalled=overdue held_by=- release=- rung=land looked=- by=- \
-                 point=- guard=- watch_at=due cause=own-work told=no-progress"
+                 point=- guard=- watch_at=due cause=own-work told=no-progress agent_told=-"
             )
             .as_str()
         )

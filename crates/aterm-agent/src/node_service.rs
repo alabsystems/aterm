@@ -37,6 +37,36 @@ pub const NODE_PORT_LOCK: &str = "node-port.lock";
 /// Marker written by `aterm node off` in `<state_dir>` so `sync.node` leaves the job off.
 pub const NODE_OFF_FILE: &str = "node-off";
 
+/// Serializes automatic node repair with explicit on/off changes across processes.
+#[cfg(unix)]
+const NODE_ADMIN_LOCK: &str = "node-admin.lock";
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static NODE_ADMIN_WAITER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn node_admin_lock(state_dir: &Path) -> Result<aterm_uds::private_file::PrivateLock, String> {
+    aterm_uds::private_file::ensure_private_dir(state_dir).map_err(|error| error.to_string())?;
+    aterm_uds::private_file::PrivateLock::take_with(
+        state_dir,
+        NODE_ADMIN_LOCK,
+        Duration::from_secs(120),
+        "another node service change is in progress",
+        || {
+            #[cfg(test)]
+            NODE_ADMIN_WAITER.with(|waiter| {
+                if let Some(waiter) = waiter.borrow().as_ref() {
+                    let _ = waiter.send(());
+                }
+            });
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Bonjour service type advertised by `aterm node serve` on every network (§3.3, C23; F17).
 pub const ALAB_TCP_SERVICE: &str = "_alab._tcp";
 
@@ -325,22 +355,25 @@ pub fn should_advertise_alab_tcp_with(
 ) -> (bool, NodeRole) {
     let enabled = aterm_config
         .is_none_or(|cfg_path| aterm_secrets::swarm::enabled_at(cfg_path).unwrap_or(false));
-    let heard = aterm_secrets::client::status(vault_paths)
+    let status = aterm_secrets::client::status(vault_paths)
         .ok()
         .filter(|status| {
             status
                 .config
                 .as_ref()
                 .is_some_and(aterm_secrets::client::alab_vault)
-        })
-        .and_then(|status| match status.membership {
-            aterm_secrets::client::Membership::In { heard, .. } => Some(heard),
-            aterm_secrets::client::Membership::Plain
-            | aterm_secrets::client::Membership::Unconfigured
-            | aterm_secrets::client::Membership::Pending
-            | aterm_secrets::client::Membership::Revoked { .. } => None,
         });
+    let heard = status.as_ref().and_then(|status| match status.membership {
+        aterm_secrets::client::Membership::In { heard, .. } => Some(heard),
+        aterm_secrets::client::Membership::Plain
+        | aterm_secrets::client::Membership::Unconfigured
+        | aterm_secrets::client::Membership::Pending
+        | aterm_secrets::client::Membership::Revoked { .. } => None,
+    });
     if !advertises(enabled, routes, heard, now_secs) {
+        return (false, NodeRole::Member);
+    }
+    if aterm_secrets::client::local_recipient_denied_in_roster(vault_paths) {
         return (false, NodeRole::Member);
     }
     let role = if aterm_secrets::client::admin_cached(vault_paths).is_ok() {
@@ -656,6 +689,13 @@ pub trait ServiceSupervisor {
     /// # Errors
     /// Returns an error if the supervisor query itself failed fatally.
     fn running_pid(&self, home: &Path) -> Result<Option<u32>, String>;
+    /// The release actually run by `program`, measured under a bounded deadline.
+    ///
+    /// # Errors
+    /// The program did not identify as an aterm release, or this supervisor does not measure it.
+    fn program_release(&self, _program: &Path) -> Result<(u64, u64, u64), String> {
+        Err("the program's release was not measured".to_owned())
+    }
     /// Load/restart the written unit file at `unit_path`.
     ///
     /// # Errors
@@ -715,7 +755,10 @@ impl RealLaunchctl {
     fn output(&self, args: &[&str]) -> Result<(std::process::ExitStatus, String), String> {
         let mut cmd = aterm_uds::spawnfd::command(LAUNCHCTL);
         cmd.args(args);
-        let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + LAUNCHCTL_WITHIN)
+        let deadline = Instant::now()
+            .checked_add(LAUNCHCTL_WITHIN)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+        let out = aterm_uds::deadline::output_until(&mut cmd, deadline)
             .map_err(|e| format!("{LAUNCHCTL} {}: {e}", args.join(" ")))?;
         let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
         said.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -814,7 +857,9 @@ impl Launchd<'_> {
         for (domain, _) in self.loaded()? {
             let target = format!("{domain}/{NODE_LABEL}");
             let _ = self.launchctl.run(&["bootout", &target])?;
-            let until = Instant::now() + self.settle;
+            let until = Instant::now()
+                .checked_add(self.settle)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
             while self.launchctl.run(&["print", &target])?.0 {
                 if Instant::now() >= until {
                     return Err(format!(
@@ -983,6 +1028,18 @@ impl LiveSupervisor {
 }
 
 impl ServiceSupervisor for LiveSupervisor {
+    fn program_release(&self, program: &Path) -> Result<(u64, u64, u64), String> {
+        #[cfg(unix)]
+        {
+            aterm_secrets::service::program_release(program).map_err(|error| error.to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = program;
+            Err("node service is Unix only".to_owned())
+        }
+    }
+
     fn unit_file(&self, home: &Path) -> PathBuf {
         if cfg!(target_os = "macos") {
             plist_path(home)
@@ -1088,11 +1145,11 @@ impl ServiceSupervisor for LiveSupervisor {
             unload_systemd(&|args| {
                 let mut command = aterm_uds::spawnfd::command(systemctl);
                 command.args(args);
-                let out = aterm_uds::deadline::output_until(
-                    &mut command,
-                    Instant::now() + LAUNCHCTL_WITHIN,
-                )
-                .map_err(|error| format!("{systemctl} {}: {error}", args.join(" ")))?;
+                let deadline = Instant::now()
+                    .checked_add(LAUNCHCTL_WITHIN)
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+                let out = aterm_uds::deadline::output_until(&mut command, deadline)
+                    .map_err(|error| format!("{systemctl} {}: {error}", args.join(" ")))?;
                 let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
                 said.push_str(&String::from_utf8_lossy(&out.stderr));
                 Ok((out.status.success(), said))
@@ -1232,6 +1289,18 @@ pub fn install_with(
     clear_off: bool,
     supervisor: &dyn ServiceSupervisor,
 ) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    let _guard = node_admin_lock(state_dir)?;
+    install_locked(program, home, state_dir, clear_off, supervisor)
+}
+
+fn install_locked(
+    program: &Path,
+    home: &Path,
+    state_dir: &Path,
+    clear_off: bool,
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<PathBuf, String> {
     aterm_uds::private_file::ensure_private_dir(state_dir).map_err(|e| e.to_string())?;
     if clear_off {
         let off = off_path(state_dir);
@@ -1265,6 +1334,8 @@ pub fn remove_with(
     record_off: bool,
     supervisor: &dyn ServiceSupervisor,
 ) -> Result<Option<PathBuf>, String> {
+    #[cfg(unix)]
+    let _guard = node_admin_lock(state_dir)?;
     if record_off {
         aterm_uds::private_file::ensure_private_dir(state_dir).map_err(|e| e.to_string())?;
         aterm_uds::private_file::write_private(
@@ -1343,32 +1414,89 @@ pub fn resolve_installed_program(
     None
 }
 
-/// Pure `sync.node` probe over injected paths and `supervisor`.
-///
-/// # Errors
-/// Returns an error if reading `aterm.toml` or querying `supervisor` fails.
-pub fn read_for_sync_with(
-    home: &Path,
+/// A fresh service must run a release that includes this node implementation.
+fn required_node_release() -> Result<(u64, u64, u64), String> {
+    let number = |part: &str| {
+        part.parse::<u64>()
+            .map_err(|_| "invalid node release version".to_owned())
+    };
+    Ok((
+        number(env!("CARGO_PKG_VERSION_MAJOR"))?,
+        number(env!("CARGO_PKG_VERSION_MINOR"))?,
+        number(env!("CARGO_PKG_VERSION_PATCH"))?,
+    ))
+}
+
+fn compatible_program(proposed: &Path, release: (u64, u64, u64)) -> Result<PathBuf, String> {
+    if release < required_node_release()? {
+        return Err(format!(
+            "{} is older than this node implementation ({}); the node job was kept",
+            proposed.display(),
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    Ok(proposed.to_path_buf())
+}
+
+/// A retained helper may propose a stale second app. Compare the actual programs before
+/// moving an existing job, preserving a verified newer program even when it needs renewal.
+fn sync_program(
+    proposed: &Path,
+    state: &NodeJobState,
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<PathBuf, String> {
+    let NodeJobState::Installed {
+        program: Some(kept),
+        ..
+    } = state
+    else {
+        if matches!(state, NodeJobState::Installed { pid: Some(_), .. }) {
+            return Err("the running node program is unknown; the node job was kept".to_owned());
+        }
+        return compatible_program(proposed, supervisor.program_release(proposed)?);
+    };
+    if kept == proposed {
+        return Ok(proposed.to_path_buf());
+    }
+    match (
+        supervisor.program_release(kept),
+        supervisor.program_release(proposed),
+    ) {
+        (Ok(current), Ok(next)) if current > next => Ok(kept.clone()),
+        (Ok(_), Err(_)) => Ok(kept.clone()),
+        (Err(_), Ok(_))
+            if matches!(state, NodeJobState::Installed { pid: Some(_), .. }) && kept.is_file() =>
+        {
+            Err(format!(
+                "{} is running but its release is unknown; the node job was kept",
+                kept.display()
+            ))
+        }
+        (Err(_), Ok(next)) => compatible_program(proposed, next),
+        (Ok(_), Ok(_)) => Ok(proposed.to_path_buf()),
+        (Err(_), Err(_)) => Err(format!(
+            "neither {} nor {} identified as an aterm release; the node job was kept",
+            kept.display(),
+            proposed.display()
+        )),
+    }
+}
+
+fn sync_gate(
     state_dir: &Path,
     aterm_config: Option<&Path>,
-    program: Option<&Path>,
     under_ci: bool,
-    supervisor: &dyn ServiceSupervisor,
-) -> Result<SyncNodeState, String> {
+) -> Result<Option<String>, String> {
     if let Some(cfg) = aterm_config
         && !aterm_secrets::swarm::enabled_at(cfg).map_err(|e| e.to_string())?
     {
-        return Ok(SyncNodeState::NotApplicable(
-            aterm_secrets::swarm::SWARM_OFF.to_owned(),
-        ));
+        return Ok(Some(aterm_secrets::swarm::SWARM_OFF.to_owned()));
     }
     if under_ci {
-        return Ok(SyncNodeState::NotApplicable(
-            "under CI no pass installs the node job".to_owned(),
-        ));
+        return Ok(Some("under CI no pass installs the node job".to_owned()));
     }
     if node_turned_off(state_dir) {
-        return Ok(SyncNodeState::NotApplicable(
+        return Ok(Some(
             "off on this Mac by your choice: `aterm node on` turns it on".to_owned(),
         ));
     }
@@ -1376,7 +1504,7 @@ pub fn read_for_sync_with(
     // default fleet's sync from joining again); a fleet a person forms or joins here after that is
     // served by the window all the same, so the job stands for it too.
     if aterm_net::fleet::read_key_file(state_dir).is_err() {
-        return Ok(SyncNodeState::NotApplicable(
+        return Ok(Some(
             if left_the_fleet(state_dir) {
                 "this Mac left its fleet (`aterm fleet leave`)"
             } else {
@@ -1385,13 +1513,34 @@ pub fn read_for_sync_with(
             .to_owned(),
         ));
     }
+    Ok(None)
+}
+
+/// Pure `sync.node` probe over injected paths and `supervisor`.
+///
+/// # Errors
+/// Returns an error if reading `aterm.toml` or querying `supervisor` fails, or a running
+/// program's release cannot be established before the job would be moved.
+pub fn read_for_sync_with(
+    home: &Path,
+    state_dir: &Path,
+    aterm_config: Option<&Path>,
+    program: Option<&Path>,
+    under_ci: bool,
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<SyncNodeState, String> {
+    if let Some(why) = sync_gate(state_dir, aterm_config, under_ci)? {
+        return Ok(SyncNodeState::NotApplicable(why));
+    }
     let Some(program) = program else {
         return Ok(SyncNodeState::NotApplicable(
             "no installed release aterm binary on this Mac".to_owned(),
         ));
     };
+    let state = state_with(home, supervisor)?;
+    let program = sync_program(program, &state, supervisor)?;
     let target = format!("{NODE_LABEL} running {}", program.display());
-    match state_with(home, supervisor)? {
+    match state {
         NodeJobState::Absent => Ok(SyncNodeState::Due {
             from: format!("{NODE_LABEL} is not installed"),
             to: target,
@@ -1489,16 +1638,25 @@ pub fn ensure_for_sync_with(
         SyncNodeState::NotApplicable(why) => Ok(format!("left as it is: {why}")),
         SyncNodeState::Current(now) => Ok(format!("nothing changed: {now}")),
         SyncNodeState::Due { .. } => {
+            #[cfg(unix)]
+            let _guard = node_admin_lock(state_dir)?;
+            // Off or fleet leave may have finished while version probes were running.
+            // The same lock keeps either from completing between this check and mutation.
+            if let Some(why) = sync_gate(state_dir, aterm_config, under_ci)? {
+                return Ok(format!("left as it is: {why}"));
+            }
             let Some(program) = program else {
                 return Ok("left as it is: no installed release aterm binary".to_owned());
             };
+            let state = state_with(home, supervisor)?;
+            let program = sync_program(program, &state, supervisor)?;
             // A job that runs as its unit says, on a build an update replaced, restarts in place;
             // anything else is (re)installed, which reloads it where it belongs.
             if let NodeJobState::Installed {
                 pid: Some(pid),
                 program: Some(kept),
                 ..
-            } = state_with(home, supervisor)?
+            } = state
                 && kept == program
                 && matches!(
                     renewal(supervisor, home, state_dir, pid, &kept),
@@ -1508,7 +1666,7 @@ pub fn ensure_for_sync_with(
                 supervisor.renew()?;
                 return Ok(format!("renewed {NODE_LABEL} on this build (kickstart -k)"));
             }
-            let unit = install_with(program, home, state_dir, false, supervisor)?;
+            let unit = install_locked(&program, home, state_dir, false, supervisor)?;
             Ok(format!(
                 "installed and started {NODE_LABEL} ({})",
                 unit.display()

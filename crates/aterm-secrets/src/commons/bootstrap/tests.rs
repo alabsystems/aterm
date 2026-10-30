@@ -1235,6 +1235,13 @@ fn bounded_bootstrap_retries_transient_vault_lock_after_releasing_custody() {
     )
     .unwrap();
     let initial = Bootstrap::cached(&paths).unwrap().unwrap();
+    {
+        let _held_journal = Journal::open_existing(initial.journal_dir(), initial.trust()).unwrap();
+        assert!(
+            super::writer_here(&paths),
+            "writer_here must read settled custody beside a concurrent journal writer"
+        );
+    }
     let (file, _) = aterm_uds::private_file::open_private(&paths.dir, "commons.lock").unwrap();
     aterm_uds::keep_out_of_children(&file).unwrap();
     #[expect(
@@ -1274,7 +1281,7 @@ fn bounded_bootstrap_retries_transient_vault_lock_after_releasing_custody() {
                 }
             },
             || {
-                Bootstrap::cached_until(&paths, Instant::now() + Duration::from_secs(5))
+                Bootstrap::cached_until(&paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
                     .unwrap()
                     .unwrap()
             },

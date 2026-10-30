@@ -146,7 +146,7 @@ pub fn write_outcome(path: &Path, met: &Met) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     if let Ok(mut file) = opts.open(path) {
         let _ = writeln!(file, "{}", met.line());
@@ -156,12 +156,19 @@ pub fn write_outcome(path: &Path, met: &Met) {
 /// The [`Met`] the outcome file at `path` holds, read once (at most a few hundred bytes).
 #[must_use]
 pub fn read_outcome(path: &Path) -> Option<Met> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(256)
-        .read_to_string(&mut text)
-        .ok()?;
+    file.take(256).read_to_string(&mut text).ok()?;
     Met::parse(&text)
 }
 
@@ -3380,16 +3387,55 @@ fn curl_config(options: &[(&'static str, &str)]) -> std::io::Result<String> {
     Ok(text)
 }
 
+/// The variables of the opener's environment that a curl or headless browser it starts keeps:
+/// where the child runs and how it speaks, and the proxies and certificate stores a request must
+/// honour. Nothing else of the opener's environment reaches the child, the mailbox's credentials
+/// ([`super::headless_oauth::IMAP_PASS_ENV`] and its kin) least of all.
+pub(super) const CHILD_ENV_KEPT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+/// The whole environment of a child the opener starts: each [`CHILD_ENV_KEPT`] variable `var`
+/// has.
+pub(super) fn child_env(var: &dyn Fn(&str) -> Option<OsString>) -> Vec<(&'static str, OsString)> {
+    CHILD_ENV_KEPT
+        .iter()
+        .filter_map(|name| var(name).map(|value| (*name, value)))
+        .collect()
+}
+
 fn curl_command(
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
     options: &[(&'static str, &str)],
+    var: &dyn Fn(&str) -> Option<OsString>,
 ) -> std::io::Result<(aterm_uds::spawnfd::Command, String)> {
     use aterm_uds::spawnfd::Stdio;
 
     let input = curl_config(options)?;
     let mut cmd = aterm_uds::spawnfd::command(program);
-    cmd.args(args)
+    cmd.env_clear()
+        .envs(child_env(var))
+        .args(args)
         .args(["--config", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3398,22 +3444,26 @@ fn curl_command(
 }
 
 /// Pass fixed curl options containing credentials or URLs through stdin, preserving the
-/// caller's environment and flags. Callers put `--disable` first to suppress `.curlrc`.
+/// caller's flags; curl's environment is the caller's [`CHILD_ENV_KEPT`] variables alone.
+/// Callers put `--disable` first to suppress `.curlrc`.
 /// # Errors
 /// A config NUL, child or writer startup failure, failed pipe I/O or wait, or a writer panic.
 pub(super) fn curl_output(
     args: &[&str],
     options: &[(&'static str, &str)],
 ) -> std::io::Result<std::process::Output> {
-    curl_output_with(aterm_uds::os_path!("curl"), args, options)
+    curl_output_with(aterm_uds::os_path!("curl"), args, options, &|name| {
+        std::env::var_os(name)
+    })
 }
 
 fn curl_output_with(
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
     options: &[(&'static str, &str)],
+    var: &dyn Fn(&str) -> Option<OsString>,
 ) -> std::io::Result<std::process::Output> {
-    let (mut cmd, input) = curl_command(program, args, options)?;
+    let (mut cmd, input) = curl_command(program, args, options, var)?;
     let mut child = cmd.spawn()?;
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();

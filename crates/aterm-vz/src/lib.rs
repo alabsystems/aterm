@@ -118,6 +118,39 @@ pub(crate) fn is_hex(text: &str, len: usize) -> bool {
     text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Read a small UTF-8 regular file without following a terminal symlink or blocking on a FIFO.
+pub(crate) fn read_small_text(path: &std::path::Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !std::fs::symlink_metadata(path).ok()?.is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let cap = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Make `path` read-only to everyone (0444), as a sealed disk and the kernel files are.
 pub(crate) fn read_only(path: &std::path::Path) -> Result<(), Error> {
     #[cfg(unix)]

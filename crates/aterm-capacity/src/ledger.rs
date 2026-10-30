@@ -109,6 +109,28 @@ impl Record {
         format!("{:013}-{}-{}", self.start_ms, self.pid, self.seq)
     }
 
+    /// This claim's COVER MARKER ([`crate::COVER_ENV`]): its file stem, `<start>-<pid>-<seq>`,
+    /// which names it and its holder.
+    #[must_use]
+    pub fn cover_marker(&self) -> String {
+        self.stem()
+    }
+
+    /// The holder's pid a cover marker names ([`Self::cover_marker`]); `None` for any other
+    /// word.
+    #[must_use]
+    pub fn marker_holder(marker: &str) -> Option<u32> {
+        let mut parts = marker.split('-');
+        let (Some(start), Some(pid), Some(seq), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        (start.parse::<u64>().is_ok() && seq.parse::<u64>().is_ok())
+            .then(|| pid.parse::<u32>().ok())
+            .flatten()
+    }
+
     /// The record's first line: who and what.
     fn head_line(&self) -> String {
         let mut o = Map::new();
@@ -134,6 +156,9 @@ impl Record {
         o.insert("quiet".to_owned(), Value::from(quiet));
         if self.need.alone {
             o.insert("alone".to_owned(), Value::from(true));
+        }
+        if self.need.covers {
+            o.insert("covers".to_owned(), Value::from(true));
         }
         if let Some(p) = self.need.patience {
             let mut q = Map::new();
@@ -243,6 +268,7 @@ impl Record {
                 .map(PathBuf::from),
             checkout: None,
             alone: head.get("alone").and_then(Value::as_bool) == Some(true),
+            covers: head.get("covers").and_then(Value::as_bool) == Some(true),
         };
         // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
         // the admission, then the measured writes' (written over in place) and each credit,
@@ -420,8 +446,25 @@ impl Ledger {
         self.scan(false)
     }
 
+    /// Every live claim of the process `pid`, oldest first, read as [`Self::list`] reads them: only
+    /// the files whose name carries that pid are tested, the stem being `<start>-<pid>-<seq>`.
+    ///
+    /// # Errors
+    /// As [`Self::list`].
+    pub fn of_pid(&self, pid: u32) -> io::Result<Vec<Record>> {
+        let mark = format!("-{pid}-");
+        let mut live = self.scan_where(false, &|name| name.contains(&mark))?;
+        live.retain(|r| r.pid == pid);
+        Ok(live)
+    }
+
     /// Every live claim, oldest first, a dead holder's file removed when `reap`.
     pub(crate) fn scan(&self, reap: bool) -> io::Result<Vec<Record>> {
+        self.scan_where(reap, &|_| true)
+    }
+
+    /// [`Self::scan`] over the claim files whose name `named` takes.
+    fn scan_where(&self, reap: bool, named: &dyn Fn(&str) -> bool) -> io::Result<Vec<Record>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -441,6 +484,9 @@ impl Ledger {
             } else {
                 continue;
             };
+            if !named(name) {
+                continue;
+            }
             if let Some(record) = probe(&entry.path(), held, reap)? {
                 live.push(record);
             }

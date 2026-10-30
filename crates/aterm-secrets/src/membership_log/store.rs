@@ -768,6 +768,43 @@ mod tests {
         (writer, incarnation, member, entrant)
     }
 
+    /// A store's copy shares its records' bytes. A server copies its store to try each POST
+    /// against it (`server::post_records`), which any LAN host may send, and that copy held
+    /// every record's bytes again, up to `MAX_RECORDS_STREAM` (about 64 MiB), once per POST.
+    /// NEGATIVE CONTROL: a `Record` that owns its bytes (`wire: Vec<u8>`, main before this fix)
+    /// copies them with the store, and the test fails "the copy holds the record's bytes again".
+    #[test]
+    fn a_stores_copy_shares_every_records_bytes() {
+        let (w1, inc1, m1, e1) = entrant(1, "m1");
+        let (_, _, _, e2) = entrant(2, "m2");
+        let genesis = Record::found(&[9; 32], vec![e1], 1_000).expect("genesis");
+        let admit = Log::new(genesis.clone())
+            .expect("log")
+            .draft(
+                &m1,
+                1_001,
+                Body::Admit {
+                    entrant: e2,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&w1, inc1)
+            .expect("admit");
+        let mut store = Store::for_vault("team").expect("store");
+        assert!(store.insert(genesis).expect("genesis"));
+        assert!(store.insert(admit).expect("admitted"));
+        let copy = store.clone();
+        assert_eq!(copy.len(), 2);
+        for id in store.inventory() {
+            let held = store.get_bytes(&id).expect("held");
+            let copied = copy.get_bytes(&id).expect("copied");
+            assert!(
+                std::ptr::eq(held, copied),
+                "the copy holds the record's bytes again"
+            );
+        }
+    }
+
     #[test]
     fn stream_codec_and_store_converge_across_orders_and_refuse_corruption() {
         let (w1, inc1, m1, e1) = entrant(1, "m1");

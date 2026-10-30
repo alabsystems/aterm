@@ -227,7 +227,10 @@ impl ActivationWake {
         {
             self.last_event = None;
         }
-        let deadline = Instant::now() + fallback;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(fallback)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400));
         loop {
             // A Settings edit may have moved the package prefix: the builds
             // it holds are others, and the watch moves with it.
@@ -923,7 +926,10 @@ mod tests {
     }
 
     fn wait_parked(parks: &std::sync::atomic::AtomicUsize, at_least: usize) {
-        let deadline = Instant::now() + HANG;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(HANG)
+            .unwrap_or_else(|| now + Duration::from_secs(60));
         while parks.load(std::sync::atomic::Ordering::SeqCst) < at_least {
             assert!(
                 Instant::now() < deadline,

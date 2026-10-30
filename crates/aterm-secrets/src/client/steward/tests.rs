@@ -432,3 +432,186 @@ fn revoke_before_explicit_roster_seed_seeds_remaining_members_first() {
         );
     });
 }
+
+/// F16's fallback, visible: a vault with no membership log (ALab until F12b) has no member's
+/// removal. `aterm members remove` refuses and names the admin's revoke, which still takes the Mac
+/// out through the admin key, and the steward's revoke repair still runs there.
+///
+/// NEGATIVE CONTROL: in `remove_member`, drop the no-log gate (`if trusted_store(paths)?
+/// .is_none()`): the refusal comes from the draft ("holds no membership log"), no longer names
+/// `aterm secrets revoke`, and the `"names the admin's revoke"` assert fails.
+#[test]
+fn a_vault_with_no_log_still_revokes_through_the_admin_key() {
+    let lab = lab("no-log-revoke");
+    let _m2 = lab.machine("m2", false);
+    lab.as_alab(|| {
+        assert!(!removes_by_log(&lab.m1), "CONTROL: no membership log here");
+        let error = remove_member(&lab.m1, "m2", false).expect_err("no member's removal");
+        assert!(
+            error.to_string().contains("aterm secrets revoke"),
+            "names the admin's revoke: {error}"
+        );
+        assert!(
+            !matches!(
+                steward_revoke_check(&lab.m1).unwrap(),
+                StewardRevoke::Idle(_)
+            ),
+            "the steward's revoke repair still runs on a vault with no log"
+        );
+        let admin = admin_open(&lab.m1).unwrap();
+        admin_revoke(&lab.m1, &admin, "m2", false).expect("the admin's revoke");
+        assert!(
+            admin_open(&lab.m1)
+                .unwrap()
+                .doc
+                .machines()
+                .iter()
+                .all(|m| m.name != "m2"),
+            "m2 is out"
+        );
+    });
+}
+
+#[test]
+fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
+    let lab = lab("steward-deny-roster-and-log");
+    let m2 = lab.machine("m2", true);
+    let m1_rec = machine_identity(&lab.m1).unwrap().recipient().to_bech32();
+    let m2_rec = machine_identity(&m2).unwrap().recipient().to_bech32();
+
+    lab.as_alab(|| {
+        let opened = admin_open(&lab.m1).unwrap();
+        let mut doc = opened.doc.clone();
+        let policy = crate::swarm_roster::SwarmPolicy {
+            network_id: Some("net-alab".to_owned()),
+            reserved_labels: vec!["m3".to_owned()],
+            release_hosts: Vec::new(),
+            servers: Vec::new(),
+            stewards: vec![
+                crate::swarm_roster::StewardPolicy {
+                    label: "m1".to_owned(),
+                    rank: 1,
+                    always_on: true,
+                },
+                crate::swarm_roster::StewardPolicy {
+                    label: "m2".to_owned(),
+                    rank: 2,
+                    always_on: true,
+                },
+            ],
+        };
+        let admins = doc.admins();
+        doc.set_entry(
+            &Audience::Hosts(admins),
+            crate::swarm_roster::POLICY_ENTRY,
+            policy.to_toml().as_bytes(),
+        )
+        .unwrap();
+        let roster = crate::swarm_roster::SwarmRoster {
+            members: vec![
+                crate::swarm_roster::SwarmMember {
+                    label: "m1".into(),
+                    vault_name: "m1".into(),
+                    recipient: m1_rec.clone(),
+                    node_id: None,
+                    node_key: None,
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                },
+                crate::swarm_roster::SwarmMember {
+                    label: "m2".into(),
+                    vault_name: "m2".into(),
+                    recipient: m2_rec.clone(),
+                    node_id: None,
+                    node_key: Some("de".repeat(32)),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                },
+            ],
+            deny_labels: Vec::new(),
+            deny_nodes: vec!["de".repeat(32)],
+        };
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::swarm_roster::ROSTER_ENTRY,
+            roster.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&lab.m1, &opened, &doc).unwrap();
+        sync(&lab.m1, None).unwrap();
+        sync(&m2, None).unwrap();
+
+        // `m2` is denied by `deny_nodes` in `aterm-swarm-roster`: it must not serve `_alab-vault._tcp`
+        // or claim the steward lease by falling back to `doc.machines()` or `config.host`.
+        assert_eq!(steward_alab_policy_role(&m2), None);
+        assert!(
+            check_standby_eligibility(&m2, Some("net-alab"))
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(
+            steward_lease_check(&m2, Some("net-alab"), 1_760_000_000).unwrap(),
+            StewardLease::Idle(_)
+        ));
+        assert!(matches!(
+            steward_ensure_lease(&m2, Some("net-alab"), 1_760_000_000).unwrap(),
+            StewardLease::Idle(_)
+        ));
+
+        // Positive control: `m1` is not denied and is eligible.
+        assert_eq!(
+            steward_alab_policy_role(&lab.m1),
+            Some((true, Some("m1".to_owned())))
+        );
+        assert!(matches!(
+            steward_lease_check(&lab.m1, Some("net-alab"), 1_760_000_000).unwrap(),
+            StewardLease::Due { .. }
+        ));
+
+        // Now publish a lease held by denied `m2` with 6 hours remaining: `swarm_lease_holder`
+        // must return `None` for the denied holder, and `m1` must immediately take over at
+        // `epoch + 1` without waiting 6 hours for `m2`'s TTL to expire.
+        let opened = admin_open(&lab.m1).unwrap();
+        let mut doc = opened.doc.clone();
+        let m2_lease = crate::swarm_roster::SwarmLease {
+            holder: "m2".into(),
+            epoch: 3,
+            until: 1_760_021_600,
+        };
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_LEASE_ENTRY,
+            m2_lease.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&lab.m1, &opened, &doc).unwrap();
+        sync(&lab.m1, None).unwrap();
+
+        assert_eq!(
+            crate::client::swarm_lease_holder(&lab.m1).unwrap(),
+            None,
+            "swarm_lease_holder must not return a denied lease holder"
+        );
+        assert!(matches!(
+            steward_lease_check(&lab.m1, Some("net-alab"), 1_760_000_000).unwrap(),
+            StewardLease::Due { makes, .. } if makes.contains("epoch 4") && makes.contains("m1")
+        ));
+        assert!(matches!(
+            steward_ensure_lease(&lab.m1, Some("net-alab"), 1_760_000_000).unwrap(),
+            StewardLease::Done(said) if said.contains("epoch 4") && said.contains("m1")
+        ));
+        sync(&lab.m1, None).unwrap();
+        assert_eq!(
+            crate::client::swarm_lease_holder(&lab.m1)
+                .unwrap()
+                .as_deref(),
+            Some("m1")
+        );
+    });
+}

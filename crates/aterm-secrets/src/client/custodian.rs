@@ -58,10 +58,34 @@ impl Admin {
     #[must_use]
     pub fn host_of_recipient(&self, recipient: &age::Recipient) -> Option<String> {
         let wanted = recipient.to_bech32();
+        if self
+            .published_doc
+            .code_only()
+            .into_iter()
+            .any(|code_only| code_only == wanted)
+        {
+            return None;
+        }
+        let roster = (self.log_base == super::log_entries::LogBase::NoLog)
+            .then(|| {
+                crate::swarm_roster::SwarmRoster::from_document(&self.published_doc)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
         self.published_doc
             .machines()
             .into_iter()
-            .find(|machine| machine.recipient == wanted)
+            .find(|machine| {
+                machine.recipient == wanted
+                    && !roster.as_ref().is_some_and(|r| {
+                        r.is_label_denied(&machine.name)
+                            || r.member_by_recipient(&machine.recipient)
+                                .is_some_and(|row| {
+                                    super::steward::member_is_denied_in_roster(r, row)
+                                })
+                    })
+            })
             .map(|machine| machine.name)
     }
 

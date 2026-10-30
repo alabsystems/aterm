@@ -243,7 +243,7 @@ pub fn read_verified_entry(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
-    Ok(read_entry(paths, expected, name, true)?.map(|(entry, _)| entry))
+    Ok(read_entry(paths, expected, name, Reading::Materialized)?.map(|(entry, _)| entry))
 }
 
 pub(crate) fn read_reserved_entry(
@@ -251,7 +251,7 @@ pub(crate) fn read_reserved_entry(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
-    Ok(read_entry(paths, expected, name, false)?.map(|(entry, _)| entry))
+    Ok(read_entry(paths, expected, name, Reading::Reserved)?.map(|(entry, _)| entry))
 }
 
 pub(crate) fn read_reserved_entry_and_admin(
@@ -259,26 +259,45 @@ pub(crate) fn read_reserved_entry_and_admin(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<(VerifiedEntry, bool)>> {
-    read_entry(paths, expected, name, false)
+    read_entry(paths, expected, name, Reading::ReservedAndAdmin)
 }
 
-fn holds_admin_locker(envelope: &envelope::Envelope, identity: &Identity) -> crate::Result<bool> {
+#[derive(Clone, Copy)]
+enum Reading {
+    Materialized,
+    Reserved,
+    ReservedAndAdmin,
+}
+
+fn holds_admin_locker(
+    paths: &Paths,
+    config: &Config,
+    envelope: &envelope::Envelope,
+    identity: &Identity,
+) -> crate::Result<bool> {
     let Some(locker) = envelope.admin_locker() else {
         return Ok(false);
     };
-    match age::decrypt(std::slice::from_ref(identity), locker.armored.as_bytes()) {
-        Ok(_) => Ok(true),
-        Err(age::AgeError::NoMatch) => Ok(false),
-        Err(error) => Err(Error::new(format!("admin locker: {error}"))),
+    let plain = match age::decrypt(std::slice::from_ref(identity), locker.armored.as_bytes()) {
+        Ok(plain) => plain,
+        Err(age::AgeError::NoMatch) => return Ok(false),
+        Err(error) => return Err(Error::new(format!("admin locker: {error}"))),
+    };
+    if let Ok(opened) = parse_admin(&plain)
+        && super::admin_removed_in_log(paths, config, envelope, identity, &opened.doc)
+    {
+        return Ok(false);
     }
+    Ok(true)
 }
 
 fn read_entry(
     paths: &Paths,
     expected: &Config,
     name: &str,
-    materialized: bool,
+    reading: Reading,
 ) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    let materialized = matches!(reading, Reading::Materialized);
     let valid = if materialized {
         text::valid_entry_name(name) && !crate::reserved_name(name)
     } else {
@@ -315,7 +334,7 @@ fn read_entry(
     let Some(identity) = read_identity(paths)? else {
         return Ok(None);
     };
-    let (entries, envelope_digest, is_admin) = if state.digest.is_none()
+    let (entries, envelope_digest, is_admin, trusted_log) = if state.digest.is_none()
         && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
     {
         if state.source_identity != Some(source_identity(&config)) {
@@ -324,14 +343,20 @@ fn read_entry(
         let Some(configured) = super::log_entries::trusted_configured_log(paths, &config)? else {
             return Ok(None);
         };
-        if !super::log_entries::reads_log(&configured.log, &identity) {
+        if configured.log.removes(&identity.recipient())
+            || configured.log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &identity.recipient(),
+            )
+            || !super::log_entries::reads_log(&configured.log, &identity)
+        {
             return Ok(None);
         }
         let Some(entries) = configured.log.open_entries(&identity)? else {
             return Ok(None);
         };
         let digest = *configured.log.genesis().id();
-        (entries, digest, false)
+        (entries, digest, false, Some(configured.log))
     } else {
         if !source_bound(&config, &state) {
             return Ok(None);
@@ -345,9 +370,38 @@ fn read_entry(
         else {
             return Ok(None);
         };
-        let admin = !materialized && holds_admin_locker(&envelope, &identity)?;
-        (entries, envelope.digest(), admin)
+        let trusted_log =
+            super::log_entries::trusted_seeded_log(paths, &config, &envelope)?.map(|(log, _)| log);
+        // Admin standing reads the base roster. A reserved read of that roster must not ask
+        // for standing again; only the caller returning admin status needs that proof.
+        let admin = matches!(reading, Reading::ReservedAndAdmin)
+            && holds_admin_locker(paths, &config, &envelope, &identity)?;
+        (entries, envelope.digest(), admin, trusted_log)
     };
+    if name != crate::SWARM_ROSTER_ENTRY
+        && let Some(roster_entry) = entries.iter().find(|e| e.name == crate::SWARM_ROSTER_ENTRY)
+        && let Ok(text) = std::str::from_utf8(roster_entry.value.as_slice())
+        && let Ok(mut r) = crate::swarm_roster::SwarmRoster::from_toml(text)
+    {
+        r.canonicalize();
+        if let Some(log) = &trusted_log {
+            let _ = super::roster::lift_restored_from_roster(log, &mut r);
+            if super::log_entries::recipient_denied_by_roster_or_log(
+                Some(&r),
+                log,
+                &identity.recipient(),
+            ) {
+                return Ok(None);
+            }
+        }
+        let my_rec = identity.recipient().to_bech32();
+        if r.is_label_denied(&config.host)
+            || r.member_by_recipient(&my_rec)
+                .is_some_and(|m| steward::member_is_denied_in_roster(&r, m))
+        {
+            return Ok(None);
+        }
+    }
     let Some(entry) = entries.into_iter().find(|entry| entry.name == name) else {
         return Ok(None);
     };

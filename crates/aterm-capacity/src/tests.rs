@@ -4191,3 +4191,34 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
         .is_none()
     );
 }
+
+/// On macOS the live machine's lineage of a child is the walk up its parents, this process among
+/// them, as covering reads it. NEGATIVE CONTROL: a sibling's lineage does not hold the child.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_live_lineage_of_a_child_walks_up_to_this_process() {
+    use crate::reading::{Live, Machine as _};
+    let spawn = || {
+        aterm_uds::spawnfd::command("/bin/cat")
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("a child")
+    };
+    let mut child = spawn();
+    let mut sibling = spawn();
+    let me = std::process::id();
+    let line = Live.lineage(child.id()).expect("its lineage");
+    assert!(
+        line.ancestors(child.id()).contains(&me),
+        "{:?}",
+        line.ancestors(child.id())
+    );
+    let theirs = Live.lineage(sibling.id()).expect("its lineage");
+    assert!(theirs.ancestors(sibling.id()).contains(&me));
+    assert!(!theirs.ancestors(sibling.id()).contains(&child.id()));
+    for c in [&mut child, &mut sibling] {
+        drop(c.stdin.take());
+        assert!(c.wait().expect("its end").success());
+    }
+}

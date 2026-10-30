@@ -194,6 +194,7 @@ impl Side {
             }))
             .with_frame_cells(Some(base.cells.as_slice()))
             .with_frame_cells_cols(base.cols)
+            .with_frame_marks(&base.combining)
             .with_print_anchor(print_anchor)
             .with_print_anchor_glyph(print_anchor_glyph),
             std::iter::empty(),

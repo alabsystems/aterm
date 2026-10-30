@@ -38,6 +38,27 @@ struct Ring {
     born: Instant,
     life: f32,
     caret: (u16, u16),
+    /// The one-colour ring's verdict for this landing ([`MonoRing`]).
+    mono: MonoRing,
+}
+
+/// The one-colour landing ring's whole-or-not verdict, kept for its landing
+/// ([`ClassicWake::lay_whole_mono_ring`]): once drawn whole it holds its size
+/// and only grows, and once it goes out it is not drawn again. Judged afresh
+/// from each frame's text, text that came and went hid the ring and showed
+/// it again: a blink (looks9's review).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MonoRing {
+    /// Not yet drawn whole: its first size still meets a letter, an edge or
+    /// the letter floor (an Enter's ring beside the `$` is admitted whole
+    /// only once it has faded a third of its life), and it shows once it
+    /// does not.
+    Unjudged,
+    /// Drawn whole, its half side `0` px so far: it only grows.
+    Drawn(i32),
+    /// Drawn, then met by a later frame's text at the size it held: not
+    /// drawn again this landing.
+    Out,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +133,16 @@ pub struct ClassicWake {
     /// (looks10 L12's, in this crate's tests and the render replay's).
     #[cfg(any(test, debug_assertions))]
     pub(crate) ring_cut: bool,
+    /// Test-only: judge the one-colour landing ring whole or not afresh
+    /// from each frame's text, as looks9 Q4 judged it, not once a landing
+    /// ([`MonoRing`], looks9's review's negative control).
+    #[cfg(test)]
+    pub(crate) ring_unlatched: bool,
+    /// Test-only: keep the one-colour landing ring inside the window's grid
+    /// alone, a split pane's edge inside it unread, as looks9 Q4 kept it
+    /// (looks9's review's negative control).
+    #[cfg(test)]
+    pub(crate) ring_window_edge: bool,
     /// Test-only: the paper rim held to the caret's row is a square as tall as
     /// the row, as round 1 laid it (looks10 round 2's L12 negative control,
     /// [`ClassicWake::row_box_reach`]).
@@ -140,6 +171,11 @@ pub struct ClassicWake {
     /// [`tracer_on_caret_row`], [`one_air_piece`]).
     #[cfg(test)]
     pub(crate) tracer_up_kept: bool,
+    /// Test-only: the paper crown and tracer lay a chosen colour in its hue's
+    /// vivid body ink, as they did (review9fix round 3's negative control,
+    /// [`WakeInk::chosen`]).
+    #[cfg(test)]
+    pub(crate) paper_pin_saturated: bool,
     /// Test-only: a tracer up a page keeps one stretch in the air, the
     /// paper face its longest and the one-colour face its longest piece, as
     /// looks9 laid them (looks10 L6's negative control: a dash floating
@@ -194,6 +230,14 @@ pub(crate) struct WakeInk<'a> {
     pub(crate) text: TextView<'a>,
     /// The frame's over-ink account.
     pub(crate) ledger: &'a mut InkLedger,
+    /// Whether the trail's colour is one the user chose
+    /// ([`crate::cursor_glow::ColourPins::trail`]). On paper the one-colour
+    /// face's crown and tracer then wear it as itself, walked toward white
+    /// only as far as the theme's text over it asks
+    /// ([`LightGround::vivid_body_ink`]): in its own hue, its chroma only
+    /// falling. Solved from its hue's vivid ink instead, a trail pinned to
+    /// `#b0b0c8` (chroma 0.094) was laid up to `#9595e1` (0.298) on white.
+    pub(crate) chosen: bool,
     /// The probed rows' feet, the caret's cell carved out, and their soles:
     /// where the one-colour bed's rail may lie in its own row
     /// ([`crate::cursor_glow::BedShape::row_rail`]).
@@ -833,6 +877,10 @@ impl ClassicWake {
             #[cfg(any(test, debug_assertions))]
             ring_cut: false,
             #[cfg(test)]
+            ring_unlatched: false,
+            #[cfg(test)]
+            ring_window_edge: false,
+            #[cfg(test)]
             ring_row_square: false,
             #[cfg(test)]
             ring_seen: std::cell::RefCell::new(Vec::new()),
@@ -844,6 +892,8 @@ impl ClassicWake {
             mono_lit_whole: false,
             #[cfg(test)]
             tracer_up_kept: false,
+            #[cfg(test)]
+            paper_pin_saturated: false,
             #[cfg(test)]
             tracer_up_stretch: false,
             #[cfg(test)]
@@ -1100,8 +1150,13 @@ impl ClassicWake {
             }
             out.keep_laid(Self::MAX_QUADS);
         } else {
-            self.emit_light_crown(now, cfg, geom, cur, under.quads());
-            self.emit_light_comet(now, cfg, geom, cur, under, ink.text);
+            #[cfg(test)]
+            let chosen = ink.chosen && !self.paper_pin_saturated;
+            #[cfg(not(test))]
+            let chosen = ink.chosen;
+            let chosen = chosen && cfg.classic_mono;
+            self.emit_light_crown(now, cfg, geom, cur, under.quads(), chosen);
+            self.emit_light_comet(now, cfg, geom, cur, under, (ink.text, chosen));
             under.keep_laid(Self::MAX_QUADS);
             if let Some(ring) = &mut self.ring
                 && let Some((r, c)) = cur
@@ -1306,6 +1361,7 @@ impl ClassicWake {
                 born: now,
                 life: 0.18,
                 caret: (cr, cc),
+                mono: MonoRing::Unjudged,
             });
         }
     }
@@ -1855,7 +1911,7 @@ impl ClassicWake {
         geom: Geom,
         cur: Option<(u16, u16)>,
         under: &mut RampSink<'_>,
-        text: TextView<'_>,
+        (text, chosen): (TextView<'_>, bool),
     ) {
         #[cfg(test)]
         let kept = !self.tracer_over_letters;
@@ -1898,7 +1954,7 @@ impl ClassicWake {
         #[inline]
         const fn sample_ink_vertex(
             wake: &ClassicWake,
-            cfg: &GlowConfig,
+            (cfg, chosen): (&GlowConfig, bool),
             ground: &LightGround,
             last_ink: &mut Option<(u32, u32)>,
             drop: f32,
@@ -1908,7 +1964,11 @@ impl ClassicWake {
             let color = match *last_ink {
                 Some((prev, c)) if prev == raw => c,
                 _ => {
-                    let c = ground.body_ink(raw);
+                    let c = if chosen {
+                        ground.vivid_body_ink(raw)
+                    } else {
+                        ground.body_ink(raw)
+                    };
                     *last_ink = Some((raw, c));
                     c
                 }
@@ -1932,7 +1992,8 @@ impl ClassicWake {
             match run.as_slice() {
                 [] => continue,
                 [lone] => {
-                    let v = sample_ink_vertex(self, cfg, &ground, &mut last_ink, drop, lone);
+                    let v =
+                        sample_ink_vertex(self, (cfg, chosen), &ground, &mut last_ink, drop, lone);
                     let dx = cwf * 0.45;
                     verts.push(BeamVertex { x: v.x - dx, ..v });
                     verts.push(BeamVertex { x: v.x + dx, ..v });
@@ -1947,7 +2008,8 @@ impl ClassicWake {
                     while si < run.len() {
                         let s = &run[si];
                         si += 1;
-                        let mut v = sample_ink_vertex(self, cfg, &ground, &mut last_ink, drop, s);
+                        let mut v =
+                            sample_ink_vertex(self, (cfg, chosen), &ground, &mut last_ink, drop, s);
                         if across_rows {
                             let t =
                                 (((s.x - ax) * dx + (s.y - ay) * dy) * inv_len2).clamp(0.0, 1.0);
@@ -2092,6 +2154,7 @@ impl ClassicWake {
         geom: Geom,
         cur: Option<(u16, u16)>,
         under: &mut Vec<GlowQuad>,
+        chosen: bool,
     ) {
         let Some(((cr, cc), fade)) = self.crown_fade(now, cfg, geom, cur) else {
             return;
@@ -2120,6 +2183,8 @@ impl ClassicWake {
         let unsolved = self.light_unsolved;
         let body_ink = if unsolved {
             color & 0x00FF_FFFF
+        } else if chosen {
+            LightGround::of(cfg).vivid_body_ink(color & 0x00FF_FFFF)
         } else {
             let key = WakeLightKey {
                 rgb: color,
@@ -2187,17 +2252,20 @@ impl ClassicWake {
     }
 
     /// THE ONE-COLOUR RING IS WHOLE OR NOT DRAWN. Its square grows as the
-    /// spectrum ring's does while all four bars keep inside the grid and off
-    /// every cell a line of text covers (the caret's own cell aside), holds
-    /// the last size that does as it fades, and is not drawn when its first
-    /// size does not; laid under the letters at the letter floor, a bar the
-    /// floor would cut takes the ring with it. Cut where it crossed a letter
-    /// or the grid's edge, an Enter's ring left a lone dim bar right of the
-    /// caret on Solarized Dark and passed a bar through the `$` on dark (the
-    /// trail gallery's classic `#d03a8c` `enter-bottom`, looks9 Q4).
+    /// spectrum ring's does while all four bars keep inside its pane's grid
+    /// and off every cell a line of text covers (the caret's own cell
+    /// aside), holds the last size that does as it fades, and is not drawn
+    /// when its first size does not; laid under the letters at the letter
+    /// floor, a bar the floor would cut takes the ring with it. Cut where it
+    /// crossed a letter or the grid's edge, an Enter's ring left a lone dim
+    /// bar right of the caret on Solarized Dark and passed a bar through the
+    /// `$` on dark (the trail gallery's classic `#d03a8c` `enter-bottom`,
+    /// looks9 Q4). The verdict is the landing's ([`MonoRing`]): once drawn
+    /// whole and then met by a later frame's text at the size it holds, it
+    /// stays out until the next landing.
     #[inline]
     fn lay_whole_mono_ring(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -2215,29 +2283,72 @@ impl ClassicWake {
         let Some((ring, t, cov)) = self.ring_now(now, cfg) else {
             return;
         };
-        let Some(s) = Self::ring_reach(ring, t, geom, ink.text, RingLeast::Growth) else {
-            return;
-        };
-        let from = out.quads().len();
-        Self::ring_square_at(ring, s, premul_rgb(cfg.accent, cov), geom, out.quads());
-        let to = out.quads().len();
-        let laid = quads_area(&out.quads()[from..to]);
-        ink.ledger
-            .admit_masked(out.quads(), from..to, InkLedger::LETTER_FLOOR);
-        let quads = out.quads();
-        keep_whole(quads, from, to, laid);
         #[cfg(test)]
-        self.ring_seen.replace(quads[from..].to_vec());
-        out.keep_laid(Self::MAX_QUADS);
+        let unlatched = self.ring_unlatched;
+        #[cfg(not(test))]
+        let unlatched = false;
+        #[cfg(test)]
+        let pane_read = !self.ring_window_edge;
+        #[cfg(not(test))]
+        let pane_read = true;
+        let held = match ring.mono {
+            _ if unlatched => None,
+            MonoRing::Out => return,
+            MonoRing::Unjudged => None,
+            MonoRing::Drawn(s) => Some(s),
+        };
+        // Not drawn: a drawn ring goes out for its landing, an undrawn one
+        // waits to be drawn whole.
+        let mut verdict = if held.is_some() {
+            MonoRing::Out
+        } else {
+            MonoRing::Unjudged
+        };
+        if let Some(s) = Self::ring_reach(
+            ring,
+            t,
+            geom,
+            ink.text,
+            RingLeast::Growth,
+            (held, pane_read),
+        ) {
+            let from = out.quads().len();
+            Self::ring_square_at(ring, s, premul_rgb(cfg.accent, cov), geom, out.quads());
+            let to = out.quads().len();
+            let laid = quads_area(&out.quads()[from..to]);
+            ink.ledger
+                .admit_masked(out.quads(), from..to, InkLedger::LETTER_FLOOR);
+            let quads = out.quads();
+            if keep_whole(quads, from, to, laid) {
+                verdict = MonoRing::Drawn(s);
+            }
+            #[cfg(test)]
+            self.ring_seen.replace(quads[from..].to_vec());
+            out.keep_laid(Self::MAX_QUADS);
+        } else {
+            #[cfg(test)]
+            self.ring_seen.replace(Vec::new());
+        }
+        if let Some(r) = &mut self.ring {
+            r.mono = verdict;
+        }
     }
 
     /// A whole landing ring's half side at `t` of its life, px: its growth
-    /// ([`Self::ring_square`]'s) held at the largest size whose four bars lie
-    /// inside the grid and off every cell a line of text covers but the
-    /// caret's own; `None` when its `least` size already leaves or meets them
+    /// ([`Self::ring_square`]'s) from the size it `held` (its `least`, on its
+    /// first frame), held at the largest size whose four bars lie inside its
+    /// pane's grid and off every cell a line of text covers but the caret's
+    /// own; `None` when the size it starts from already leaves or meets them
     /// (the one-colour ring on a dark page from its first size,
     /// [`Self::lay_whole_mono_ring`], and every ring's rim on paper from the
-    /// caret's row, [`Self::emit_light_ring_rim`]).
+    /// caret's row, [`Self::emit_light_ring_rim`]). A split's focused pane
+    /// has its edge inside the window's grid, where the GUI clips the glow to
+    /// the pane ([`crate::cursor_glow::TextView::past_pane`]): read by the
+    /// window's edge alone, a ring on a pane's last row was laid across the
+    /// divider and cut there to three bars (looks9's review). The effects
+    /// box's head room over the window's first row stays the ring's on a pane
+    /// at the window's top (`pane_read` false reads the window's edge alone,
+    /// a test's control).
     #[inline]
     fn ring_reach(
         ring: Ring,
@@ -2245,6 +2356,7 @@ impl ClassicWake {
         geom: Geom,
         text: TextView<'_>,
         least: RingLeast,
+        (held, pane_read): (Option<i32>, bool),
     ) -> Option<i32> {
         let chf = chf_of(geom);
         let first = match least {
@@ -2263,14 +2375,13 @@ impl ClassicWake {
             geom.fx_right(),
             geom.fx_bot(),
         );
+        let (grid_rows, grid_cols) = (geom.rows as i32, geom.cols as i32);
+        // The sizes whose four bars lie inside the effects box, in closed form.
         let max_s = (cx - fx_l).min(fx_r - cx).min(cy - fx_t).min(fx_b - cy);
         let min_s = (fx_l + th - cx)
             .max(fx_t + th - cy)
             .max(cx + th - fx_r)
             .max(cy + th - fx_b);
-        if first < min_s || first > max_s {
-            return None;
-        }
         let want = want.min(max_s);
         let own = (i32::from(ring.row), i32::from(ring.col));
         let bar_cells_clear = |(r0, r1): (i32, i32), (c0, c1): (i32, i32)| {
@@ -2279,6 +2390,15 @@ impl ClassicWake {
                 let mut c = c0;
                 while c <= c1 {
                     if (r, c) != own && text.covers_cell(r, c) {
+                        return false;
+                    }
+                    if pane_read
+                        && r >= 0
+                        && r < grid_rows
+                        && c >= 0
+                        && c < grid_cols
+                        && text.past_pane(r, c)
+                    {
                         return false;
                     }
                     c += 1;
@@ -2309,11 +2429,17 @@ impl ClassicWake {
                 && bar_cells_clear((r_t1 + 1, r_b0 - 1), (c_l0, c_l1))
                 && bar_cells_clear((r_t1 + 1, r_b0 - 1), (c_r0, c_r1))
         };
-        let mut last_bounds = bounds_of(first);
+        let mut s = match held {
+            Some(s) => s.max(first),
+            None => first,
+        };
+        if s < min_s || s > max_s {
+            return None;
+        }
+        let mut last_bounds = bounds_of(s);
         if !bounds_clear(last_bounds) {
             return None;
         }
-        let mut s = first;
         while s < want {
             let next_bounds = bounds_of(s + 1);
             if next_bounds != last_bounds && !bounds_clear(next_bounds) {
@@ -2375,7 +2501,8 @@ impl ClassicWake {
             let s = ((0.6 + 1.0 * t) * chf_of(geom)) as i32;
             (s, s)
         } else {
-            let Some(s) = Self::ring_reach(ring, t, geom, text, RingLeast::CaretRow) else {
+            let Some(s) = Self::ring_reach(ring, t, geom, text, RingLeast::CaretRow, (None, true))
+            else {
                 return;
             };
             if s > (0.5 * chf_of(geom)) as i32 || row_square {
@@ -2637,9 +2764,9 @@ const fn quads_area(quads: &[GlowQuad]) -> u32 {
 
 /// Keep a ring laid at `from..to` of `quads` whole or drop it: an admission
 /// that cut it (its `laid` area shrank, a bar went, or a piece took another
-/// colour) takes the ring with it.
+/// colour) takes the ring with it. Returns whether it was kept.
 #[inline]
-fn keep_whole(quads: &mut Vec<GlowQuad>, from: usize, to: usize, laid: u32) {
+fn keep_whole(quads: &mut Vec<GlowQuad>, from: usize, to: usize, laid: u32) -> bool {
     let kept = match quads.get(from..) {
         Some(slice) => quads_area(slice),
         None => 0,
@@ -2660,6 +2787,7 @@ fn keep_whole(quads: &mut Vec<GlowQuad>, from: usize, to: usize, laid: u32) {
     if !whole {
         quads.truncate(from);
     }
+    whole
 }
 
 #[cfg(test)]
@@ -2741,6 +2869,7 @@ mod tests {
                 WakeInk {
                     text: crate::cursor_glow::TextView::new(self.spans, None),
                     ledger: &mut self.ledger,
+                    chosen: false,
                     feet: (&[], [None; 2]),
                 },
             )
@@ -2926,6 +3055,103 @@ mod tests {
                 "control: landing {land:?}: the ring as it was stays whole and off the text"
             );
         }
+    }
+
+    /// The one-colour ring's quads each 8 ms frame after a jump from `(1, 30)`
+    /// to `(2, 2)` beside a `$`, the frame `k` (from 0) probing `lines(k)`;
+    /// `unlatched` judging the ring afresh each frame ([`ClassicWake::ring_unlatched`]).
+    fn mono_ring_frames_over(
+        lines: &dyn Fn(u64) -> Vec<(i32, i32, i32)>,
+        unlatched: bool,
+    ) -> Vec<Vec<GlowQuad>> {
+        let g = geom();
+        let c = GlowConfig {
+            classic_mono: true,
+            color: 0x00D0_3A8C,
+            accent: 0x00D0_3A8C,
+            ..cfg()
+        };
+        let mut rig = Rig::default();
+        rig.w.ring_unlatched = unlatched;
+        let t0 = Instant::now();
+        rig.spans = crate::cursor_glow::TextSpans::of_lines(&[(1, 28, 29)]);
+        rig.tick(Some((1, 30)), t0, &c, g);
+        (0..30u64)
+            .map(|k| {
+                rig.out.clear();
+                rig.under.clear();
+                rig.halos.clear();
+                let mut now = vec![(2, 0, 1)];
+                now.extend(lines(k));
+                rig.spans = crate::cursor_glow::TextSpans::of_lines(&now);
+                rig.tick(Some((2, 2)), ms(t0, 8 * (k + 1)), &c, g);
+                rig.w.ring_seen.take()
+            })
+            .collect()
+    }
+
+    /// looks9's review of Q4: THE ONE-COLOUR RING'S VERDICT IS ITS LANDING'S.
+    /// Judged whole or not afresh from each frame's text, a ring whose bar a
+    /// line met for three frames hid for them and came back
+    /// (`#####...###############`): a blink. Landing beside a `$`, the ring
+    /// shows; met by a line over its top bar from its sixth frame for three
+    /// frames, or from then on, it is never drawn again once it goes out,
+    /// and no drawn frame lays a bar on the text. Negative control
+    /// ([`ClassicWake::ring_unlatched`]): judged afresh, the ring met for
+    /// three frames comes back.
+    #[test]
+    fn the_one_colour_ring_s_verdict_is_its_landing_s() {
+        let line = (1, 1, 9);
+        // `(drawn, came back, a bar on the text)`.
+        let read = |frames: &[Vec<GlowQuad>], lines: &dyn Fn(u64) -> Vec<(i32, i32, i32)>| {
+            let drawn = frames.iter().filter(|q| !q.is_empty()).count();
+            let shown = frames.iter().position(|q| !q.is_empty()).unwrap_or(0);
+            let out = frames[shown..]
+                .iter()
+                .position(Vec::is_empty)
+                .map_or(frames.len(), |i| shown + i);
+            let back = frames[out..].iter().any(|q| !q.is_empty());
+            let on_text = frames.iter().enumerate().any(|(k, q)| {
+                let mut now = vec![(2, 0, 1)];
+                now.extend(lines(k as u64));
+                !q.is_empty() && ring_reading(q, &now, (2, 2)).1
+            });
+            (drawn, back, on_text)
+        };
+        let still = |_: u64| Vec::new();
+        let (drawn, back, _) = read(&mono_ring_frames_over(&still, false), &still);
+        assert!(
+            drawn >= 10 && !back,
+            "fixture: on a still page the ring shows ({drawn} frames)"
+        );
+        let passing = move |k: u64| {
+            if (6..9).contains(&k) {
+                vec![line]
+            } else {
+                Vec::new()
+            }
+        };
+        let staying = move |k: u64| if k >= 6 { vec![line] } else { Vec::new() };
+        for (label, lines) in [
+            (
+                "met for three frames",
+                &passing as &dyn Fn(u64) -> Vec<(i32, i32, i32)>,
+            ),
+            ("met from then on", &staying),
+        ] {
+            let (drawn, back, on_text) = read(&mono_ring_frames_over(lines, false), lines);
+            assert!(
+                drawn >= 3,
+                "{label}: fixture: the ring shows first ({drawn})"
+            );
+            assert!(!back, "{label}: the ring goes out and is drawn again");
+            assert!(!on_text, "{label}: a drawn frame lays a bar on the text");
+        }
+        let (_, old_back, _) = read(&mono_ring_frames_over(&passing, true), &passing);
+        assert!(
+            old_back,
+            "control: judged afresh, the ring met for three frames never comes back"
+        );
     }
 
     /// looks10 L12, THE PAPER RING IS WHOLE AND OFF THE LETTERS: on paper the
@@ -3745,6 +3971,7 @@ mod tests {
                             born,
                             life: 0.4,
                             caret,
+                            mono: MonoRing::Unjudged,
                         }),
                         veil_unbound: unbound,
                         ..ClassicWake::default()

@@ -325,3 +325,48 @@ fn muse_code_store_names_only_an_active_goal() {
         "clearing -journal without modifying db/-wal retries instead of freezing a stale stamp"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_live_muse_sessions_goal_is_the_one_in_the_store_beside_the_lock_it_holds() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-goal-lock-")
+        .tempdir()
+        .expect("scratch");
+    let home = std::fs::canonicalize(dir.path()).expect("canonical");
+    let sid = "019a0000-0000-7000-8000-00000000000a";
+    let session = home.join(".local/share/muse/sessions/2026/10/24").join(sid);
+    std::fs::create_dir_all(&session).expect("session dir");
+    std::fs::write(session.join(".session.lock"), b"pid=4242\nhost=mac\n").expect("lock");
+    std::fs::write(session.join("session.jsonl"), b"{}\n").expect("log");
+    store_db(
+        &session,
+        MUSE_GOALS,
+        MUSE_SCHEMA,
+        &format!(
+            "INSERT INTO goals (session_id,goal_id,revision,objective,status,percent_complete,created_at_ms,updated_at_ms) \
+             VALUES ('{sid}','g1','r1','ship it','active',40,1,2);"
+        ),
+    );
+    let lock = std::fs::canonicalize(session.join(".session.lock")).expect("canonical lock");
+    let goal = |argv: &[&str], files: &[std::path::PathBuf]| {
+        let argv: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+        crate::harness::profile::muse_goal_for(
+            4242,
+            &argv,
+            &[],
+            &home,
+            Some(files),
+            &mut StoreGoal::default(),
+        )
+    };
+    assert_eq!(
+        goal(&["muse"], std::slice::from_ref(&lock)).as_deref(),
+        Some("ship it")
+    );
+    assert_eq!(
+        goal(&["muse", "resume", sid], &[]).as_deref(),
+        Some("ship it"),
+        "a session its launch names, found by its folder, holds the store beside its lock there"
+    );
+}

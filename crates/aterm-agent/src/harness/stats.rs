@@ -19,6 +19,7 @@ use crate::supervise::policy::approval::{
     RULE_ALLOW_ONCE, RULE_LIMIT_RESET, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_TRUST_ANY,
     SUBJECT_OPTION, WARNED_UNDER_SAFE,
 };
+use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{CHOSE_FIRST_SAFE, CHOSE_RECOMMENDED, CHOSE_UNMARKED};
 use crate::supervise::policy::reset::KeepWhy;
 use crate::supervise::policy::turn_end::{
@@ -947,11 +948,16 @@ fn box_option<'a>(rule: &str, command: &'a str) -> (&'a str, Option<&'a str>) {
     }
 }
 
+/// What a decision row says aterm answered with the owner's standing go-ahead ([`RULE_GO_AHEAD`]).
+pub const GO_AHEAD_DID: &str =
+    "the owner's standing go-ahead: build, test and land its own work, nothing outward";
+
 fn prose_answer_words(rule: &str, command: &str) -> Box<str> {
     match rule {
         RULE_LAND_ANSWER => Box::from(
             "the land answer: land all of the work on the remote main soonest, start nothing new",
         ),
+        RULE_GO_AHEAD => Box::from(GO_AHEAD_DID),
         RULE_PROSE_LONG_TERM => {
             Box::from("the long-term answer: decide for long-term correctness and total value")
         }

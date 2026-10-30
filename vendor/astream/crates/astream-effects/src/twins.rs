@@ -65,6 +65,28 @@ pub const fn seam_false_reads_advance(cur: u64, next: u64) -> u64 {
     }
 }
 
+/// `shadow_nonzero_bit` as `shadow_island.rs` defines it in Clean:
+/// `if 0 < val then code else 0`.
+#[must_use]
+pub const fn shadow_nonzero_bit(val: u64, code: u64) -> u64 {
+    if 0 < val {
+        code
+    } else {
+        0
+    }
+}
+
+/// `shadow_code_select` as `shadow_island.rs` defines it in Clean:
+/// `if 0 < primary_count then primary_code else fallback_code`.
+#[must_use]
+pub const fn shadow_code_select(primary_count: u64, primary_code: u64, fallback_code: u64) -> u64 {
+    if 0 < primary_count {
+        primary_code
+    } else {
+        fallback_code
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -111,6 +133,35 @@ mod tests {
             answers(|[a, b]| super::seam_false_reads_advance(a, b)),
             want
         );
+        let want = "000012012";
+        assert_eq!(
+            answers(|[a, b]| crate::shadow::shadow_nonzero_bit(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::shadow_nonzero_bit(a, b)), want);
+        let want = "012012012000111222000111222";
+        assert_eq!(
+            answers(|[a, b, c]| crate::shadow::shadow_code_select(a, b, c)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b, c]| super::shadow_code_select(a, b, c)),
+            want
+        );
+        for &a in &super::twin_answers::EDGES {
+            for &b in &super::twin_answers::EDGES {
+                let want_taint = if a > 0 || b > 0 { 1 } else { 0 };
+                assert_eq!(crate::shadow::shadow_taint_latch(a, b), want_taint);
+                let want_exit = if a > 0 {
+                    1
+                } else if b > 0 {
+                    3
+                } else {
+                    0
+                };
+                assert_eq!(crate::shadow::shadow_exit_code(a, b), want_exit);
+            }
+        }
     }
 
     // Not vacuous: `replay_cursor_monotone` with its branches swapped answers otherwise.

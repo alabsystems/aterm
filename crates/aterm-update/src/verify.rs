@@ -8,7 +8,12 @@ use aterm_uds::spawnfd::Command;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+/// A unit test's helper is a real program that finishes, so one a loaded machine slows is waited
+/// for to the hang detector; a test that needs the ceiling to fire opens an [`ApplyBudget`].
+#[cfg(test)]
+const HELPER_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 const HELPER_REAP: Duration = Duration::from_millis(250);
 

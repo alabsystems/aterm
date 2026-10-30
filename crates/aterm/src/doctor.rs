@@ -974,10 +974,14 @@ fn run_pkg(
         child.arg(atpkg::cli::PRIVATE_STATE_ROOT_FLAG);
     }
     child.args(args);
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(budget)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
     match aterm_uds::deadline::output_until_from(
         &mut child,
         aterm_uds::spawnfd::Stdio::null(),
-        std::time::Instant::now() + budget,
+        deadline,
     ) {
         Ok(out) => Ok(Ran {
             status: out.status.code(),

@@ -596,7 +596,7 @@ impl CursorGlow {
                     }
                 }
                 #[cfg(test)]
-                let kept = !self.particles_on_bars;
+                let kept = !self.crackle_unkept;
                 #[cfg(not(test))]
                 let kept = true;
                 if kept {
@@ -776,6 +776,7 @@ impl CursorGlow {
                                 hue: 0.8 + r4 * 0.2,
                                 cov_scale: 1.0,
                                 born: now,
+                                latch: ParticleLatch::FRESH,
                                 edge_cut: false,
                             }
                         } else if r5 < pop_p + smolder_p {
@@ -789,6 +790,7 @@ impl CursorGlow {
                                 hue: r4 * 0.35,
                                 cov_scale: 1.0,
                                 born: now,
+                                latch: ParticleLatch::FRESH,
                                 edge_cut: false,
                             }
                         } else {
@@ -802,6 +804,7 @@ impl CursorGlow {
                                 hue: 0.35 + r4 * 0.45,
                                 cov_scale: 1.0,
                                 born: now,
+                                latch: ParticleLatch::FRESH,
                                 edge_cut: false,
                             }
                         }
@@ -826,6 +829,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    latch: ParticleLatch::FRESH,
                                     edge_cut: false,
                                 }
                             } else {
@@ -839,6 +843,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    latch: ParticleLatch::FRESH,
                                     edge_cut: false,
                                 }
                             }
@@ -854,6 +859,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    latch: ParticleLatch::FRESH,
                                     edge_cut: false,
                                 }
                             } else if r5 < bubble_p + drip_p {
@@ -867,6 +873,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    latch: ParticleLatch::FRESH,
                                     edge_cut: false,
                                 }
                             } else {
@@ -880,6 +887,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    latch: ParticleLatch::FRESH,
                                     edge_cut: false,
                                 }
                             }
@@ -899,6 +907,7 @@ impl CursorGlow {
                             hue: r4,
                             cov_scale: laser_cov_scale,
                             born: now,
+                            latch: ParticleLatch::FRESH,
                             edge_cut: false,
                         }
                     }
@@ -922,6 +931,7 @@ impl CursorGlow {
                             hue: r4,
                             cov_scale: 1.0,
                             born: now,
+                            latch: ParticleLatch::FRESH,
                             edge_cut: false,
                         }
                     }
@@ -961,6 +971,7 @@ impl CursorGlow {
                             hue: r4,
                             cov_scale: 1.0,
                             born: now,
+                            latch: ParticleLatch::FRESH,
                             edge_cut: false,
                         }
                     }
@@ -987,6 +998,7 @@ impl CursorGlow {
                             hue: (hue0 + r5 * 0.3).fract(),
                             cov_scale: 1.0,
                             born: now,
+                            latch: ParticleLatch::FRESH,
                             edge_cut: false,
                         }
                     }
@@ -1013,6 +1025,7 @@ impl CursorGlow {
                             hue: (hue0 + r5 * 0.3).fract(),
                             cov_scale: 1.0,
                             born: now,
+                            latch: ParticleLatch::FRESH,
                             edge_cut: false,
                         }
                     }
@@ -1181,24 +1194,40 @@ impl CursorGlow {
         });
     }
 
-    /// Whether the bolt along `pts` meets, its corona's girth and all, a
-    /// filled cell of a row outside `rows` (a prompt's powerline bar) or
-    /// leaves its pane's grid ([`Self::keep_crackle_off_bars`],
-    /// [`Self::keep_strike_in_grid`]). A split's focused pane has its edge
-    /// inside the window's grid ([`FrameText::past_pane`]), where the GUI
-    /// clips the glow to the pane: read by the window's edge alone, a fork
-    /// that crossed the divider was cut there (looks9 round 3's review).
+    /// Whether the bolt along `pts` (`branch`: a fork or a crackle) meets,
+    /// its corona's girth and all, a filled cell of a row outside `rows` (a
+    /// prompt's powerline bar) or leaves its pane's grid
+    /// ([`Self::keep_crackle_off_bars`], [`Self::keep_strike_in_grid`]). A
+    /// split's focused pane has its edge inside the window's grid
+    /// ([`FrameText::past_pane`]), where the GUI clips the glow to the pane:
+    /// read by the window's edge alone, a fork that crossed the divider was
+    /// cut there (looks9 round 3's review). The girth is the one each
+    /// segment's slabs lay ([`Self::bolt_slab_half`]), across a steep
+    /// segment's width and a flat one's height: read as a fifth of a row
+    /// across the height alone, a strike's channel (0.55 of a row thick, its
+    /// slabs wider on a diagonal) still laid its corona past a split pane's
+    /// bottom edge and onto a bar the jump did not cross (looks9's review).
+    /// Along its major axis a segment's slabs tile whole pixels, from the
+    /// floor of its near end to the ceiling of its far one, so each end is
+    /// read a pixel past: read at the ends alone, a steep turn of the
+    /// channel in the grid's last pixel row lit it, cut at the card's
+    /// bottom edge (1 of 300 seeds of `a_strike_s_corona_keeps_inside_its_grid`).
     #[inline]
     fn bolt_meets_a_bar(
         &self,
         geom: Geom,
         page: u32,
         rows: (u16, u16),
-        (pts, half): (&[(f32, f32)], f32),
+        (pts, branch): (&[(f32, f32)], bool),
     ) -> bool {
         let page = page & 0x00FF_FFFF;
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+        #[cfg(test)]
+        let (narrow, ends_unread) = (self.bolt_girth_narrow, self.bolt_ends_unread);
+        #[cfg(not(test))]
+        let (narrow, ends_unread) = (false, false);
+        let corona_th = Self::bolt_corona_th(chf, branch);
         let frame_text = &self.frame_text;
         let (grid_rows, cols) = (geom.rows as i32, geom.cols as i32);
         #[cfg(test)]
@@ -1227,16 +1256,48 @@ impl CursorGlow {
         while wi + 1 < pts.len() {
             let ((xa, ya), (xb, yb)) = (pts[wi], pts[wi + 1]);
             wi += 1;
-            let n = ((xb - xa).abs().max((yb - ya).abs()) * inv_step_px)
+            let (dx, dy) = (xb - xa, yb - ya);
+            // The slabs' half girth and their axis: a steep segment's lie
+            // across its width, a flat one's across its height.
+            let (half, across_x) = if narrow {
+                (chf * 0.15 + 1.0, false)
+            } else {
+                (
+                    Self::bolt_slab_half(corona_th, (dx, dy)) + 1.0,
+                    dy.abs() >= dx.abs(),
+                )
+            };
+            // Every cell the girth spans, a half cell apart at most.
+            let reads = ((2.0 * half) / (0.5 * cwf.min(chf)).max(1.0))
                 .ceil()
-                .max(1.0) as usize;
-            let inv_nf = 1.0 / (n as f32);
+                .max(2.0) as usize;
+            // The slabs' whole-pixel tiling: a pixel past each end along the
+            // major axis, under either girth (the narrow control reverts the
+            // girth alone, `bolt_ends_unread` the ends alone).
+            let major = dx.abs().max(dy.abs());
+            let past = if ends_unread || major < 1e-3 {
+                0.0
+            } else {
+                1.0 / major
+            };
+            let n = ((major + 2.0 * past * major) * inv_step_px).ceil().max(1.0) as usize;
+            let inv_nf = (1.0 + 2.0 * past) / (n as f32);
             let mut k = 0;
             while k <= n {
-                let f = k as f32 * inv_nf;
-                let (x, y) = (xa + (xb - xa) * f, ya + (yb - ya) * f);
-                if on_bar(x, y) || on_bar(x, y - half) || on_bar(x, y + half) {
-                    return true;
+                let f = k as f32 * inv_nf - past;
+                let (x, y) = (xa + dx * f, ya + dy * f);
+                let mut j = 0;
+                while j <= reads {
+                    let off = -half + 2.0 * half * j as f32 / reads as f32;
+                    let met = if across_x {
+                        on_bar(x + off, y)
+                    } else {
+                        on_bar(x, y + off)
+                    };
+                    if met {
+                        return true;
+                    }
+                    j += 1;
                 }
                 k += 1;
             }
@@ -1244,21 +1305,32 @@ impl CursorGlow {
         false
     }
 
-    /// A fork's or a crackle's corona's half girth ([`Self::emit_bolts`]
-    /// strokes it 0.30 of a row across) and a pixel.
+    /// The thickness of a bolt's corona, its widest stroke
+    /// ([`Self::emit_bolts`]): a fork's or a crackle's (`branch`), or a
+    /// strike's channel.
     #[inline]
-    const fn bolt_half_girth(ch: f32) -> f32 {
-        ch * 0.15 + 1.0
+    pub(super) const fn bolt_corona_th(ch: f32, branch: bool) -> f32 {
+        ch * if branch { 0.30 } else { 0.55 }
     }
 
-    /// A strike's main channel's corona's half girth ([`Self::emit_bolts`]
-    /// strokes it 0.55 of a row across) and a pixel. Kept inside its grid by
-    /// a fork's girth, the channel's corona stood cut at the grid's bottom
-    /// edge, 3 px of lavender along the settings card's last pixel row under
-    /// the Return's strike (looks10 round 3, after main's card edge law).
+    /// The half girth of the slabs a stroke `thickness` px thick lays along
+    /// a segment `(dx, dy)` ([`aterm_render::comet_beam`]'s polyline): its
+    /// half thickness widened by the segment's slant over its major axis, up
+    /// to the square root of two and half a pixel.
     #[inline]
-    const fn strike_half_girth(ch: f32) -> f32 {
-        ch * 0.275 + 1.0
+    const fn bolt_slab_half(thickness: f32, (dx, dy): (f32, f32)) -> f32 {
+        let half_perp = (thickness * 0.5).max(0.5);
+        let seg = crate::color_math::hypot_f32(dx, dy);
+        let major = dx.abs().max(dy.abs()).max(1e-3);
+        (half_perp * seg / major).min(half_perp * std::f32::consts::SQRT_2 + 0.5)
+    }
+
+    /// A bolt's corona's widest half girth ([`Self::bolt_slab_half`] on a
+    /// diagonal) and a pixel.
+    #[inline]
+    const fn bolt_half_girth(ch: f32, branch: bool) -> f32 {
+        let half_perp = (Self::bolt_corona_th(ch, branch) * 0.5).max(0.5);
+        half_perp * std::f32::consts::SQRT_2 + 0.5 + 1.0
     }
 
     /// Keep the crackle just spawned (the last bolt) off every filled cell
@@ -1282,10 +1354,10 @@ impl CursorGlow {
             return;
         }
         let chf = geom.ch as f32;
-        let half = Self::bolt_half_girth(chf);
+        let half = Self::bolt_half_girth(chf, true);
         let rows = (caret_row, caret_row);
         let laid = bolt.pts;
-        if !self.bolt_meets_a_bar(geom, page, rows, (laid.as_slice(), half)) {
+        if !self.bolt_meets_a_bar(geom, page, rows, (laid.as_slice(), true)) {
             return;
         }
         #[cfg(test)]
@@ -1319,9 +1391,9 @@ impl CursorGlow {
             flat_slice[fi].1 = y0 + (flat_slice[fi].1 - y0) * k;
             fi += 1;
         }
-        let keep = if !self.bolt_meets_a_bar(geom, page, rows, (mirrored.as_slice(), half)) {
+        let keep = if !self.bolt_meets_a_bar(geom, page, rows, (mirrored.as_slice(), true)) {
             Some(mirrored)
-        } else if !self.bolt_meets_a_bar(geom, page, rows, (flat.as_slice(), half)) {
+        } else if !self.bolt_meets_a_bar(geom, page, rows, (flat.as_slice(), true)) {
             Some(flat)
         } else {
             None
@@ -1343,10 +1415,11 @@ impl CursorGlow {
     /// cross (`rows`, its start's and its end's), its corona's girth and
     /// all: a fork aimed at a pane's edge was cut there to a lone violet
     /// fragment (the paper gallery's `split`, looks9 round 2's Q8). The
-    /// channel's jag is eased toward its chord until it meets none (the
-    /// chord, between the two cells' centres, meets none), its forks moved
+    /// channel's jag is eased toward its chord (between the two cells'
+    /// centres) until it meets none, its forks moved
     /// with their roots; a fork that meets one is mirrored about its root's
-    /// row to aim away, and dropped if that meets one too.
+    /// row to aim away, and dropped if that meets one too. A strike whose
+    /// chord's corona leaves the pane is not laid.
     #[inline]
     pub(super) fn keep_strike_in_grid(
         &mut self,
@@ -1383,21 +1456,23 @@ impl CursorGlow {
         let laid = self.bolts[channel].pts;
         let mut eased = laid;
         let pts = laid.as_slice();
-        let chf = geom.ch as f32;
+        // The channel is kept by its own corona's girth (0.55 of a row
+        // across, [`Self::bolt_corona_th`]). Kept inside its grid by a fork's
+        // girth, the channel's corona stood cut at the grid's bottom edge, 3
+        // px of lavender along the settings card's last pixel row under the
+        // Return's strike (looks10 round 3, after main's card edge law); its
+        // negative control (`strike_channel_fork_girth`) reads it as a fork.
         #[cfg(test)]
-        let girth = if self.strike_channel_fork_girth {
-            Self::bolt_half_girth(chf)
-        } else {
-            Self::strike_half_girth(chf)
-        };
+        let channel_as_fork = self.strike_channel_fork_girth;
         #[cfg(not(test))]
-        let girth = Self::strike_half_girth(chf);
-        let fork_girth = Self::bolt_half_girth(chf);
+        let channel_as_fork = false;
         if let (Some(&a), Some(&b)) = (pts.first(), pts.last()) {
             let (dx, dy) = (b.0 - a.0, b.1 - a.1);
             let inv = 1.0 / (dx * dx + dy * dy).max(1e-3);
             let mut k = 1.0f32;
-            while k > 0.0 && self.bolt_meets_a_bar(geom, page, rows, (eased.as_slice(), girth)) {
+            while k > 0.0
+                && self.bolt_meets_a_bar(geom, page, rows, (eased.as_slice(), channel_as_fork))
+            {
                 k = (k - 0.25).max(0.0);
                 let eased_slice = eased.as_mut_slice();
                 let mut pi = 0;
@@ -1409,6 +1484,13 @@ impl CursorGlow {
                         (chord.0 + (p.0 - chord.0) * k, chord.1 + (p.1 - chord.1) * k);
                     pi += 1;
                 }
+            }
+            if self.bolt_meets_a_bar(geom, page, rows, (eased.as_slice(), channel_as_fork)) {
+                // Even the chord's corona leaves the pane (a jump down the
+                // pane's first or last column, the channel's slabs wider
+                // than half a cell): no strike.
+                self.bolts.truncate(first);
+                return;
             }
             self.bolts[channel].pts = eased;
         }
@@ -1442,7 +1524,7 @@ impl CursorGlow {
                     }
                 }
             }
-            if self.bolt_meets_a_bar(geom, page, rows, (fork.as_slice(), fork_girth)) {
+            if self.bolt_meets_a_bar(geom, page, rows, (fork.as_slice(), true)) {
                 let y0 = fork.as_slice().first().map_or(0.0, |p| p.1);
                 let fork_slice = fork.as_mut_slice();
                 let mut fi = 0;
@@ -1450,7 +1532,7 @@ impl CursorGlow {
                     fork_slice[fi].1 = 2.0 * y0 - fork_slice[fi].1;
                     fi += 1;
                 }
-                if self.bolt_meets_a_bar(geom, page, rows, (fork.as_slice(), fork_girth)) {
+                if self.bolt_meets_a_bar(geom, page, rows, (fork.as_slice(), true)) {
                     self.bolts.remove(i);
                     continue;
                 }
@@ -1501,6 +1583,7 @@ impl CursorGlow {
                 hue: 0.35 + r4 * 0.5,
                 cov_scale: 1.0,
                 born: now,
+                latch: ParticleLatch::FRESH,
                 edge_cut: false,
             });
         }
@@ -1736,6 +1819,7 @@ impl CursorGlow {
                         hue: r4,
                         cov_scale: 1.0,
                         born: now,
+                        latch: ParticleLatch::FRESH,
                         edge_cut: false,
                     });
                     k += 1;
@@ -1806,6 +1890,7 @@ impl CursorGlow {
                 hue: r0,
                 cov_scale: ERASE_ROUND_SCALE,
                 born: now,
+                latch: ParticleLatch::FRESH,
                 edge_cut: false,
             });
             k += 1;
@@ -1823,6 +1908,7 @@ impl CursorGlow {
                 hue: 0.02,
                 cov_scale: ERASE_HERO_SCALE_MIN + ERASE_HERO_SCALE_SPAN * heft,
                 born: now,
+                latch: ParticleLatch::FRESH,
                 edge_cut: false,
             });
         }

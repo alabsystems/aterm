@@ -158,6 +158,72 @@ pub const fn wide_spacer_col_clamp(next_col: u64, line_end: u64) -> u64 {
     }
 }
 
+/// `sync_bytes_clamp` as `sync_island.rs` defines it in Clean:
+/// `if proposed_bytes < byte_cap then proposed_bytes else byte_cap`.
+#[must_use]
+pub const fn sync_bytes_clamp(proposed_bytes: u64, byte_cap: u64) -> u64 {
+    if proposed_bytes < byte_cap {
+        proposed_bytes
+    } else {
+        byte_cap
+    }
+}
+
+/// `sync_hold_ticks_clamp` as `sync_island.rs` defines it in Clean:
+/// `if proposed_ticks < tick_cap then proposed_ticks else tick_cap`.
+#[must_use]
+pub const fn sync_hold_ticks_clamp(proposed_ticks: u64, tick_cap: u64) -> u64 {
+    if proposed_ticks < tick_cap {
+        proposed_ticks
+    } else {
+        tick_cap
+    }
+}
+
+/// `vs_width_clamp` as `vs_island.rs` defines it in Clean:
+/// `if proposed_width < max_width then proposed_width else max_width`.
+#[must_use]
+pub const fn vs_width_clamp(proposed_width: u64, max_width: u64) -> u64 {
+    if proposed_width < max_width {
+        proposed_width
+    } else {
+        max_width
+    }
+}
+
+/// `vs_cursor_advance_clamp` as `vs_island.rs` defines it in Clean:
+/// `if next_col < line_end then next_col else line_end`.
+#[must_use]
+pub const fn vs_cursor_advance_clamp(next_col: u64, line_end: u64) -> u64 {
+    if next_col < line_end {
+        next_col
+    } else {
+        line_end
+    }
+}
+
+/// `echo_queue_len_clamp` as `overlap_echo_island.rs` defines it in Clean:
+/// `if proposed_len < cap then proposed_len else cap`.
+#[must_use]
+pub const fn echo_queue_len_clamp(proposed_len: u64, cap: u64) -> u64 {
+    if proposed_len < cap {
+        proposed_len
+    } else {
+        cap
+    }
+}
+
+/// `echo_matched_advance` as `overlap_echo_island.rs` defines it in Clean:
+/// `if cur_off < cand_off then cand_off else cur_off`.
+#[must_use]
+pub const fn echo_matched_advance(cur_off: u64, cand_off: u64) -> u64 {
+    if cur_off < cand_off {
+        cand_off
+    } else {
+        cur_off
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -257,6 +323,34 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::wide_spacer_col_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::events::sync_bytes_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::sync_bytes_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::events::sync_hold_ticks_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::sync_hold_ticks_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::screen::vs_width_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::vs_width_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::screen::vs_cursor_advance_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::vs_cursor_advance_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::overlap_echo::echo_queue_len_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::echo_queue_len_clamp(a, b)), want);
+        let want = "012112222";
+        assert_eq!(
+            answers(|[a, b]| crate::overlap_echo::echo_matched_advance(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::echo_matched_advance(a, b)), want);
     }
 
     // Not vacuous: `echo_watermark_monotone` with its branches swapped answers otherwise.

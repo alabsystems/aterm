@@ -76,15 +76,11 @@ fn golden(port: u16) -> String {
 #[test]
 fn post_writes_the_golden_bytes() {
     let (port, rx) = recording_listener();
-    let response = Client::new(
-        Trust::Roots(Vec::new()),
-        ProxyMode::Direct,
-        Duration::from_secs(10),
-    )
-    .post(&format!("http://127.0.0.1:{port}/v1/x"))
-    .header("X-A", "1")
-    .send_with_env(b"hello", &NoEnv)
-    .expect("the listener answers 204");
+    let response = Client::new(Trust::Roots(Vec::new()), ProxyMode::Direct, HANG_DETECTOR)
+        .post(&format!("http://127.0.0.1:{port}/v1/x"))
+        .header("X-A", "1")
+        .send_with_env(b"hello", &NoEnv)
+        .expect("the listener answers 204");
     assert_eq!(response.status(), 204);
     let seen = rx.recv_timeout(HANG_DETECTOR).unwrap();
     assert_eq!(String::from_utf8_lossy(&seen), golden(port));
@@ -93,19 +89,15 @@ fn post_writes_the_golden_bytes() {
 #[test]
 fn caller_framing_headers_are_dropped_from_the_golden_bytes() {
     let (port, rx) = recording_listener();
-    Client::new(
-        Trust::Roots(Vec::new()),
-        ProxyMode::Direct,
-        Duration::from_secs(10),
-    )
-    .post(&format!("http://127.0.0.1:{port}/v1/x"))
-    .header("Host", "evil.test")
-    .header("X-A", "1")
-    .header("Content-Length", "99")
-    .header("Connection", "keep-alive")
-    .header("Transfer-Encoding", "chunked")
-    .send_with_env(b"hello", &NoEnv)
-    .expect("the listener answers 204");
+    Client::new(Trust::Roots(Vec::new()), ProxyMode::Direct, HANG_DETECTOR)
+        .post(&format!("http://127.0.0.1:{port}/v1/x"))
+        .header("Host", "evil.test")
+        .header("X-A", "1")
+        .header("Content-Length", "99")
+        .header("Connection", "keep-alive")
+        .header("Transfer-Encoding", "chunked")
+        .send_with_env(b"hello", &NoEnv)
+        .expect("the listener answers 204");
     let seen = rx.recv_timeout(HANG_DETECTOR).unwrap();
     assert_eq!(String::from_utf8_lossy(&seen), golden(port));
 }

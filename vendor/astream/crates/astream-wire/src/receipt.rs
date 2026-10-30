@@ -946,6 +946,432 @@ impl fmt::Display for V1Receipt {
     }
 }
 
+/// State reported on a node's halt acknowledgment face (`/f/<F>/pub/<node>/node/ack`,
+/// `DESIGN-aterm-fabric.md` §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAckState {
+    /// Every live session on the node has been placed under the fleet drive hold.
+    Held,
+    /// The fleet drive hold has been lifted across the node's sessions.
+    Ready,
+}
+
+impl NodeAckState {
+    /// Closed vocabulary of node halt-ack states (`held`, `ready`).
+    pub const ALL: [Self; 2] = [Self::Held, Self::Ready];
+
+    /// Canonical lowercase wire token (`held`, `ready`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Ready => "ready",
+        }
+    }
+
+    /// Parse a canonical node-ack state byte slice.
+    pub const fn parse_bytes(s: &[u8]) -> Result<Self, ReceiptError> {
+        let mut rest: &[Self] = &Self::ALL;
+        while let &[st, ref tail @ ..] = rest {
+            if bytes_eq(s, st.as_str().as_bytes()) {
+                return Ok(st);
+            }
+            rest = tail;
+        }
+        Err(ReceiptError::InvalidVerdict)
+    }
+
+    /// Parse a canonical node-ack state token.
+    pub const fn parse(s: &str) -> Result<Self, ReceiptError> {
+        Self::parse_bytes(s.as_bytes())
+    }
+}
+
+impl fmt::Display for NodeAckState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const fn view_node_ack_state(bytes: &[u8]) -> Result<(NodeAckState, Option<&[u8]>), ReceiptError> {
+    let mut rest: &[NodeAckState] = &NodeAckState::ALL;
+    while let &[st, ref tail @ ..] = rest {
+        if let Some(next) = whole_value(bytes, st.as_str().as_bytes()) {
+            return Ok((st, next));
+        }
+        rest = tail;
+    }
+    Err(ReceiptError::InvalidVerdict)
+}
+
+/// View of a node's retained halt answer on `/f/<F>/pub/<node>/node/ack`
+/// (`v=1 t=<ms> re=<halt-offset> state=held|ready`, `DESIGN-aterm-fabric.md` §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V1NodeAck {
+    /// Offset of the newest `/f/<F>/fleet/<h>/halt` transition this node reached (`re=`).
+    pub re: Offset,
+    /// Endpoint hold state reached for `re` (`held` or `ready`).
+    pub state: NodeAckState,
+    /// Sender wall clock (`t=`), informational; `None` when omitted.
+    pub sender_t_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum StateAckKey<'a> {
+    End,
+    Skip(Option<&'a [u8]>),
+    V(&'a [u8]),
+    T(&'a [u8]),
+    Re(&'a [u8]),
+    State(&'a [u8]),
+}
+
+const fn classify_state_ack_key(rem: &[u8]) -> StateAckKey<'_> {
+    let &[b0, ref r1 @ ..] = rem else {
+        return StateAckKey::End;
+    };
+    match b0 {
+        b'\n' => StateAckKey::End,
+        b' ' => StateAckKey::Skip(Some(r1)),
+        b'v' => {
+            if let &[b'=', ref val @ ..] = r1 {
+                StateAckKey::V(val)
+            } else {
+                StateAckKey::Skip(after_value(rem))
+            }
+        }
+        b't' => {
+            if let &[b'=', ref val @ ..] = r1 {
+                StateAckKey::T(val)
+            } else {
+                StateAckKey::Skip(after_value(rem))
+            }
+        }
+        b'r' => {
+            if let &[b'e', b'=', ref val @ ..] = r1 {
+                StateAckKey::Re(val)
+            } else {
+                StateAckKey::Skip(after_value(rem))
+            }
+        }
+        b's' => {
+            if let &[b't', b'a', b't', b'e', b'=', ref val @ ..] = r1 {
+                StateAckKey::State(val)
+            } else {
+                StateAckKey::Skip(after_value(rem))
+            }
+        }
+        _ => StateAckKey::Skip(after_value(rem)),
+    }
+}
+
+impl V1NodeAck {
+    /// Decode a `/f/<F>/pub/<node>/node/ack` body (`v=1 [t=<ms>] re=<off> state=held|ready`).
+    pub const fn decode(body: &[u8]) -> Result<Self, ReceiptError> {
+        let mut v1 = false;
+        let mut sender_t_ms: Option<u64> = None;
+        let mut re: Option<Offset> = None;
+        let mut state: Option<NodeAckState> = None;
+        let mut rest = Some(body);
+        while let Some(rem) = rest {
+            rest = match classify_state_ack_key(rem) {
+                StateAckKey::End => None,
+                StateAckKey::Skip(next) => next,
+                StateAckKey::V(val) => {
+                    if v1 {
+                        return Err(ReceiptError::MissingOrDuplicateField("v"));
+                    }
+                    let Some(next) = whole_value(val, b"1") else {
+                        return Err(ReceiptError::UnknownVersion);
+                    };
+                    v1 = true;
+                    next
+                }
+                StateAckKey::T(val) => {
+                    if sender_t_ms.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("t"));
+                    }
+                    match view_u64(val, "t") {
+                        Ok((t, next)) => {
+                            sender_t_ms = Some(t);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                StateAckKey::Re(val) => {
+                    if re.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("re"));
+                    }
+                    match view_u64(val, "re") {
+                        Ok((off, next)) => {
+                            re = Some(Offset(off));
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                StateAckKey::State(val) => {
+                    if state.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("state"));
+                    }
+                    match view_node_ack_state(val) {
+                        Ok((st, next)) => {
+                            state = Some(st);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+        }
+        if !v1 {
+            return Err(ReceiptError::MissingOrDuplicateField("v"));
+        }
+        let Some(re) = re else {
+            return Err(ReceiptError::MissingOrDuplicateField("re"));
+        };
+        let Some(state) = state else {
+            return Err(ReceiptError::MissingOrDuplicateField("state"));
+        };
+        Ok(Self {
+            re,
+            state,
+            sender_t_ms,
+        })
+    }
+
+    /// Encode into canonical `v=1 [t=<ms>] re=<off> state=held|ready` form.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        match self.sender_t_ms {
+            Some(t) => format!("v=1 t={t} re={} state={}", self.re.0, self.state.as_str()),
+            None => format!("v=1 re={} state={}", self.re.0, self.state.as_str()),
+        }
+    }
+
+    /// Judge this single-subject node row against `halt_offset` (`DESIGN-aterm-fabric.md` §5.3):
+    /// returns `Some(self.state)` iff `self.re == halt_offset`. When `self.re > halt_offset`,
+    /// the node overwrote its single row with a later halt transition (so the earlier halt is
+    /// unknown, not absent); when `self.re < halt_offset`, the node has not yet acked it.
+    #[must_use]
+    pub const fn answers_halt_at(&self, halt_offset: Offset) -> Option<NodeAckState> {
+        if self.re.0 == halt_offset.0 {
+            Some(self.state)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for V1NodeAck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.encode())
+    }
+}
+
+/// State reported on a member's barrier answer face (`/f/<F>/pub/<owner>/ack/<B>`,
+/// `DESIGN-aterm-fabric.md` §4.2, §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierAckState {
+    /// Member explicitly consented / reached the barrier (`ready`).
+    Ready,
+    /// Bridge auto-answered liveness while member was mid-turn (`busy`).
+    Busy,
+    /// Member explicitly refused the barrier (`refused`).
+    Refused,
+    /// Bridge auto-answered that the session has exited (`absent`).
+    Absent,
+    /// Member is held under a fleet halt (`held`).
+    Held,
+}
+
+impl BarrierAckState {
+    /// Closed vocabulary of barrier-ack states (`ready|busy|refused|absent|held`, §4.2).
+    pub const ALL: [Self; 5] = [
+        Self::Ready,
+        Self::Busy,
+        Self::Refused,
+        Self::Absent,
+        Self::Held,
+    ];
+
+    /// Canonical lowercase wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Busy => "busy",
+            Self::Refused => "refused",
+            Self::Absent => "absent",
+            Self::Held => "held",
+        }
+    }
+
+    /// Whether this state is an automatic bridge liveness echo (`busy` or `absent`) rather
+    /// than explicit member consent/refusal (`DESIGN-aterm-fabric.md` §5.4).
+    #[must_use]
+    pub const fn is_liveness_only(self) -> bool {
+        matches!(self, Self::Busy | Self::Absent)
+    }
+
+    /// Parse a canonical barrier-ack state byte slice.
+    pub const fn parse_bytes(s: &[u8]) -> Result<Self, ReceiptError> {
+        let mut rest: &[Self] = &Self::ALL;
+        while let &[st, ref tail @ ..] = rest {
+            if bytes_eq(s, st.as_str().as_bytes()) {
+                return Ok(st);
+            }
+            rest = tail;
+        }
+        Err(ReceiptError::InvalidVerdict)
+    }
+
+    /// Parse a canonical barrier-ack state token.
+    pub const fn parse(s: &str) -> Result<Self, ReceiptError> {
+        Self::parse_bytes(s.as_bytes())
+    }
+}
+
+impl fmt::Display for BarrierAckState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const fn view_barrier_ack_state(
+    bytes: &[u8],
+) -> Result<(BarrierAckState, Option<&[u8]>), ReceiptError> {
+    let mut rest: &[BarrierAckState] = &BarrierAckState::ALL;
+    while let &[st, ref tail @ ..] = rest {
+        if let Some(next) = whole_value(bytes, st.as_str().as_bytes()) {
+            return Ok((st, next));
+        }
+        rest = tail;
+    }
+    Err(ReceiptError::InvalidVerdict)
+}
+
+/// View of a member's retained barrier answer on `/f/<F>/pub/<owner>/ack/<B>`
+/// (`v=1 [t=<ms>] [re=<B>] state=ready|busy|refused|absent|held [reason=…]`, §4.2, §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V1BarrierAck {
+    /// Optional explicit `re=<B>` offset in the body (when absent, `<B>` comes from the
+    /// subject's trailing segment).
+    pub re: Option<Offset>,
+    /// Reported barrier state (`ready`, `busy`, `refused`, `absent`, or `held`).
+    pub state: BarrierAckState,
+    /// Sender wall clock (`t=`), informational; `None` when omitted.
+    pub sender_t_ms: Option<u64>,
+}
+
+impl V1BarrierAck {
+    /// Decode a `/f/<F>/pub/<owner>/ack/<B>` body (`v=1 [t=<ms>] [re=<B>] state=<word>`).
+    pub const fn decode(body: &[u8]) -> Result<Self, ReceiptError> {
+        let mut v1 = false;
+        let mut sender_t_ms: Option<u64> = None;
+        let mut re: Option<Offset> = None;
+        let mut state: Option<BarrierAckState> = None;
+        let mut rest = Some(body);
+        while let Some(rem) = rest {
+            rest = match classify_state_ack_key(rem) {
+                StateAckKey::End => None,
+                StateAckKey::Skip(next) => next,
+                StateAckKey::V(val) => {
+                    if v1 {
+                        return Err(ReceiptError::MissingOrDuplicateField("v"));
+                    }
+                    let Some(next) = whole_value(val, b"1") else {
+                        return Err(ReceiptError::UnknownVersion);
+                    };
+                    v1 = true;
+                    next
+                }
+                StateAckKey::T(val) => {
+                    if sender_t_ms.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("t"));
+                    }
+                    match view_u64(val, "t") {
+                        Ok((t, next)) => {
+                            sender_t_ms = Some(t);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                StateAckKey::Re(val) => {
+                    if re.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("re"));
+                    }
+                    match view_u64(val, "re") {
+                        Ok((off, next)) => {
+                            re = Some(Offset(off));
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                StateAckKey::State(val) => {
+                    if state.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("state"));
+                    }
+                    match view_barrier_ack_state(val) {
+                        Ok((st, next)) => {
+                            state = Some(st);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+        }
+        if !v1 {
+            return Err(ReceiptError::MissingOrDuplicateField("v"));
+        }
+        let Some(state) = state else {
+            return Err(ReceiptError::MissingOrDuplicateField("state"));
+        };
+        Ok(Self {
+            re,
+            state,
+            sender_t_ms,
+        })
+    }
+
+    /// Encode into canonical `v=1 [t=<ms>] [re=<B>] state=<word>` form.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let t = match self.sender_t_ms {
+            Some(t) => format!(" t={t}"),
+            None => String::new(),
+        };
+        match self.re {
+            Some(re) => format!("v=1{t} re={} state={}", re.0, self.state.as_str()),
+            None => format!("v=1{t} state={}", self.state.as_str()),
+        }
+    }
+
+    /// Validate that a `Last{/f/<F>/pub/*/*/ack/<B>}` row at `record_offset` genuinely
+    /// answers `barrier_offset` (`DESIGN-aterm-fabric.md` §5.4: discard any pre-published
+    /// `ack/<B>` whose own log offset is `< B`, or whose explicit `re=` disagrees with `B`).
+    #[must_use]
+    pub const fn valid_for_barrier(&self, record_offset: Offset, barrier_offset: Offset) -> bool {
+        if record_offset.0 < barrier_offset.0 {
+            return false;
+        }
+        match self.re {
+            Some(re) => re.0 == barrier_offset.0,
+            None => true,
+        }
+    }
+}
+
+impl fmt::Display for V1BarrierAck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.encode())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,5 +1793,45 @@ mod tests {
         assert_eq!(FabricReceipt::tick_clock(1_000, 950), 1_000);
         assert_eq!(FabricReceipt::tick_clock(1_000, 1_000), 1_000);
         assert_eq!(FabricReceipt::tick_clock(1_000, 1_250), 1_250);
+    }
+
+    #[test]
+    fn v1_node_ack_and_v1_barrier_ack_roundtrip_and_guard_invariants() {
+        for state in NodeAckState::ALL {
+            let ack = V1NodeAck {
+                re: Offset(42),
+                state,
+                sender_t_ms: Some(1_700_000_000_500),
+            };
+            let encoded = ack.encode();
+            assert_eq!(V1NodeAck::decode(encoded.as_bytes()), Ok(ack));
+            assert_eq!(ack.answers_halt_at(Offset(42)), Some(state));
+            assert_eq!(ack.answers_halt_at(Offset(41)), None);
+            assert_eq!(ack.answers_halt_at(Offset(43)), None);
+        }
+        assert!(V1NodeAck::decode(b"v=1 re=7 state=invalid").is_err());
+        assert!(V1NodeAck::decode(b"v=1 state=held").is_err());
+
+        for state in BarrierAckState::ALL {
+            let back = V1BarrierAck {
+                re: Some(Offset(100)),
+                state,
+                sender_t_ms: Some(9_000),
+            };
+            assert_eq!(
+                V1BarrierAck::decode(format!("{} reason=ok", back.encode()).as_bytes()),
+                Ok(back)
+            );
+            assert!(back.valid_for_barrier(Offset(100), Offset(100)));
+            assert!(back.valid_for_barrier(Offset(105), Offset(100)));
+            // Pre-published ack/<B> (`record_offset < B`) or mismatched `re=` is rejected (§5.4).
+            assert!(!back.valid_for_barrier(Offset(99), Offset(100)));
+            assert!(!back.valid_for_barrier(Offset(105), Offset(101)));
+        }
+        assert!(BarrierAckState::Busy.is_liveness_only());
+        assert!(BarrierAckState::Absent.is_liveness_only());
+        assert!(!BarrierAckState::Ready.is_liveness_only());
+        assert!(!BarrierAckState::Refused.is_liveness_only());
+        assert!(!BarrierAckState::Held.is_liveness_only());
     }
 }

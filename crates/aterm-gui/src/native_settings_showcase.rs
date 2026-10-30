@@ -21,8 +21,8 @@ pub(super) use view::forget_strip_names;
 pub(super) use view::{
     Between, BlocksShared, ChooserFits, Held, ListRoom, PanelAt, Place, SharedBlocks, SharedDemo,
     SharedHeading, SharedSheet, SharedSheetRows, SharedStrip, blocks_between, caption_over_row,
-    demo_font_candidate, demo_spec, laid_last, led_first_screen_least, list_laid, list_room,
-    listed_least, row_filtered_out, row_under_caption, themes_page,
+    demo_font_candidate, demo_spec, footer_reach, laid_last, led_first_screen_least, list_laid,
+    list_room, listed_least, row_filtered_out, row_under_caption, rows_apart, themes_page,
 };
 #[cfg(test)]
 pub(super) use view::{list_blocks, list_heights, row_height as chooser_row_height, section_items};
@@ -692,12 +692,19 @@ impl SettingsViewState {
                 UiKey::new(format!("{CARD_PREFIX}{}", self.showcase.cards[index].slug))
             });
         // The reveal a pinned filter's first result replaces, kept across its changes.
-        let before = match self.first_beside.take() {
-            Some((key, was)) if self.page_reveal.as_ref() == Some(&key) => was,
-            _ => (self.reveal_as == scroll::Reveal::Keep)
-                .then(|| self.page_reveal.clone())
-                .flatten(),
+        let replaced = match self.first_beside.take() {
+            Some((key, was)) if self.page_reveal.as_ref() == Some(&key) => Some(was),
+            _ => None,
         };
+        let before = replaced.clone().unwrap_or_else(|| {
+            (self.reveal_as == scroll::Reveal::Keep)
+                .then(|| self.page_reveal.clone())
+                .flatten()
+        });
+        // A filter matching nothing gives back the reveal its earlier first result replaced.
+        if let Some(was) = replaced.filter(|_| first.is_none()) {
+            self.page_reveal = was;
+        }
         // A filter's earlier revealed result gives way to the new first result; a landing stays.
         if self.reveal_as == scroll::Reveal::Keep
             && self.page_reveal != self.common.last_focus

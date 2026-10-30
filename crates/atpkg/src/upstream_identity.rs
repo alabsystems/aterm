@@ -489,7 +489,7 @@ fn run_probe(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    crate::doctor::output_bounded_capturing(cmd, crate::prereq::PROBE_TIMEOUT)
+    crate::doctor::output_bounded_capturing(cmd, crate::doctor::probe_timeout())
 }
 
 /// What must be unchanged for a cached identity to still be the file's: the canonical path,

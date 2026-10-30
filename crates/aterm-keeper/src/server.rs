@@ -232,22 +232,38 @@ pub fn born(pid: u32) -> Option<Birth> {
 impl Server {
     /// Binds the keeper listener socket according to `config`.
     /// # Errors
-    /// Returns an error if the directory is not private, a live keeper holds the socket, or binding
-    /// fails.
+    /// Returns an error if the directory is not private, a non-socket or foreign node occupies the
+    /// path, a live keeper holds the socket, or binding fails.
     pub fn bind(config: ServeConfig) -> io::Result<Self> {
         let dir = config
             .socket
             .parent()
             .ok_or_else(|| io::Error::other("the socket path has no directory"))?;
         ensure_private_dir(dir)?;
-        if config.socket.exists() {
-            if CtlStream::connect(&config.socket).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("a keeper already answers on {}", config.socket.display()),
-                ));
+        match std::fs::symlink_metadata(&config.socket) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+            Ok(meta) => {
+                if !meta.file_type().is_socket() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} exists and is not a socket", config.socket.display()),
+                    ));
+                }
+                if meta.uid() != aterm_uds::peer::our_uid() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{} is not a socket of ours", config.socket.display()),
+                    ));
+                }
+                if CtlStream::connect(&config.socket).is_ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("a keeper already answers on {}", config.socket.display()),
+                    ));
+                }
+                std::fs::remove_file(&config.socket)?;
             }
-            std::fs::remove_file(&config.socket)?;
         }
         let listener = UnixListener::bind(&config.socket)?;
         // The keeper spawns every session's program: keep its sockets out of them all.
@@ -1653,5 +1669,62 @@ mod tests {
         assert_eq!(server.refused_dials, 0, "none turned away");
         drop((slow, fast, server));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bind_refuses_non_socket_and_symlink_paths_without_unlinking_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("akk-bind-nonsock-")
+            .tempdir()
+            .expect("exclusive fixture");
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("0700");
+
+        let regular = scratch.path().join("not-a.sock");
+        std::fs::write(&regular, b"keep").expect("write regular");
+        let err = match Server::bind(ServeConfig {
+            socket: regular.clone(),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        }) {
+            Ok(_) => panic!("regular file must not be unlinked and bound over"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read(&regular).expect("kept"), b"keep");
+
+        let link = scratch.path().join("link.sock");
+        std::os::unix::fs::symlink(&regular, &link).expect("symlink");
+        let err = match Server::bind(ServeConfig {
+            socket: link.clone(),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        }) {
+            Ok(_) => panic!("symlink must not be unlinked"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert_eq!(std::fs::read(&regular).expect("kept"), b"keep");
+
+        let dangling = scratch.path().join("dangling.sock");
+        std::os::unix::fs::symlink(scratch.path().join("missing"), &dangling).expect("dangling");
+        let err = match Server::bind(ServeConfig {
+            socket: dangling.clone(),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        }) {
+            Ok(_) => panic!("dangling symlink must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(std::fs::symlink_metadata(&dangling).is_ok());
     }
 }

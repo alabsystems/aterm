@@ -154,7 +154,10 @@ fn path(opts: &Opts, source: &str, version: &str) -> Option<PathBuf> {
 
 /// The note of build `version` in install `source`, if one was written.
 pub fn load(opts: &Opts, source: &str, version: &str) -> Option<Note> {
-    Note::from_json(&std::fs::read_to_string(path(opts, source, version)?).ok()?)
+    let text = crate::harness::accounts::read_bounded(&path(opts, source, version)?, 256 * 1024)
+        .ok()
+        .flatten()?;
+    Note::from_json(&text)
 }
 
 /// Writes `note` (a dry run writes nothing).
@@ -165,13 +168,7 @@ fn write(opts: &Opts, note: &Note) {
     let Some(path) = path(opts, &note.source, &note.version) else {
         return;
     };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, note.to_json()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = crate::harness::upgrade_models::write_atomic(&path, &note.to_json());
 }
 
 /// What `session`'s record, saved at `now` over `before` (the record on disk), says of its build's start: a failure it carries ([`note_failure`]) or a stop it takes back ([`taken_back`]).
@@ -543,7 +540,10 @@ pub fn probe(exe: &Path) -> Probe {
 
 /// [`probe`] with an explicit bound.
 pub(super) fn probe_within(exe: &Path, limit: Duration) -> Probe {
-    let deadline = std::time::Instant::now() + limit;
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(limit)
+        .unwrap_or_else(|| now + Duration::from_secs(3600));
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.arg(PROBE_ARG)
         .stdin(aterm_uds::spawnfd::Stdio::null())

@@ -350,6 +350,29 @@ impl OpenConsoleHost {
 /// How long a host has to write its first byte once its first client started.
 const HEALTH_WINDOW: Duration = Duration::from_millis(250);
 
+/// A test's [`HEALTH_WINDOW`] in milliseconds for every host this process starts (0: none set).
+#[cfg(any(test, debug_assertions))]
+static HEALTH_WINDOW_FOR_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Give every OpenConsole host this process starts `window` to write its first byte, in place
+/// of [`HEALTH_WINDOW`]: a test that needs the bundled host (not the inbox fallback a missed
+/// window picks) waits its hang detector, which a loaded machine's start-up cannot outrun.
+/// Development builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn set_health_window_for_test(window: Duration) {
+    let ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+    HEALTH_WINDOW_FOR_TEST.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`HEALTH_WINDOW`], or the window a test set ([`set_health_window_for_test`]).
+fn health_window() -> Duration {
+    #[cfg(any(test, debug_assertions))]
+    if let ms @ 1.. = HEALTH_WINDOW_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return Duration::from_millis(ms);
+    }
+    HEALTH_WINDOW
+}
+
 /// Launch `exe` as the host of a new pseudoconsole of `size` on `pipes`: winconpty's `_CreatePseudoConsole`, minus the token and WOW64 branches and minus its driver-load retry (a failure here falls back to the inbox host instead).
 pub(crate) fn launch(
     exe: &OpenConsoleExe,
@@ -467,7 +490,7 @@ pub(crate) fn await_started(host: &OpenConsoleHost, client: HANDLE, out_read: HA
     if image_of(client).is_some_and(|image| is_gui_image(&image)) {
         return Health::NoClient;
     }
-    let health = await_first_output(host.process.raw(), client, out_read, HEALTH_WINDOW);
+    let health = await_first_output(host.process.raw(), client, out_read, health_window());
     if let Health::Failed { .. } = health {
         // SAFETY: the host we launched, by its handle; a dead one ignores the call.
         unsafe { ffi::TerminateProcess(host.process.raw(), 1) };

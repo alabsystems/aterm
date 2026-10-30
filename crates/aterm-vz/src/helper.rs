@@ -705,13 +705,18 @@ impl<M: Machine> Core<M> {
         note!("booting:\n{}", plan.config_text(&limits));
         // The last boot's console is kept beside this one's (a bake's, once its clone boots).
         let _ = std::fs::rename(&plan.console_log, previous_console(&plan.console_log));
-        self.console_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&plan.console_log)
-            .map_err(|e| note!("console.log {}: {e}", plan.console_log.display()))
-            .ok();
+        self.console_file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&plan.console_log)
+                .map_err(|e| note!("console.log {}: {e}", plan.console_log.display()))
+                .ok()
+        };
         self.console = Console::new();
         self.watch = Some(Watch::new(now));
         self.watch_taken = false;

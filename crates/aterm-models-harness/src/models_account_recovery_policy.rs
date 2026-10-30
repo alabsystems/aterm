@@ -14,11 +14,12 @@ pub fn account_recovery_policy_model() -> Model {
             const Buggy = 0;
             var phase = 0; var provider = 1; var case = 1; var recovered = 0;
             action AnotherProvider when (phase == 0 && provider <= 3) { provider = provider + 1; }
-            action AnotherCase when (phase == 0 && case <= 29) { case = case + 1; }
+            action AnotherCase when (phase == 0 && case <= 30) { case = case + 1; }
             action Choose when (phase == 0) { phase = 1; }
             action Recover when (phase == 1) {
                 phase = 2;
-                recovered = if case == 27 || case == 28 || case == 29 {
+                recovered = if case == 31 { if Buggy == 33 {1} else {0} }
+                else if case == 27 || case == 28 || case == 29 {
                     if provider == 4 {
                         if (case == 27 && Buggy == 27) || (case == 28 && Buggy == 28)
                             || (case == 29 && Buggy == 31) {1} else {0}
@@ -46,7 +47,7 @@ pub fn account_recovery_policy_model() -> Model {
                 || ((case == 27 || case == 28 || case == 29) && provider <= 3);
             invariant AdmissibleRecoverySucceeds: phase <= 1
                 || (case > 1 && case <= 8) || (case > 9 && case <= 18)
-                || case == 21 || (case > 22 && case <= 26)
+                || case == 21 || case == 31 || (case > 22 && case <= 26)
                 || ((case == 27 || case == 28 || case == 29) && provider == 4)
                 || recovered == 1;
         }

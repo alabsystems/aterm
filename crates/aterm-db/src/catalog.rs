@@ -25,6 +25,9 @@ use policy::Policy;
 
 /// The catalog has its own slot; applications cannot displace it.
 pub(crate) const MAX_TABLES: usize = 63;
+/// The slots of [`MAX_TABLES`] the catalog's tables may take: the rest stay for the rings
+/// (`ring::RING_SLOTS`), whose storage never counts against these.
+pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS;
 pub(crate) const PER_CREATOR: usize = 8;
 pub(crate) const RECORDS_PER_CREATOR: usize = 64;
 pub(crate) const MAX_PAYLOAD: usize = 4096;
@@ -101,6 +104,18 @@ impl Directory {
         aterm_journal::create_private_dir_durable(&self.root)?;
         Store::join(session, &path, scope)
     }
+    /// The storage directories counted against the catalog's slots ([`CATALOG_SLOTS`], and the
+    /// catalog's own): every retained one but the ring tables this Mac holds
+    /// (`ring_storage`), out of `retained`'s `count`.
+    fn catalog_count(
+        &self,
+        session: &Session<'_>,
+        retained: &BTreeSet<Digest>,
+        count: usize,
+    ) -> usize {
+        let rings = self.ring_storage(session);
+        count.saturating_sub(retained.intersection(&rings).count())
+    }
     fn retained(&self) -> Result<(BTreeSet<Digest>, usize)> {
         let mut retained = BTreeSet::new();
         let mut count = 0;
@@ -150,7 +165,7 @@ impl Directory {
             ));
         }
         let mut catalog = self.catalog(session)?;
-        let snapshot = self.project(catalog.catalog(session)?, &Policy::default())?;
+        let snapshot = self.project(session, catalog.catalog(session)?, &Policy::default())?;
         let id = descriptor.scope.digest();
         if let Some(entry) = snapshot.entries.get(&id) {
             if entry.state == State::Conflict
@@ -192,12 +207,13 @@ impl Directory {
             return Err(Error::new("catalog author history limit reached"));
         }
         let (retained, count) = self.retained()?;
+        let count = self.catalog_count(session, &retained, count);
         let awaiting = snapshot
             .entries
             .iter()
             .filter(|(id, entry)| entry.state == State::Subscribed && !retained.contains(*id))
             .count();
-        if count + awaiting > MAX_TABLES {
+        if count + awaiting > CATALOG_SLOTS {
             return Err(Error::new("subscription capacity is already assigned"));
         }
         self.room(descriptor.scope)?;
@@ -221,11 +237,19 @@ impl Directory {
     }
     /// Current catalog view, revalidated against the locked control observation.
     pub fn snapshot(&self, session: &Session<'_>) -> Result<Snapshot> {
-        self.project(self.discovery_records(session)?, &Policy::default())
+        self.project(
+            session,
+            self.discovery_records(session)?,
+            &Policy::default(),
+        )
     }
     /// Local view with the same policy used by automatic network repair.
     pub fn snapshot_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
-        self.project(self.discovery_records(session)?, &Policy::read(config)?)
+        self.project(
+            session,
+            self.discovery_records(session)?,
+            &Policy::read(config)?,
+        )
     }
 
     /// Read locally retained declarations without enrolling or repairing storage.
@@ -246,7 +270,11 @@ impl Directory {
             }
             return Ok(Snapshot::default());
         };
-        self.project(self.discovery_records_from(session, &catalog)?, &policy)
+        self.project(
+            session,
+            self.discovery_records_from(session, &catalog)?,
+            &policy,
+        )
     }
 
     /// Read the catalog this Mac holds with default local projection policy, without enrolling
@@ -256,6 +284,7 @@ impl Directory {
         match Store::observe_if_exists(session, &self.path(scope)?, scope)? {
             None => Ok(Snapshot::default()),
             Some(catalog) => self.project(
+                session,
                 self.discovery_records_from(session, &catalog)?,
                 &Policy::default(),
             ),
@@ -293,7 +322,7 @@ impl Directory {
             return Ok(false);
         }
         let mut catalog = Store::open(session, &self.path(scope)?, scope)?;
-        let snapshot = self.project(catalog.catalog(session)?, &Policy::default())?;
+        let snapshot = self.project(session, catalog.catalog(session)?, &Policy::default())?;
         let Some(entry) = snapshot.entries.get(&retired.scope.digest()) else {
             return Ok(false);
         };
@@ -325,6 +354,7 @@ impl Directory {
             self.catalog_scope(),
         )?;
         self.project(
+            session,
             self.discovery_records_from(session, &catalog)?,
             &Policy::default(),
         )
@@ -348,6 +378,7 @@ impl Directory {
             self.catalog_scope(),
         )?;
         self.project(
+            session,
             self.discovery_records_from(session, &catalog)?,
             &Policy::read(config)?,
         )
@@ -371,7 +402,7 @@ impl Directory {
             return Ok(true);
         }
         Ok(self
-            .project(self.discovery_records(session)?, policy)?
+            .project(session, self.discovery_records(session)?, policy)?
             .entries
             .get(&id)
             .is_some_and(|entry| entry.state == State::Subscribed))
@@ -390,7 +421,11 @@ impl Directory {
         let Some(catalog) = Store::observe_if_exists(session, &self.path(scope)?, scope)? else {
             return Ok(None);
         };
-        let snapshot = self.project(self.discovery_records_from(session, &catalog)?, policy)?;
+        let snapshot = self.project(
+            session,
+            self.discovery_records_from(session, &catalog)?,
+            policy,
+        )?;
         let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
         for entry in snapshot
             .entries
@@ -474,7 +509,7 @@ impl Directory {
         if !policy.enabled || policy.excluded.contains(&scope.digest()) {
             return Ok(BTreeMap::new());
         }
-        let snapshot = self.project(self.discovery_records(session)?, policy)?;
+        let snapshot = self.project(session, self.discovery_records(session)?, policy)?;
         let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
         for entry in snapshot
             .entries
@@ -535,7 +570,12 @@ impl Directory {
         Ok(records)
     }
 
-    fn project(&self, records: Vec<crate::table::Record>, policy: &Policy) -> Result<Snapshot> {
+    fn project(
+        &self,
+        session: &Session<'_>,
+        records: Vec<crate::table::Record>,
+        policy: &Policy,
+    ) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
         let mut created: BTreeMap<Actor, BTreeSet<Digest>> = BTreeMap::new();
         let mut order = Vec::new();
@@ -575,8 +615,10 @@ impl Directory {
         }
         // Already enrolled tables retain their storage slots. A later low
         // digest cannot evict one, nor can exclusion silently reclaim custody.
+        // The rings' slots stay theirs: their storage counts against none of these.
         let (retained, count) = self.retained()?;
-        let mut free = (MAX_TABLES + 1).saturating_sub(count);
+        let count = self.catalog_count(session, &retained, count);
+        let mut free = (CATALOG_SLOTS + 1).saturating_sub(count);
         for (id, entry) in &mut snapshot.entries {
             let first = &entry.declarations[0].descriptor;
             entry.state = if entry.declarations.iter().any(|d| &d.descriptor != first) {

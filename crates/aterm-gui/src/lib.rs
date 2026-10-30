@@ -470,6 +470,10 @@ pub use trail_frame_reads::WindowTrailReads;
 #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
 #[doc(hidden)]
 pub use trail_rig::{TrailFrame, TrailRig};
+/// The yield at the host routes that lay the glow's under stream again (a windowed composed
+/// capture, the heterogeneous route), driven on the trail-diff rig at the glass level.
+#[cfg(all(test, unix))]
+mod glass_yield_host_tests;
 /// The host unreachability pin: no dark ground reaches the light fork through the frame path.
 #[cfg(all(test, unix))]
 mod light_fork_pin_tests;
@@ -17140,9 +17144,8 @@ impl App {
         let Some(alert) = crate::app_icon::alert(mtm) else {
             return Some(text);
         };
-        // SAFETY: standard `NSAlert` setters and sheet presentation on the main thread against a
-        // live `NSWindow`. The text setters copy; `-addButtonWithTitle:` and `-window` answer +0
-        // and are retained; AppKit copies the `BlockPtr`.
+        // SAFETY: standard `NSAlert` setters on the main thread. The text setters copy;
+        // `-addButtonWithTitle:` and `-window` answer +0 and are retained.
         let (panel, accept, cancel) = unsafe {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
@@ -17157,19 +17160,31 @@ impl App {
                 cancel_title.id(),
             ));
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
-            *payload.borrow_mut() = Some((wid, session, text, source, framing));
-            let begin_sheet: unsafe extern "C-unwind" fn(Id, Sel, Id, aterm_objc::BlockPtr) =
-                aterm_objc::checked_msg();
-            begin_sheet(
-                alert.id(),
-                sel!(beginSheetModalForWindow:completionHandler:),
-                ns_window.id(),
-                handler.as_block_ptr(),
-            );
             (panel, accept, cancel)
         };
-        let keys = match (panel.as_ref(), accept, cancel) {
-            (Some(panel), Some(accept), Some(cancel)) => alert_keys::watch_alert_keys(
+        // An untracked sheet would hold no `ConfirmationUp`, so `hwkey` could answer it: refuse
+        // the paste instead (the person pastes again).
+        let Some(panel) = panel else {
+            aterm_log::warn!(
+                "multiline-paste sheet: the alert reported no panel, so the sheet could not be \
+                 guarded; this paste ({} bytes) is dropped",
+                text.len(),
+            );
+            return None;
+        };
+        // Counted as on screen, and the key queue fenced, before the sheet shows: no key a burst
+        // posted (or one typed ahead) before the question was up answers it.
+        let up = alert_keys::ConfirmationUp::hold();
+        if !crate::hwkey::fence_queued_keys(mtm) {
+            aterm_log::warn!(
+                "multiline-paste sheet: the key queue would not drain, so a queued key could \
+                 answer the sheet; this paste ({} bytes) is dropped",
+                text.len(),
+            );
+            return None;
+        }
+        let keys = match (accept, cancel) {
+            (Some(accept), Some(cancel)) => alert_keys::watch_alert_keys(
                 panel.clone_retained(),
                 Some(ns_window.clone_retained()),
                 accept,
@@ -17184,16 +17199,21 @@ impl App {
                  will not answer it",
             );
         }
-        let Some(panel) = panel else {
-            aterm_log::warn!(
-                "multiline-paste sheet: the alert reported no panel, so this \
-                 confirmation is not tracked; it will still answer, but a second \
-                 multi-line paste could stack a second sheet",
+        // SAFETY: sheet presentation on the main thread against a live `NSWindow`; AppKit copies
+        // the `BlockPtr`.
+        unsafe {
+            *payload.borrow_mut() = Some((wid, session, text, source, framing));
+            let begin_sheet: unsafe extern "C-unwind" fn(Id, Sel, Id, aterm_objc::BlockPtr) =
+                aterm_objc::checked_msg();
+            begin_sheet(
+                alert.id(),
+                sel!(beginSheetModalForWindow:completionHandler:),
+                ns_window.id(),
+                handler.as_block_ptr(),
             );
-            return None;
-        };
+        }
         self.paste_confirm = Some(alert_keys::PasteConfirm::new(
-            id, wid, ns_window, panel, keys,
+            id, wid, ns_window, panel, keys, up,
         ));
         None
     }

@@ -365,7 +365,7 @@ fn upgrade_action(step: &Step) -> Option<&'static str> {
         Step::Announce => Some("Announce"),
         Step::GiveUp => Some("GiveUp"),
         Step::Terminate | Step::Fresh => Some("Restart"),
-        Step::Wait(_) | Step::Void(_) | Step::Rearm => None,
+        Step::Wait(_) | Step::Void(_) | Step::Rearm | Step::Tell(_) => None,
     }
 }
 

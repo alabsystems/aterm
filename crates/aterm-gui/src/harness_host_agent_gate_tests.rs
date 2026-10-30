@@ -77,7 +77,7 @@ fn switch_off_during_idle(in_step: bool) {
     h.acts.step = {
         let steps = Arc::clone(&steps);
         let release = Arc::clone(&release);
-        Arc::new(move |sid, _| {
+        Arc::new(move |sid, _, _| {
             steps.lock().unwrap().push(sid.to_string());
             if sid == "off" && in_step {
                 release_after_edit(&release, &entered_tx);

@@ -237,6 +237,11 @@ pub(crate) fn recovery_transition(
                     object.remove("region");
                     fs::write(path, doc.to_string()).unwrap();
                 }
+                31 => {
+                    // A completion receipt must not substitute for the vendor files it
+                    // describes. Preserve the removed file outside the candidate home.
+                    fs::rename(&login_file, root.path().join("retained-login")).unwrap();
+                }
                 _ => {}
             }
             if matches!(state["case"], 23..=25) {
@@ -290,7 +295,12 @@ pub(crate) fn recovery_transition(
             } else {
                 assert_eq!(files.each_ref().map(|path| fs::read(path).ok()), before);
             }
-            assert_eq!(fs::read(&login_file).unwrap(), b"private fixture");
+            let retained_login = if state["case"] == 31 {
+                root.path().join("retained-login")
+            } else {
+                login_file
+            };
+            assert_eq!(fs::read(retained_login).unwrap(), b"private fixture");
             assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
             next.insert("phase", 2);
             next.insert("recovered", i64::from(recovered));
@@ -303,8 +313,8 @@ pub(crate) fn recovery_transition(
 #[test]
 fn checkpoint_recovery_conforms_to_current_policy_for_every_provider() {
     let model = aterm_models_harness::account_recovery_policy_model();
-    assert_eq!(model.mutant_dials(), (1..=32).collect::<Vec<_>>());
-    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 360);
+    assert_eq!(model.mutant_dials(), (1..=33).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 372);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -347,6 +357,18 @@ fn checkpoint_recovery_conforms_to_current_policy_for_every_provider() {
         let mut refused = recovery_transition(&rejected, "Recover");
         refused.insert("recovered", 0);
         assert!(!model.check_invariant("AdmissibleRecoverySucceeds", &refused));
+    }
+}
+
+#[test]
+fn checkpoint_alone_cannot_recover_a_login() {
+    for provider in 1..=4 {
+        let mut state = aterm_models_harness::account_recovery_policy_model().init_state();
+        state.insert("provider", provider);
+        state.insert("case", 31);
+        state.insert("phase", 1);
+        let next = recovery_transition(&state, "Recover");
+        assert_eq!(next["recovered"], 0, "provider {provider}");
     }
 }
 

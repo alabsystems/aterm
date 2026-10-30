@@ -1220,6 +1220,9 @@ impl SessionStore {
                 at,
             );
             tl.record("spawned");
+            drop(tl);
+            #[cfg(not(test))]
+            crate::fabric::watch_direct_mail(&handle.ctx);
         }
         let journal = first.then(|| (handle.sid.as_str().to_string(), handle.local_id));
         self.by_local.insert(handle.local_id, handle.sid.clone());

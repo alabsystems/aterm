@@ -27,6 +27,8 @@ aterm-digest = { workspace = true }
 aterm-uds = { workspace = true }
 # `dirs::home_dir`, `fs_restricted` (0700 directories).
 aterm-types = { workspace = true }
+# Shared release-ring authority is verified with the updater's pinned master-roster chain.
+aterm-update-core = { workspace = true }
 # The workspace clock.
 aterm-time = { workspace = true }
 # The flush a wiped file gets before it is removed (`durable_data`).

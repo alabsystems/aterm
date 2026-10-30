@@ -618,6 +618,9 @@ fn arg_kinds(msg: &Message) -> impl Iterator<Item = u8> + '_ {
 /// # Safety
 /// `msg` and `args` are the event's, as libwayland passed them, and no handler has seen them.
 unsafe fn close_fds(msg: &Message, args: *const WlArgument) {
+    if args.is_null() {
+        return;
+    }
     for (i, kind) in arg_kinds(msg).enumerate() {
         if kind != b'h' {
             continue;
@@ -625,9 +628,9 @@ unsafe fn close_fds(msg: &Message, args: *const WlArgument) {
         // SAFETY: One argument per signature argument, and this one is a descriptor.
         let fd = unsafe { (*args.add(i)).h };
         #[cfg(unix)]
-        {
+        if fd >= 0 {
             use std::os::fd::{FromRawFd, OwnedFd};
-            // SAFETY: A descriptor this side owns, closed once here.
+            // SAFETY: A valid descriptor this side owns, closed once here.
             drop(unsafe { OwnedFd::from_raw_fd(fd) });
         }
         #[cfg(not(unix))]
@@ -659,6 +662,9 @@ unsafe extern "C" fn dispatch(
     if arg_kinds(msg).count() > MAX_ARGS {
         // SAFETY: As above.
         unsafe { close_fds(msg, args) };
+        return 0;
+    }
+    if args.is_null() && arg_kinds(msg).next().is_some() {
         return 0;
     }
     let mut decoded = [EventArg::Uint(0); MAX_ARGS];
@@ -806,5 +812,32 @@ mod tests {
         // SAFETY: The descriptor the handler was given, closed by its owner.
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
         assert!(far_closed(&mut near));
+    }
+
+    #[test]
+    fn negative_fd_and_null_args_are_ignored_without_invalid_owned_fd() {
+        let mut args = [
+            WlArgument { u: 1 },
+            WlArgument { h: -1 },
+            WlArgument { u: 2 },
+        ];
+        let target = NonNull::<c_void>::dangling().as_ptr();
+        // SAFETY: Malformed negative fd and null argument vector are ignored safely.
+        unsafe {
+            dispatch(
+                std::ptr::null(),
+                target,
+                0,
+                &raw const KEYMAP,
+                args.as_mut_ptr(),
+            );
+            dispatch(
+                std::ptr::null(),
+                target,
+                0,
+                &raw const KEYMAP,
+                std::ptr::null_mut(),
+            );
+        }
     }
 }

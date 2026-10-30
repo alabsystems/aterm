@@ -2678,7 +2678,12 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
         "only the dead one"
     );
 
-    let probes: Vec<(u32, String, Probe)> = probe_sessions(targets, Some(rv.clone())).collect();
+    // The mocks serve, so their probes wait the hang detector, not the product's 2 s.
+    let probe = |path: &str, verb: &str, pid: u32| {
+        probe_lines_with_deadline(path, verb, pid, HANG_DETECTOR)
+    };
+    let probes: Vec<(u32, String, Probe)> =
+        probe_sessions_with(targets, Some(rv.clone()), probe).collect();
     for (_, sock, probe) in &probes {
         if *sock == foreign_s {
             match probe {
@@ -2715,7 +2720,7 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
         first
     });
     let explicit: Vec<_> =
-        probe_sessions(vec![Target::named(me, foreign_s.clone())], None).collect();
+        probe_sessions_with(vec![Target::named(me, foreign_s.clone())], None, probe).collect();
     assert!(
         matches!(explicit[0].2, Probe::NoToken(..)),
         "{:?}",
@@ -3821,15 +3826,17 @@ fn the_retry_after_a_replaced_listener_sends_the_new_token() {
         })
     };
     let path = sock.to_str().expect("utf8").to_string();
-    let outcome = exchange(
-        &path,
-        TargetOrigin::Pinned,
-        "status\n",
-        "status",
-        Some(std::time::Duration::from_secs(60)),
-        false,
-        &redial::Redial::none(),
-    )
+    let outcome = with_accept_within(HANG_DETECTOR, || {
+        exchange(
+            &path,
+            TargetOrigin::Pinned,
+            "status\n",
+            "status",
+            Some(std::time::Duration::from_secs(60)),
+            false,
+            &redial::Redial::none(),
+        )
+    })
     .expect("exchange");
     let (first, lines) = server.join().expect("server");
     assert_eq!(first, ["AUTH deadbeef\n", "version\n"]);
@@ -3923,7 +3930,10 @@ fn a_busy_reply_is_reported_as_busy() {
             .expect("busy");
     });
     let path = sock.to_str().expect("utf8").to_string();
-    let outcome = open_accepted(&path, TargetOrigin::Pinned, Some(HANG_DETECTOR)).expect("open");
+    let outcome = with_accept_within(HANG_DETECTOR, || {
+        open_accepted(&path, TargetOrigin::Pinned, Some(HANG_DETECTOR))
+    })
+    .expect("open");
     server.join().expect("server");
     match outcome {
         Acceptance::Refused(line) => assert_eq!(line, BUSY),

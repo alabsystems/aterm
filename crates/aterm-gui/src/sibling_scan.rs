@@ -271,7 +271,12 @@ fn arm(stream: &aterm_uds::CtlStream, deadline: Instant) -> Option<()> {
 /// Dial one sibling and read its `survey facts`. A refusal, budget exhaustion
 /// or malformed frame skips the peer silently (the `run_discovery` posture).
 fn summarize_peer(pid: u32, sock: &str) -> Option<SiblingInstance> {
-    let deadline = Instant::now() + PEER_BUDGET;
+    summarize_peer_within(pid, sock, PEER_BUDGET)
+}
+
+/// [`summarize_peer`] within `budget` of wall clock, not [`PEER_BUDGET`].
+fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<SiblingInstance> {
+    let deadline = Instant::now() + budget;
     let (stream, token) = aterm_ctl::connect_then_read_token(sock).ok()?;
     let token = token.ok()?;
     arm(&stream, deadline)?;
@@ -482,7 +487,12 @@ mod tests {
                 line.clear();
                 assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line:?}");
             });
-            let row = super::summarize_peer(4242, sock.to_str().unwrap()).expect("summarized");
+            let row = super::summarize_peer_within(
+                4242,
+                sock.to_str().unwrap(),
+                aterm_spec::wait::MUST_HAPPEN,
+            )
+            .expect("summarized");
             server.join().unwrap();
             assert_eq!(row.pid, 4242);
             assert_eq!(row.sessions, 2, "exited row excluded");

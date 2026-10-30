@@ -32,8 +32,47 @@ fn refused() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "local observation unavailable")
 }
 
+#[derive(Debug)]
+struct ReadFailure {
+    step: &'static str,
+    source: io::Error,
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.source)
+    }
+}
+
+impl std::error::Error for ReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A locally assigned stage, never parsed from an error message or a peer's data.
+pub(crate) fn error_stage(error: &io::Error) -> Option<&'static str> {
+    error
+        .get_ref()?
+        .downcast_ref::<ReadFailure>()
+        .map(|failure| failure.step)
+}
+
 fn context(step: &'static str, error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{step}: {error}"))
+    if error_stage(&error).is_some() {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        ReadFailure {
+            step,
+            source: error,
+        },
+    )
+}
+
+fn refused_at(step: &'static str) -> io::Error {
+    context(step, refused())
 }
 
 #[cfg(test)]
@@ -193,7 +232,7 @@ fn read_exact(stream: &mut CtlStream, mut bytes: &mut [u8], deadline: Instant) -
     while !bytes.is_empty() {
         stream
             .set_read_timeout(Some(remaining(deadline)?))
-            .map_err(|error| context("read timeout", error))?;
+            .map_err(|error| context("read-timeout", error))?;
         match stream.read(bytes) {
             Ok(0) => return Err(refused()),
             Ok(n) => bytes = &mut bytes[n..],
@@ -208,7 +247,7 @@ fn write_all(stream: &mut CtlStream, mut bytes: &[u8], deadline: Instant) -> io:
     while !bytes.is_empty() {
         stream
             .set_write_timeout(Some(remaining(deadline)?))
-            .map_err(|error| context("write timeout", error))?;
+            .map_err(|error| context("write-timeout", error))?;
         match stream.write(bytes) {
             Ok(0) => return Err(refused()),
             Ok(n) => bytes = &bytes[n..],
@@ -286,39 +325,41 @@ fn read_named(config: &Path, name: &str) -> io::Result<Publication> {
     let mut client = aterm_uds::connect::until(&dir.join(name), deadline)
         .map_err(|error| context("connect", error))?;
     if peer::peer_uid(&client) != Some(peer::our_uid()) {
-        return Err(refused());
+        return Err(refused_at("peer-user"));
     }
-    write_all(&mut client, REQUEST, deadline)?;
+    write_all(&mut client, REQUEST, deadline).map_err(|error| context("request", error))?;
     let mut size = [0; 4];
-    read_exact(&mut client, &mut size, deadline)?;
-    let pid = aterm_uds::fdpass::peer_pid(&client).map_err(|error| context("peer pid", error))?;
+    read_exact(&mut client, &mut size, deadline).map_err(|error| context("frame-header", error))?;
+    let pid = aterm_uds::fdpass::peer_pid(&client).map_err(|error| context("peer-pid", error))?;
     let native_pid = i32::try_from(pid)
         .ok()
         .filter(|pid| *pid > 0)
-        .ok_or_else(refused)?;
-    let birth = aterm_uds::process::read_birth(native_pid).ok_or_else(refused)?;
+        .ok_or_else(|| refused_at("peer-pid"))?;
+    let birth =
+        aterm_uds::process::read_birth(native_pid).ok_or_else(|| refused_at("peer-process"))?;
     let size = u32::from_be_bytes(size) as usize;
     if size == 0 || size > MAX_BYTES {
-        return Err(refused());
+        return Err(refused_at("frame-size"));
     }
     let mut wire = vec![0; size];
-    read_exact(&mut client, &mut wire, deadline)?;
-    let now = aterm_time::unix_millis().ok_or_else(refused)?;
-    let mut publication = decode_publication(&wire, now, requested)?;
+    read_exact(&mut client, &mut wire, deadline).map_err(|error| context("frame-body", error))?;
+    let now = aterm_time::unix_millis().ok_or_else(|| refused_at("clock"))?;
+    let mut publication =
+        decode_publication(&wire, now, requested).map_err(|error| context("snapshot", error))?;
     if aterm_uds::process::read_birth(native_pid) != Some(birth)
-        || endpoint_named(&dir, name)? != bound
+        || endpoint_named(&dir, name).map_err(|error| context("endpoint-recheck", error))? != bound
         || listener::names_now(dir.join(name), bound) != listener::Named::Same
     {
-        return Err(refused());
+        return Err(refused_at("endpoint-changed"));
     }
-    remaining(deadline)?;
+    remaining(deadline).map_err(|error| context("deadline", error))?;
     if Instant::now()
         .checked_duration_since(publication.at)
         .is_none_or(|age| age > REACHABLE)
     {
-        return Err(refused());
+        return Err(refused_at("sample-stale"));
     }
-    write_all(&mut client, ACK, deadline)?;
+    write_all(&mut client, ACK, deadline).map_err(|error| context("acknowledgement", error))?;
     publication.observation.via_local_process = Some(pid);
     Ok(publication)
 }
@@ -387,7 +428,7 @@ fn decode_publication(wire: &[u8], now: u64, requested: Instant) -> io::Result<P
     let (observation, age_ms, contact_ages) = live_decode_parts(wire, now)?;
     let at = requested
         .checked_sub(Duration::from_millis(age_ms))
-        .ok_or_else(refused)?;
+        .ok_or_else(|| refused_at("monotonic-clock"))?;
     Ok(Publication {
         observation,
         at,
@@ -399,27 +440,34 @@ fn live_decode_parts(
     wire: &[u8],
     now: u64,
 ) -> io::Result<(NetworkObservation, u64, BTreeMap<u64, Duration>)> {
-    if wire.len() > MAX_BYTES || now == 0 {
-        return Err(refused());
+    if wire.len() > MAX_BYTES {
+        return Err(refused_at("frame-size"));
     }
-    let value: Value = aterm_json::from_slice(wire).map_err(|_| refused())?;
-    if number(&value, "version").map_err(|_| refused())? != 1 {
-        return Err(refused());
+    if now == 0 {
+        return Err(refused_at("clock"));
     }
-    let age_ms = number(&value, "source_age_ms").map_err(|_| refused())?;
+    let value: Value = aterm_json::from_slice(wire).map_err(|_| refused_at("snapshot-json"))?;
+    if number(&value, "version").map_err(|_| refused_at("snapshot-version"))? != 1 {
+        return Err(refused_at("snapshot-version"));
+    }
+    let age_ms = number(&value, "source_age_ms").map_err(|_| refused_at("snapshot-age"))?;
     if age_ms > 15_000 {
-        return Err(refused());
+        return Err(refused_at("source-stale"));
     }
-    let history =
-        aterm_json::to_vec(value.get("history").ok_or_else(refused)?).map_err(|_| refused())?;
+    let history = aterm_json::to_vec(
+        value
+            .get("history")
+            .ok_or_else(|| refused_at("snapshot-history"))?,
+    )
+    .map_err(|_| refused_at("snapshot-history"))?;
     // History decoding validates bounded identities and samples but deliberately
     // resets current evidence. Only this live exchange can supply it again.
-    let mut observation = decode(&history).map_err(|_| refused())?;
-    if observation.observed_at_ms == 0
-        || observation.observed_at_ms > now
-        || now - observation.observed_at_ms > REACHABLE.as_millis() as u64
-    {
-        return Err(refused());
+    let mut observation = decode(&history).map_err(|_| refused_at("snapshot-history"))?;
+    if observation.observed_at_ms == 0 || observation.observed_at_ms > now {
+        return Err(refused_at("sample-clock"));
+    }
+    if now - observation.observed_at_ms > REACHABLE.as_millis() as u64 {
+        return Err(refused_at("sample-stale"));
     }
     observation.visibility = match value.get("visibility").and_then(Value::as_str) {
         Some("checking") => Visibility::Checking,
@@ -428,81 +476,80 @@ fn live_decode_parts(
         Some("disabled") => Visibility::Disabled,
         Some("waiting") => Visibility::Waiting,
         Some("unavailable") => Visibility::Unavailable,
-        _ => return Err(refused()),
+        _ => return Err(refused_at("snapshot-visibility")),
     };
     observation.history = match value.get("history_state").and_then(Value::as_str) {
         Some("ready") => HistoryState::Ready,
         Some("restoring") => HistoryState::Restoring,
         Some("unavailable") => HistoryState::Unavailable,
-        _ => return Err(refused()),
+        _ => return Err(refused_at("snapshot-history-state")),
     };
     let detail = value
         .get("detail")
         .and_then(Value::as_str)
         .filter(|text| text.len() <= 2048)
-        .ok_or_else(refused)?;
+        .ok_or_else(|| refused_at("snapshot-detail"))?;
     observation.detail = detail.into();
     observation.unverified_endpoints =
-        usize::try_from(number(&value, "unverified").map_err(|_| refused())?)
-            .map_err(|_| refused())?;
+        usize::try_from(number(&value, "unverified").map_err(|_| refused_at("snapshot-hints"))?)
+            .map_err(|_| refused_at("snapshot-hints"))?;
     if observation.unverified_endpoints > crate::runtime::MAX_UNVERIFIED_ENDPOINTS {
-        return Err(refused());
+        return Err(refused_at("snapshot-hints"));
     }
     let live = value
         .get("live")
         .and_then(Value::as_array)
-        .ok_or_else(refused)?;
+        .ok_or_else(|| refused_at("snapshot-peers"))?;
     if live.len() != observation.peers.len() {
-        return Err(refused());
+        return Err(refused_at("snapshot-peers"));
     }
     let mut slots = std::collections::BTreeSet::new();
     let mut contact_ages = BTreeMap::new();
     for row in live {
-        let slot = number(row, "slot").map_err(|_| refused())?;
+        let slot = number(row, "slot").map_err(|_| refused_at("snapshot-slots"))?;
         if !slots.insert(slot) {
-            return Err(refused());
+            return Err(refused_at("snapshot-slots"));
         }
         let peer = observation
             .peers
             .iter_mut()
             .find(|p| p.slot == slot)
-            .ok_or_else(refused)?;
-        peer.reachability = state(row.get("state").ok_or_else(refused)?).map_err(|_| refused())?;
+            .ok_or_else(|| refused_at("snapshot-slots"))?;
+        peer.reachability = state(row.get("state").ok_or_else(|| refused_at("peer-state"))?)
+            .map_err(|_| refused_at("peer-state"))?;
         let contact_age = match row.get("contact_age_ms") {
             Some(value) if value.is_null() => None,
             Some(value) => {
                 let age = value
                     .as_u64()
                     .filter(|age| *age <= 15_000)
-                    .ok_or_else(refused)?;
+                    .ok_or_else(|| refused_at("peer-contact-age"))?;
                 Some(Duration::from_millis(age))
             }
             None => None,
         };
         if peer.reachability == Reachability::Reachable {
-            let age = contact_age.ok_or_else(refused)?;
+            let age = contact_age.ok_or_else(|| refused_at("peer-contact-age"))?;
             contact_ages.insert(slot, age);
         }
         peer.last_checked_ms = match row.get("checked") {
             Some(value) if value.is_null() => None,
-            Some(value) => Some(value.as_u64().ok_or_else(refused)?),
-            None => return Err(refused()),
+            Some(value) => Some(value.as_u64().ok_or_else(|| refused_at("peer-check"))?),
+            None => return Err(refused_at("peer-check")),
         };
         if peer.first_seen_ms > peer.last_seen_ms
             || peer.last_seen_ms > now
             || peer.last_checked_ms.is_some_and(|at| at > now)
             || peer.samples.iter().any(|sample| sample.at_ms > now)
         {
-            return Err(refused());
+            return Err(refused_at("peer-clock"));
         }
+        // A contact may expire while a fresh publication is in transit.
+        // `Publication::current_at` ages it without discarding the other peers.
         if peer.reachability == Reachability::Reachable
-            && (observation.visibility != Visibility::Active
-                || now - peer.last_seen_ms > REACHABLE.as_millis() as u64
-                || peer
-                    .last_checked_ms
-                    .is_none_or(|at| now - at > REACHABLE.as_millis() as u64))
+            && (observation.visibility != Visibility::Active || peer.last_checked_ms.is_none())
         {
-            return Err(refused());
+            return Err(refused_at("peer-evidence"));
         }
     }
     Ok((observation, age_ms, contact_ages))
@@ -877,6 +924,42 @@ mod tests {
     }
 
     #[test]
+    fn expiring_contacts_preserve_a_fresh_snapshot_and_its_other_peers() {
+        for (seen_age_ms, checked_age_ms) in [(14_500, 14_500), (14_500, 0), (0, 14_500)] {
+            let mut state = current();
+            let observed = state.observed_at_ms;
+            let mut fresh = state.peers[0].clone();
+            fresh.slot = 4;
+            fresh.identity.machine_id = [5; 16];
+            fresh.identity.incarnation = [6; 16];
+            state.peers.push(fresh);
+            let old = &mut state.peers[0];
+            old.first_seen_ms = observed - 20_000;
+            old.last_seen_ms = observed - seen_age_ms;
+            old.last_checked_ms = Some(observed - checked_age_ms);
+            old.samples[0].at_ms = old.last_seen_ms;
+            let requested = Instant::now();
+            let initial =
+                decode_publication(&live_encode(&state, 0).unwrap(), observed, requested).unwrap();
+            assert_eq!(
+                initial.current_at(requested, Some(observed)).peers[0].reachability,
+                Reachability::Reachable
+            );
+            let received = decode_publication(
+                &live_encode(&state, 1000).unwrap(),
+                observed + 1000,
+                requested,
+            )
+            .unwrap();
+            let aged = received.current_at(requested, Some(observed + 1000));
+            assert_eq!(aged.visibility, Visibility::Active);
+            assert_eq!(aged.observed_at_ms, observed);
+            assert_eq!(aged.peers[0].reachability, Reachability::LastSeen);
+            assert_eq!(aged.peers[1].reachability, Reachability::Reachable);
+        }
+    }
+
+    #[test]
     fn live_decoder_rejects_stale_future_and_unconfirmed_current_peers() {
         let state = current();
         let wire = live_encode(&state, 0).unwrap();
@@ -990,27 +1073,34 @@ mod tests {
 
     #[test]
     fn connected_peer_cannot_forward_malformed_oversized_or_stale_frames() {
-        assert_eq!(
-            fake_reply(b"{}", 2).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            fake_reply(b"", (MAX_BYTES + 1) as u32).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
+        let rejected = |error: io::Error, stage| {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error_stage(&error), Some(stage));
+        };
+        rejected(fake_reply(b"{}", 2).unwrap_err(), "snapshot-version");
+        rejected(fake_reply(b"\xff", 1).unwrap_err(), "snapshot-json");
+        rejected(
+            fake_reply(b"", (MAX_BYTES + 1) as u32).unwrap_err(),
+            "frame-size",
         );
         let mut stale = current();
         stale.observed_at_ms -= 15_001;
         let wire = live_encode(&stale, 0).unwrap();
-        assert_eq!(
-            fake_reply(&wire, wire.len() as u32).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
+        rejected(
+            fake_reply(&wire, wire.len() as u32).unwrap_err(),
+            "sample-stale",
         );
         let mut future = current();
         future.observed_at_ms += 60_000;
         let wire = live_encode(&future, 0).unwrap();
-        assert_eq!(
-            fake_reply(&wire, wire.len() as u32).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
+        rejected(
+            fake_reply(&wire, wire.len() as u32).unwrap_err(),
+            "sample-clock",
+        );
+        let wire = live_encode(&current(), 15_001).unwrap();
+        rejected(
+            fake_reply(&wire, wire.len() as u32).unwrap_err(),
+            "source-stale",
         );
     }
 

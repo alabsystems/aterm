@@ -37,7 +37,19 @@ use super::{
 const RELAY_PREFIX: &str = "wf-";
 const RELAY_SUFFIX: &str = ".sock";
 const RELAY_HEADER_MAX: usize = 1024;
+#[cfg(not(test))]
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// A unit test's window relays are its own, which answer, and its hand-overs run on node-job
+/// threads a per-thread bound would not reach: they wait the hang detector.
+#[cfg(test)]
+const RELAY_CONNECT_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// A peer's fleet handshake, and each read and write of a served exchange and its window
+/// hand-over, within aterm-net's `HANDSHAKE_WITHIN`; a unit test's dialers and windows are its
+/// own, which answer, so theirs wait the hang detector.
+#[cfg(not(test))]
+const HANDSHAKE: Duration = aterm_net::fleet::HANDSHAKE_WITHIN;
+#[cfg(test)]
+const HANDSHAKE: Duration = aterm_spec::wait::MUST_HAPPEN;
 const DEFAULT_WAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_COOLDOWN: Duration = Duration::from_secs(5);
 /// How long `open -g -a` may take to hand the app to Launch Services before the spawn reports it
@@ -431,8 +443,8 @@ fn relay_ask(relay_dir: PathBuf) -> aterm_net::fleet::AskHandler {
                     return Ok(());
                 }
             };
-            let _ = window.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN));
-            let _ = window.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN));
+            let _ = window.set_read_timeout(Some(HANDSHAKE));
+            let _ = window.set_write_timeout(Some(HANDSHAKE));
             if window
                 .write_all(b"go\n")
                 .and_then(|()| window.flush())
@@ -666,7 +678,7 @@ fn open_window_relay(relay_dir: &Path, header: &RelayHeader) -> Option<CtlStream
 /// The answer to a fleet peer whose request a running window here took no hand-over of.
 fn answer_busy(served: aterm_net::fleet::Served, why: &str) -> std::io::Result<()> {
     served.answer(|stream| {
-        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+        stream.set_write_timeout(Some(HANDSHAKE))?;
         std::io::Write::write_all(
             stream,
             format!(
@@ -1371,22 +1383,25 @@ fn serve_one_node_generation(
     let open_for_serve = Arc::clone(&open_table);
     let ask = relay_ask(relay_dir.clone());
 
-    aterm_net::fleet::serve_offering_with_ask(
+    aterm_net::fleet::serve_offering_with_ask_within(
         &listener,
-        &listening,
-        &move || {
-            let s = serving_for_offer();
-            (s.scope, s.ops())
-        },
-        &move || {
-            let log = members_for_gate.as_ref().and_then(|members| members.keys());
-            denied_under(
-                &denied_nodes_for(vault_for_gate.as_ref(), &denied_for_gate),
-                log.as_deref(),
-            )
-        },
+        (
+            &listening,
+            &move || {
+                let s = serving_for_offer();
+                (s.scope, s.ops())
+            },
+            &move || {
+                let log = members_for_gate.as_ref().and_then(|members| members.keys());
+                denied_under(
+                    &denied_nodes_for(vault_for_gate.as_ref(), &denied_for_gate),
+                    log.as_deref(),
+                )
+            },
+        ),
         Some(ask),
         &running,
+        HANDSHAKE,
         move |served, op| {
             let peer = served.peer_addr();
             let denied = denied_nodes_for(vault_paths.as_ref(), &denied_for_serve);
@@ -1396,7 +1411,7 @@ fn serve_one_node_generation(
                 let st = state_dir.clone();
                 let secret = Arc::clone(&join_secret);
                 return served.answer(|stream| {
-                    stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                    stream.set_read_timeout(Some(HANDSHAKE))?;
                     register_member_at(
                         stream,
                         &st,
@@ -1409,7 +1424,7 @@ fn serve_one_node_generation(
             if op == FleetOp::Book {
                 let st = state_dir.clone();
                 return served.answer(|stream| {
-                    stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                    stream.set_write_timeout(Some(HANDSHAKE))?;
                     share_book_at(stream, &st, peer, (&denied, log.as_deref()), addr)
                 });
             }
@@ -1417,8 +1432,8 @@ fn serve_one_node_generation(
                 let proof = served.peer_node().cloned();
                 let st = state_dir.clone();
                 return served.answer(|stream| {
-                    stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                    stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                    stream.set_read_timeout(Some(HANDSHAKE))?;
+                    stream.set_write_timeout(Some(HANDSHAKE))?;
                     receive_pushed_facts_at(
                         stream,
                         &st,
@@ -1433,8 +1448,8 @@ fn serve_one_node_generation(
                 let st = state_dir.clone();
                 let hm = home_dir.clone();
                 return served.answer(|stream| {
-                    stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                    stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                    stream.set_read_timeout(Some(HANDSHAKE))?;
+                    stream.set_write_timeout(Some(HANDSHAKE))?;
                     serve_mail_code_request_at(stream, &st, hm.as_deref(), proof.as_ref(), peer)
                 });
             }
@@ -1442,8 +1457,8 @@ fn serve_one_node_generation(
                 let st = state_dir.clone();
                 let hm = home_dir.clone();
                 return served.answer(|stream| {
-                    stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                    stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                    stream.set_read_timeout(Some(HANDSHAKE))?;
+                    stream.set_write_timeout(Some(HANDSHAKE))?;
                     serve_census_request_at(stream, &st, hm.as_deref(), peer)
                 });
             }
@@ -1530,7 +1545,13 @@ fn serve_one_node_generation(
             let content =
                 served.scope() == FleetScope::Content && serving.scope == FleetScope::Content;
             let drive = !serving.grants.is_empty()
-                && lists_driver_at(&served, &state_dir, &serving.grants, log.as_deref());
+                && lists_driver_at(
+                    &served,
+                    &state_dir,
+                    &serving.grants,
+                    &denied,
+                    log.as_deref(),
+                );
             let relayed = relay_to_window(
                 &relay_dir,
                 &RelayHeader::Survey {
@@ -1764,7 +1785,7 @@ fn spawn_windowless_drive(
     std::thread::Builder::new()
         .name("aterm-node-wake-drive".to_owned())
         .spawn(move || {
-            let _ = near.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN));
+            let _ = near.set_read_timeout(Some(HANDSHAKE));
             let first_line =
                 match read_line_raw(&mut near, aterm_types::control_verbs::MAX_REQUEST_LINE) {
                     Ok(Some(line)) => line,

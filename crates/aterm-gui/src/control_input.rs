@@ -923,6 +923,9 @@ pub(crate) fn cmd_hwkey(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     if crate::askpass_sheet::sheets_open() {
         return "ERR hwkey: a sudo password sheet is up\n".to_string();
     }
+    if crate::alert_keys::confirmation_up() {
+        return crate::alert_keys::CONFIRMATION_UP_REFUSAL.to_string();
+    }
     let spec = match crate::hwkey::parse_hwkey(rest) {
         Ok(s) => s,
         Err(e) => return e,

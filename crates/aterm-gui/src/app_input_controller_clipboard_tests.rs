@@ -630,14 +630,6 @@ fn a_key_hwkey_posted_reaches_no_clipboard_by_the_persons_key_path() {
     set_board(None);
 }
 
-/// AN EDIT ITEM A KEY `hwkey` POSTED CHOSE REACHES NO CLIPBOARD: ⌘V and ⌘C reach Edit ▸ Paste and
-/// Copy by their key equivalents, whose native relay posts the item to the event loop; the relay
-/// asks whether the key being dispatched is one a burst posted
-/// ([`crate::tab_spawn::native_post_by_controller`]), so that item runs marked
-/// ([`App::run_posted_menu_action`]): its Paste sends no clipboard and its Copy writes none, and
-/// both answer why. The person's items paste and copy.
-/// NEGATIVE CONTROL: with the relay posting no mark (as on main, `147b22abdc`), the posted ⌘V's
-/// Paste wrote `s3cret-pass` to the PTY.
 /// A KEY `hwkey` POSTED ANSWERS NO IN-WINDOW QUESTION: the paste question holds text from the
 /// person's clipboard and the close question their work. A posted Return or Escape arrives by the
 /// person's key path ([`App::dispatch_hw_key`]) under the controller mark, so it leaves each
@@ -697,6 +689,14 @@ fn a_key_hwkey_posted_answers_no_in_window_question() {
     assert!(app.windows.contains_key(&WID), "no, so the window stays");
 }
 
+/// AN EDIT ITEM A KEY `hwkey` POSTED CHOSE REACHES NO CLIPBOARD: ⌘V and ⌘C reach Edit ▸ Paste and
+/// Copy by their key equivalents, whose native relay posts the item to the event loop; the relay
+/// asks whether the key being dispatched is one a burst posted
+/// ([`crate::tab_spawn::native_post_by_controller`]), so that item runs marked
+/// ([`App::run_posted_menu_action`]): its Paste sends no clipboard and its Copy writes none, and
+/// both answer why. The person's items paste and copy.
+/// NEGATIVE CONTROL: with the relay posting no mark (as on main, `147b22abdc`), the posted ⌘V's
+/// Paste wrote `s3cret-pass` to the PTY.
 #[test]
 fn an_edit_item_a_key_hwkey_posted_chose_reaches_no_clipboard() {
     let (mut app, mut reader, sink) = app_reading_pty();

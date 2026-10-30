@@ -1179,11 +1179,23 @@ pub fn default_login_made(cli: Cli, home: &Path) -> bool {
         .any(|file| dir.join(file).is_file())
 }
 
-/// Returns whether `dir` is a non-empty directory containing an initialized login.
+/// Returns whether `dir` contains an entry other than aterm's renewal bookkeeping.
+/// This is an initialization footprint, not authentication: the provider's status and
+/// identity checks decide whether the login works. A checkpoint or its interrupted
+/// publication directory alone cannot enroll a login.
 #[must_use]
 pub fn login_made(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .is_ok_and(|mut entries| entries.next().is_some_and(|entry| entry.is_ok()))
+    std::fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.any(|entry| {
+            entry.is_ok_and(|entry| {
+                let name = entry.file_name();
+                name != RENEWAL_CHECKPOINT_FILE
+                    && !name
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(RENEWAL_CHECKPOINT_STAGE_PREFIX))
+            })
+        })
+    })
 }
 
 /// Whether `row`'s login is here: the enrolled set is the one answer, a default-home row
@@ -1593,6 +1605,7 @@ const SUBSCRIPTION_MAX: usize = 32;
 
 /// Private evidence left only after a fresh staging sign-in passed its check.
 pub(super) const RENEWAL_CHECKPOINT_FILE: &str = ".aterm-renewal.json";
+const RENEWAL_CHECKPOINT_STAGE_PREFIX: &str = ".renewal-check-";
 const RENEWAL_CHECKPOINT_MAX: u64 = 4096;
 
 /// The binding a completed sign-in is allowed to replace. An absent or legacy binding has
@@ -1770,7 +1783,7 @@ pub(super) fn write_renewal_checkpoint_for(
         ));
     }
     let stage = aterm_tempfile::Builder::new()
-        .prefix(".renewal-check-")
+        .prefix(RENEWAL_CHECKPOINT_STAGE_PREFIX)
         .tempdir_in(staging)?;
     let candidate = stage.path().join("result");
     super::upgrade_models::write_atomic_mode(&candidate, &text, Some(0o600))?;
@@ -5006,9 +5019,9 @@ pub enum Advice {
         /// When to decide again.
         until: i64,
     },
-    /// The owner lifted this wall ([`pin`]).
+    /// The recorded wall expired or was lifted, and the current account can run.
     Resume {
-        /// When the owner cleared the account ([`Account::cleared_at`], as the state was read).
+        /// When the wall expired or was cleared, as the state was read.
         cleared_at: i64,
     },
 }
@@ -5548,7 +5561,16 @@ fn advise_with(
     } = point
         && available_here(mine)
         && let Some(record) = state.accounts.get(&mine.label)
-        && let Some(cleared_at) = record.cleared_since(window, *written, now)
+        && let Some(cleared_at) = record.cleared_since(window, *written, now).or_else(|| {
+            // A timed wall is also released at its reset (including its grace), or
+            // at the end of its retry backoff. An observation made at or after
+            // that instant is a new wall, not evidence that the old one ended.
+            record
+                .walls
+                .get(window)?
+                .stands_until()
+                .filter(|end| *written < *end && *end <= now)
+        })
         && cond(mine).runs()
     {
         return Advice::Resume {

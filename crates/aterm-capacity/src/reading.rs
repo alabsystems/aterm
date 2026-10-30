@@ -333,7 +333,19 @@ pub trait Machine {
 
     /// Every process now; `None` where the platform has no sweep.
     fn procs(&self) -> Option<Procs>;
+
+    /// `pid` and the processes it descends from, as far as they are read: what deciding whether
+    /// an ancestor's claim covers `pid` needs ([`crate::covering`]), with no footprints. By
+    /// default the whole sweep ([`Self::procs`]).
+    fn lineage(&self, pid: u32) -> Option<Procs> {
+        let _ = pid;
+        self.procs()
+    }
 }
+
+/// The most parents [`Live`]'s lineage walks up: deeper than any shell, agent and build nest.
+#[cfg(target_os = "macos")]
+const LINEAGE_MAX: usize = 64;
 
 /// The volume holding `path`, read now through the mount table `table` ([`aterm_sysprobe::volumes`]), as the window's disk watch reads its volume: a local volume is placed by the path's nearest existing ancestor, with the platform's error boxes off.
 ///
@@ -412,6 +424,30 @@ impl Machine for Live {
         Some(Procs::of(
             sweep.procs.iter().map(Proc::of_reading).collect(),
         ))
+    }
+
+    /// On macOS a walk up `pid`'s parents, one kernel record each (`kproc::record`), not a whole
+    /// sweep: a build's admission reads it on every call.
+    #[cfg(target_os = "macos")]
+    fn lineage(&self, pid: u32) -> Option<Procs> {
+        let mut line = Vec::new();
+        let mut at = pid;
+        while line.len() < LINEAGE_MAX {
+            let Some(r) = aterm_sysprobe::kproc::record(at) else {
+                break;
+            };
+            line.push(Proc {
+                pid: r.pid,
+                ppid: r.ppid,
+                footprint: 0,
+                written: 0,
+            });
+            if r.ppid <= 1 || r.ppid == at {
+                break;
+            }
+            at = r.ppid;
+        }
+        (!line.is_empty()).then(|| Procs::of(line))
     }
 }
 

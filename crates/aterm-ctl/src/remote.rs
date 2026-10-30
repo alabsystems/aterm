@@ -7,7 +7,7 @@ use std::env;
 use std::fmt;
 use std::io::{self, BufReader, Write};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_types::control_verbs::turn_option_words;
 
@@ -262,13 +262,48 @@ pub(crate) fn run(
     let mut request = request_line(&parts)?;
     validate_request_line_len(&request, Some(verb))?;
     request.push('\n');
-    let link = drive(host, within.get()).map_err(|refused| match (&refused.left, args) {
-        (Some(left), [sid, off, ..]) if verb == "hold" && off == "off" => {
-            io::Error::other(left_holding(host, sid, left, &refused.why))
+    exchange_with_retry(&request, verb, within, |remaining| {
+        drive(host, remaining).map_err(|refused| match (&refused.left, args) {
+            (Some(left), [sid, off, ..]) if verb == "hold" && off == "off" => {
+                io::Error::other(left_holding(host, sid, left, &refused.why))
+            }
+            _ => io::Error::other(refused),
+        })
+    })
+}
+
+/// A complete busy reply promises the request was not dispatched. Only that response may
+/// redial; sends, EOFs and partial responses remain ambiguous and are never repeated here.
+fn exchange_with_retry(
+    request: &str,
+    verb: &str,
+    within: Within,
+    mut dial: impl FnMut(Duration) -> io::Result<DriveLink>,
+) -> io::Result<ExitCode> {
+    let started = Instant::now();
+    let mut remaining = within.get();
+    loop {
+        let link = dial(remaining)?;
+        let label = link.label.clone();
+        match exchange(link, request, verb, within)? {
+            Exchange::Completed(code) => return Ok(code),
+            Exchange::Busy => {
+                remaining = within.get().saturating_sub(started.elapsed());
+                if !remaining.is_zero() {
+                    std::thread::sleep(remaining.min(Duration::from_millis(50)));
+                    remaining = within.get().saturating_sub(started.elapsed());
+                }
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "{label} remained busy until this call's deadline; the request was not dispatched"
+                        ),
+                    ));
+                }
+            }
         }
-        _ => io::Error::other(refused),
-    })?;
-    exchange(link, &request, verb, within)
+    }
 }
 
 /// How `--host any` is used ([`any_host_node`]).
@@ -330,7 +365,7 @@ fn any_host_node(
 /// Why a `hold <sid> off` cannot be sent to `host` by this machine, out of the fleet now or
 /// holding a book that names no such Mac ([`Left`]): the dial's own refusal `why`, then, as a
 /// condition this machine cannot check, what lifts a hold it took there under any grant
-/// ([`lifts_there`], [`RmLifts::Unknown`]) and when the same `hold off` from here works.
+/// ([`lifts_there`]) and when the same `hold off` from here works.
 fn left_holding(host: &str, sid: &str, left: &Left, why: &str) -> String {
     let (host, sid) = (
         aterm_codec::tty::one_line(host, 80),
@@ -346,44 +381,21 @@ fn left_holding(host: &str, sid: &str, left: &Left, why: &str) -> String {
     format!(
         "{why}; if this machine took {sid} on {host}, {}, and `aterm ctl --host {host} hold {sid} \
          off` from here works once this machine{again}",
-        lifts_there(node, RmLifts::Unknown)
+        lifts_there(node)
     )
 }
 
-/// Whose `peers rm` of this machine's node ends what lets it drive another Mac, which lifts a
-/// hold it took there ([`lifts_there`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RmLifts {
-    /// That Mac's own: it is this machine's issuer, or this machine is its, so its own book binds
-    /// the node, under any grant there.
-    There,
-    /// The fleet's issuer's, once that Mac reads the issuer's book again: a member's copy of that
-    /// book binds the node, which its `"*"` grant admits through a `peers rm` there.
-    Issuer,
-    /// Not known here: none is named.
-    Unknown,
-}
-
 /// What lifts, on another Mac, a hold this machine (`node`) took there, under any grant there:
-/// taking the tab, a lower level, or the `peers rm` `rm` names. The node is named whole, as a
-/// member's `peers rm` takes the issuer it can no longer read.
+/// the person's Take Over/Hand Back or a lower drive level. Peer removal also drops named
+/// grants on that Mac, but another member can restore signed membership under an all-member grant.
 #[must_use]
-pub fn lifts_there(node: &str, rm: RmLifts) -> String {
-    match rm {
-        RmLifts::There => format!(
-            "that Mac lifts the hold when its person takes the tab (Take Over), runs `aterm fleet \
-             peers rm {node}` there, or lowers `aterm fleet allow` there (to content or facts)"
-        ),
-        RmLifts::Issuer => format!(
-            "that Mac lifts the hold when its person takes the tab (Take Over) or lowers `aterm \
-             fleet allow` there (to content or facts), or once the fleet's issuer takes this \
-             machine out (`aterm fleet peers rm {node}` on the issuer) and that Mac reads the \
-             issuer's book again (`aterm fleet peers` there reads it now)"
-        ),
-        RmLifts::Unknown => "that Mac lifts the hold when its person takes the tab (Take Over) \
-                             or lowers `aterm fleet allow` there (to content or facts)"
-            .to_owned(),
-    }
+pub fn lifts_there(node: &str) -> String {
+    format!(
+        "that Mac lifts the hold when its person takes the tab (Take Over then Hand Back) or \
+         runs `aterm fleet allow content` there; `aterm fleet peers rm {node}` there also drops \
+         grants naming this node, but an all-member grant can admit a valid signed entry merged \
+         back from another member's book"
+    )
 }
 
 /// Refuse a leading selector that names a session of THIS Mac, or none by
@@ -820,7 +832,13 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
 /// on stderr (exit 1); a line-framed reply's rows on stdout, a turn's
 /// verdict and a result's header on stderr; a status line on stdout; a
 /// reported timeout exits 124, as does an answer not come `within` the deadline.
-fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::Result<ExitCode> {
+#[derive(Debug)]
+enum Exchange {
+    Completed(ExitCode),
+    Busy,
+}
+
+fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::Result<Exchange> {
     let DriveLink { mut stream, label } = link;
     let cut = |e| closed(&label, request, within, e);
     stream
@@ -832,11 +850,18 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
     if read_status_line(&mut reader, &mut status).map_err(cut)? == 0 {
         return Err(cut(io::Error::from(io::ErrorKind::UnexpectedEof)));
     }
+    let complete = status.ends_with('\n');
     let status = status.trim_end_matches(['\r', '\n']);
+    if complete
+        && status == aterm_types::control_verbs::CONTROL_BUSY_REPLY
+        && reader.buffer().is_empty()
+    {
+        return Ok(Exchange::Busy);
+    }
     let (head, tail) = status.split_once(' ').unwrap_or((status, ""));
     if head != "OK" {
         stderr_line(status)?;
-        return Ok(ExitCode::FAILURE);
+        return Ok(Exchange::Completed(ExitCode::FAILURE));
     }
     if streams_payload(verb, request) {
         let count = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
@@ -856,11 +881,11 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
     } else {
         print_stdout_line(status)?;
     }
-    Ok(if reply_is_timeout(status) {
+    Ok(Exchange::Completed(if reply_is_timeout(status) {
         ExitCode::from(EXIT_TIMEOUT)
     } else {
         ExitCode::SUCCESS
-    })
+    }))
 }
 
 #[cfg(test)]

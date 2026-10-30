@@ -393,6 +393,7 @@ fn light_grains_keep_off_the_block_caret() {
                 hue: 0.5,
                 cov_scale: 1.0,
                 born: t,
+                latch: ParticleLatch::FRESH,
                 edge_cut: false,
             });
             let (mut q, mut h, mut u) = (Vec::new(), Vec::new(), Vec::new());
@@ -721,5 +722,131 @@ fn sparkles_paper_body_is_gold() {
     assert!(
         bv < 0.8,
         "control: the vivid ink {bold:06X} is the muddy one (v {bv:.2})"
+    );
+}
+
+/// A COLOUR THE USER CHOSE KEEPS ITS HUE AND CHROMA IN CLASSIC'S PAPER WAKE
+/// ([`crate::classic_wake::WakeInk::chosen`]): a trail pinned to `#b0b0c8`
+/// draws Classic's one-colour face, and on white every pixel its paper crown
+/// and tracer lay beside the caret keeps the pin's hue and no more than the
+/// chroma of the tone it is drawn from (the pin, or its accent: the pin
+/// brightened, which clips to `#ffffff`). The gallery's `#d03a8c` keeps its two
+/// tones' hues (the pin's 327 and its clipped accent's 316) and the
+/// brighter tone's chroma. Solved from the hue's vivid ink, `#b0b0c8` (chroma
+/// 24 of 255) was laid up to `#9595e1` (76) beside the caret. Control:
+/// [`crate::classic_wake::ClassicWake::paper_pin_saturated`], the paper
+/// crown and tracer alone reading no colour as chosen, which lays them past
+/// the pin's chroma.
+#[test]
+fn a_pinned_classic_s_paper_wake_keeps_the_pin_s_hue_and_chroma() {
+    use crate::color_math::rgb2hsv;
+    let g = geom();
+    let (w, h) = (usize::from(g.win_w), usize::from(g.win_h));
+    let chroma = |c: u32| {
+        let (r, gg, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+        r.max(gg).max(b) - r.min(gg).min(b)
+    };
+    let hue = |c: u32| rgb2hsv(c & 0x00FF_FFFF).0;
+    let apart = |a: f32, b: f32| (a - b).abs().min(360.0 - (a - b).abs());
+    // The wake's paper pixels over a neutral white, frame by frame, across a
+    // burst of keys.
+    let laid = |c: &GlowConfig, saturated: bool| -> Vec<u32> {
+        let mut glow = CursorGlow::default();
+        glow.set_colour_pins(ColourPins {
+            trail: true,
+            accent: false,
+        });
+        glow.classic.paper_pin_saturated = saturated;
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((2, 4)), t, c, g, &mut out);
+        let mut px_all = Vec::new();
+        for col in 5..17 {
+            t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((2, col)), t, c, g, &mut out);
+            const NEUTRAL: u32 = 0x00FF_FFFF;
+            let mut px = vec![NEUTRAL; w * h];
+            for q in glow.under_quads() {
+                let qw = u32::from(q.w.max(1));
+                let at = |i: u32, a: u32, b: u32| {
+                    (a * (2 * qw - (2 * i + 1)) + b * (2 * i + 1) + qw) / (2 * qw)
+                };
+                for y in usize::from(q.y)..(usize::from(q.y) + usize::from(q.h)).min(h) {
+                    for x in usize::from(q.x)..(usize::from(q.x) + usize::from(q.w)).min(w) {
+                        let i = (x - usize::from(q.x)) as u32;
+                        let (color, alpha) = if q.is_flat() {
+                            (q.color, q.alpha)
+                        } else {
+                            let lerp = |sh: u32| {
+                                at(i, (q.color >> sh) & 0xff, (q.color2 >> sh) & 0xff) << sh
+                            };
+                            (
+                                lerp(16) | lerp(8) | lerp(0),
+                                at(i, u32::from(q.alpha), u32::from(q.alpha2)) as u8,
+                            )
+                        };
+                        let slot = &mut px[y * w + x];
+                        *slot = aterm_render::over_premul(*slot, color, alpha) & 0x00FF_FFFF;
+                    }
+                }
+            }
+            px_all.extend(px.into_iter().filter(|&p| p != NEUTRAL));
+        }
+        px_all
+    };
+    let mut control_over = 0usize;
+    for pin in [0x00B0_B0C8u32, 0x00D0_3A8C] {
+        let mut c = light(GlowStyle::Classic);
+        c.classic_mono = true;
+        c.color = pin;
+        c.accent = crate::cursor_fx::brighten(pin, 1.5);
+        let tones = [pin, c.accent];
+        let most = tones.iter().map(|&t| chroma(t)).max().unwrap_or(0);
+        // A pixel holds a hue once it has chroma to hold one (8 of 255); it
+        // keeps the hue of one of its tones, or lies between them, to within
+        // its channels' rounding (a level of its middle channel moves its hue
+        // 60 degrees over its chroma).
+        let hues: Vec<f32> = tones
+            .iter()
+            .filter(|&&t| chroma(t) >= 8)
+            .map(|&t| hue(t))
+            .collect();
+        let off = |p: u32| {
+            let tol = 2.0 + 60.0 / chroma(p).max(1) as f32;
+            chroma(p) > most + 1
+                || (chroma(p) >= 8
+                    && !hues.is_empty()
+                    && hues.iter().all(|&t| apart(hue(p), t) > tol)
+                    && !(hues.len() == 2
+                        && apart(hue(p), hues[0]) + apart(hue(p), hues[1])
+                            <= apart(hues[0], hues[1]) + tol))
+        };
+        let px = laid(&c, false);
+        assert!(
+            px.len() > 500,
+            "{pin:06x}: the paper wake lays ({} px)",
+            px.len()
+        );
+        let bad: Vec<String> = px
+            .iter()
+            .filter(|&&p| off(p))
+            .map(|p| format!("{p:06x}"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{pin:06x}: {} of {} paper pixels leave its tones' hues or pass chroma {most}: {:?}",
+            bad.len(),
+            px.len(),
+            &bad[..bad.len().min(8)]
+        );
+        control_over += laid(&c, true)
+            .iter()
+            .filter(|&&p| chroma(p) > most + 1)
+            .count();
+    }
+    assert!(
+        control_over > 0,
+        "control: solved from the hue's vivid ink, the paper wake keeps within the pins' chroma"
     );
 }

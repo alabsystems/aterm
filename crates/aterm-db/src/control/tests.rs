@@ -550,7 +550,8 @@ impl Lab {
             });
             let report = ea
                 .exchange(
-                    Connection::connect(addr, Scope::Loopback, Duration::from_secs(2)).unwrap(),
+                    Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
+                        .unwrap(),
                     Side::Initiator,
                     a,
                 )
@@ -736,7 +737,8 @@ fn real_tls_rejects_a_copied_witness_without_its_writer_key() {
         assert!(
             impostor
                 .exchange(
-                    Connection::connect(addr, Scope::Loopback, Duration::from_secs(2)).unwrap(),
+                    Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
+                        .unwrap(),
                     Side::Initiator,
                     &mut Repair::default()
                 )
@@ -1601,7 +1603,7 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
             .unwrap()
         });
         ea.exchange(
-            Connection::connect(addr, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+            Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN).unwrap(),
             Side::Initiator,
             &mut ra,
         )
@@ -1654,7 +1656,7 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
                 .unwrap()
         });
         ea.exchange(
-            Connection::connect(addr, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+            Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN).unwrap(),
             Side::Initiator,
             &mut ra_leg,
         )
@@ -1751,7 +1753,8 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                     .expect("responder exchange")
                 });
                 ea.exchange(
-                    Connection::connect(addr, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+                    Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
+                        .unwrap(),
                     Side::Initiator,
                     &mut ra,
                 )
@@ -1830,7 +1833,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                 .unwrap()
             });
             ea.exchange(
-                Connection::connect(addr, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+                Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN).unwrap(),
                 Side::Initiator,
                 &mut Repair::default(),
             )
@@ -2022,7 +2025,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                 )
             });
             let _ = e3.exchange(
-                Connection::connect(addr, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+                Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN).unwrap(),
                 Side::Initiator,
                 &mut Repair::default(),
             );
@@ -2075,7 +2078,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                 )
             });
             let _ = e_sybil.exchange(
-                Connection::connect(addr2, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+                Connection::connect(addr2, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN).unwrap(),
                 Side::Initiator,
                 &mut Repair::default(),
             );
@@ -2220,7 +2223,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                 )
             });
             let _ = e4_before.exchange(
-                Connection::connect(addr, Scope::Loopback, Duration::from_secs(5)).unwrap(),
+                Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN).unwrap(),
                 Side::Initiator,
                 &mut Repair::default(),
             );

@@ -32,13 +32,11 @@ use aterm_hash::FxHashMap;
 use aterm_render::sprites::{FreeSprite, FreeZ};
 use aterm_time::Instant;
 
-/// The bar an app's ink keeps over the glass: the glass's own ([`GLASS_BAR`]) with the
-/// lerp guard over it for the renderer's rounding ([`LERP_BAR_GUARD`]).
+/// The bar an app's ink keeps over the glass: the glass's own ([`GLASS_BAR`], 5.25:1), the
+/// `bar` of §4's seam and §15.2 1.9's rules.
 ///
 /// [`GLASS_BAR`]: crate::rainbow_kitty::prism_glass::GLASS_BAR
-/// [`LERP_BAR_GUARD`]: crate::rainbow_kitty::prism_glass::LERP_BAR_GUARD
-pub const YIELD_BAR: f64 = crate::rainbow_kitty::prism_glass::GLASS_BAR
-    + crate::rainbow_kitty::prism_glass::LERP_BAR_GUARD;
+pub const YIELD_BAR: f64 = crate::rainbow_kitty::prism_glass::GLASS_BAR;
 
 /// The least cap a word keeps: under it the glass leaves the word (§4 rule 3).
 pub const K_MIN: u8 = 200;
@@ -53,9 +51,10 @@ pub const RAMP_KNOT_PX: i32 = 2;
 /// The grid a glass is laid over: origin x and y, cell width and height, window px.
 pub type Grid = (i32, i32, i32, i32);
 
-/// Where a glass was solved and laid: the page `(theme fg, theme bg)`, the [`Grid`] and the caret
-/// cell.
-pub type Place = ((u32, u32), Grid, Option<(u16, u16)>);
+/// Where a glass was solved and laid: the page `(theme fg, theme bg)`, the [`Grid`], the caret
+/// cell and the columns `(first, count)` of the pane the step drew in (`None`: the window's one
+/// pane).
+pub type Place = ((u32, u32), Grid, Option<(u16, u16)>, Option<(u16, u16)>);
 
 /// The glass a frame laid (§15.2 1.9): its quads and ramps in draw order, as the cursor step
 /// left them, and what the yield reads them by.
@@ -73,6 +72,9 @@ pub struct GlassLaid {
     grid: (i32, i32, i32, i32),
     /// The caret cell.
     caret: Option<(u16, u16)>,
+    /// The columns `(first, count)`, window cells, of the pane the step drew in: in a composed
+    /// frame the yield reads no cell outside them, another session's. `None`: the whole row.
+    pane: Option<(u16, u16)>,
 }
 
 impl GlassLaid {
@@ -94,7 +96,16 @@ impl GlassLaid {
             page: (page.0 & 0x00FF_FFFF, page.1 & 0x00FF_FFFF),
             grid,
             caret,
+            pane: None,
         }
+    }
+
+    /// This glass laid by a step in the pane whose columns are `pane` (`(first, count)`, window
+    /// cells; `None`: the whole row).
+    #[must_use]
+    pub const fn in_pane(mut self, pane: Option<(u16, u16)>) -> Self {
+        self.pane = pane;
+        self
     }
 
     /// Forget the glass: the frame laid none.
@@ -104,6 +115,7 @@ impl GlassLaid {
         self.quads.clear();
         self.ramps.clear();
         self.caret = None;
+        self.pane = None;
     }
 
     /// The instant of the step that laid it.
@@ -121,13 +133,13 @@ impl GlassLaid {
     }
 
     /// Record the glass of a stream: its quads `[q0, q1)` and ramps `[r0, r1)` of `quads` and
-    /// `ramps`, laid at `at` on `page` over `grid`, the caret at `caret`.
+    /// `ramps`, laid at `at` on `page` over `grid`, the caret at `caret`, by a step in `pane`.
     pub(crate) fn record(
         &mut self,
         (quads, ramps): (&[GlowQuad], &GlowRamps),
         (q0, q1, r0, r1): (usize, usize, usize, usize),
         at: Instant,
-        (page, grid, caret): Place,
+        (page, grid, caret, pane): Place,
     ) {
         self.clear();
         let q1 = q1.min(quads.len());
@@ -146,6 +158,7 @@ impl GlassLaid {
         self.page = (page.0 & 0x00FF_FFFF, page.1 & 0x00FF_FFFF);
         self.grid = grid;
         self.caret = caret;
+        self.pane = pane;
     }
 }
 
@@ -182,6 +195,9 @@ enum Class {
     Ink(u32),
     /// A glyph whose ink the word pass animates.
     Animated,
+    /// A cell outside the step's pane (a composed frame's other session): the glass never lies
+    /// there, and it is neither a word nor a blank, so it bounds no run and eases no blank.
+    Outside,
 }
 
 impl Class {
@@ -587,7 +603,7 @@ impl GlassYield {
                         }
                         c = e + 1;
                     }
-                    Class::Blank | Class::Fg => c += 1,
+                    Class::Blank | Class::Fg | Class::Outside => c += 1,
                 }
             }
             self.bridge(cols, glass.caret.filter(|&(cr, _)| usize::from(cr) == r));
@@ -654,7 +670,8 @@ impl GlassYield {
             })
     }
 
-    /// Row `r`'s cells' kinds over its `cols` columns ([`Self::classes`]): rules 1, 2 and 4.
+    /// Row `r`'s cells' kinds over its `cols` columns ([`Self::classes`]): rules 1, 2 and 4, and
+    /// every cell outside the step's pane [`Class::Outside`].
     fn classify(&mut self, input: &RenderInput, glass: &GlassLaid, r: usize, cols: usize) {
         let cells = &input.cells[r];
         let (fg, bg) = glass.page;
@@ -677,7 +694,14 @@ impl GlassYield {
         let images = input.images.get(r);
         let (ry0, ry1) = (r as i32 * ch, (r as i32 + 1) * ch);
         let rgb = |v: [u8; 3]| u32::from(v[0]) << 16 | u32::from(v[1]) << 8 | u32::from(v[2]);
+        let pane = glass
+            .pane
+            .map(|(first, n)| (usize::from(first), usize::from(first) + usize::from(n)));
         for c in 0..cols {
+            if pane.is_some_and(|(first, end)| c < first || c >= end) {
+                self.classes.push(Class::Outside);
+                continue;
+            }
             let cell = cells.get(c);
             let page = match input.default_bg_at(r, c) {
                 aterm_core::render::COLOR_UNSET => bg,
@@ -966,6 +990,17 @@ impl GlassYield {
         cut
     }
 
+    /// Drop the memo of caps and the scratch: the light left (§10.1).
+    pub(super) fn forget(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The caps the memo holds.
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn memo_len(&self) -> usize {
+        self.memo.len()
+    }
+
     /// Lay the input's under stream again with its glass yielded; whether its quads and its
     /// ramps changed.
     fn lay(&mut self, input: &mut RenderInput, glass: &GlassLaid) -> (bool, bool) {
@@ -1110,7 +1145,7 @@ impl super::CursorGlow {
     ) {
         let (quads, ramps) = self.ink_ledger.light_owned();
         if quads.is_empty() && ramps.is_empty() {
-            self.glass_laid.clear();
+            self.forget_glass();
             return;
         }
         let span = |spans: &[(u32, u32)]| {
@@ -1133,35 +1168,65 @@ impl super::CursorGlow {
             (&self.under_out, &self.under_ramps),
             (q0, q1, r0, r1),
             now,
-            ((cfg.theme_fg, cfg.theme_bg), grid, cur),
+            ((cfg.theme_fg, cfg.theme_bg), grid, cur, self.pane_columns),
         );
     }
 
     /// Yield the glass the step at `at` laid in `input`'s under stream to the frame's words
     /// (§15.2 1.9, [`GlassYield::apply`]), the frame's free `sprites` beside them: what it cut.
-    /// A frame whose step laid no glass is left as it is, and so is every publish after the
-    /// first of a step's glass: the step's glass is cut once, and a second publish before the
-    /// next step (a capture's, or a host's second word pass) holds the stream the first left,
-    /// whose cut pieces the record no longer names.
+    /// A frame whose step laid no glass is left as it is, and so is the stream this step's last
+    /// cut left (a host's second word pass over its own frame), whose cut pieces the record no
+    /// longer names. Every other stream holding the step's glass is cut: a copy of the uncut
+    /// stream the glow keeps, which a retained projection (a windowed composed capture) and the
+    /// heterogeneous route lay, yields as the frame's own did.
     pub fn yield_glass(
         &mut self,
         input: &mut RenderInput,
         sprites: &[FreeSprite],
         at: Instant,
     ) -> YieldReport {
-        if self.glass_laid.at() != Some(at) || self.yield_spent == Some(at) {
+        if self.glass_laid.at() != Some(at) {
             return YieldReport::default();
         }
-        self.yield_spent = Some(at);
+        if self.yield_spent == Some(at)
+            && input.glow_under == self.yield_left.0
+            && input.glow_under_ramps == self.yield_left.1
+        {
+            return YieldReport::default();
+        }
         let report = self.glass_yield.apply(input, &self.glass_laid, sprites);
         if report.cut() {
+            self.yield_spent = Some(at);
+            self.yield_left.0.clone_from(&input.glow_under);
+            self.yield_left.1.clone_from(&input.glow_under_ramps);
             self.yielded = Some((at, report));
         }
         report
     }
 
+    /// Forget the glass the last step laid and what the yield did with it: the record, the last
+    /// cut's report and the step whose glass a publish spent (§10.1: light state goes with the
+    /// light). Every tick starts by it, so a step that lays no glass, and every dark step, holds
+    /// none of them.
+    pub(super) fn forget_glass(&mut self) {
+        self.glass_laid.clear();
+        self.yielded = None;
+        self.yield_spent = None;
+        self.yield_left.0.clear();
+        self.yield_left.1.clear();
+    }
+
+    /// The step whose glass a word publish cut ([`Self::yield_glass`]) and the caps the yield's
+    /// memo holds: `(None, 0)` once the light leaves. Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn yield_held(&self) -> (Option<Instant>, usize) {
+        (self.yield_spent, self.glass_yield.memo_len())
+    }
+
     /// The last yield that cut: its step's instant and what it cut. `None` until a frame's glass
-    /// yielded to its words (§15.2 1.9), so `None` on every dark frame.
+    /// yielded to its words (§15.2 1.9), and again from the next step that lays no glass, so
+    /// `None` on every dark frame, the first after a light one included.
     #[inline]
     #[must_use]
     pub const fn last_yield(&self) -> Option<(Instant, YieldReport)> {
@@ -1306,18 +1371,57 @@ mod tests {
         }
     }
 
-    /// The measured caps (§4 rule 3): Default Light's grey `#474d57` reads over the warm glass
-    /// whole; a red `#c4262e` keeps its bar at no alpha the yield keeps, so its cap is 0.
+    /// The measured caps (§4 rule 3 and its Measured table), over Default Light's shipped glass
+    /// at its anchors, whole (alpha 255), each a word's k (a cap under [`K_MIN`] is 0): the
+    /// theme's ink `#2b2d33` keeps every anchor whole (the glass is solved for it); the grey
+    /// `#474d57` keeps the yellow, the green and the cyan whole and loses the rest; `#c4262e`,
+    /// `#0b5cc4`, `#a2269e` and `#5c6370` lose every anchor; `#1a7f37`, `#8a6100`, `#0f7684`
+    /// and `#6b7280`, under the bar on the page itself, take 0 at every alpha. An ink lighter
+    /// than the page, or a page under the bar itself, keeps no glass either.
     #[test]
     fn the_caps_are_the_measured_ones() {
-        let glass = aterm_render::over_premul(BG, GLASS.0, GLASS.1) & 0x00FF_FFFF;
-        assert_eq!(cap(0x0047_4D57, glass, BG, YIELD_BAR), 255);
-        assert!(cap(0x00C4_262E, glass, BG, YIELD_BAR) < K_MIN);
-        // The ink lighter than the page, or a page under the bar itself, keeps no glass.
-        assert_eq!(cap(0x00FF_FFFF, glass, BG, YIELD_BAR), 0);
-        assert_eq!(cap(0x00F0_F0F0, BG, BG, YIELD_BAR), 0);
-        // The theme's own ink keeps its bar over its own glass (the glass is solved for it).
-        assert_eq!(cap(FG, glass, BG, YIELD_BAR), 255);
+        use crate::rainbow_kitty::prism_glass::{ANCHOR_AT, Palette};
+        let shipped = Palette::shipped(FG, BG).expect("Default Light's tables ship");
+        // Red, orange, yellow, green, cyan, azure, lilac, magenta.
+        let anchors = ANCHOR_AT.map(|at| shipped.glass_arc[at]);
+        let k = |ink: u32, glass: u32| match cap(ink, glass, BG, YIELD_BAR) {
+            c if c < K_MIN => 0,
+            c => c,
+        };
+        for (i, &glass) in anchors.iter().enumerate() {
+            assert_eq!(k(FG, glass), 255, "#2b2d33 on anchor {i} #{glass:06x}");
+            let grey = if (2..=4).contains(&i) { 255 } else { 0 };
+            assert_eq!(
+                k(0x0047_4D57, glass),
+                grey,
+                "#474d57 on anchor {i} #{glass:06x}"
+            );
+            for ink in [0x00C4_262E, 0x000B_5CC4, 0x00A2_269E, 0x005C_6370] {
+                assert_eq!(k(ink, glass), 0, "#{ink:06x} on anchor {i} #{glass:06x}");
+            }
+            for ink in [0x001A_7F37, 0x008A_6100, 0x000F_7684, 0x006B_7280] {
+                assert_eq!(
+                    cap(ink, glass, BG, YIELD_BAR),
+                    0,
+                    "#{ink:06x}, under the bar on the page, on anchor {i}"
+                );
+            }
+            assert_eq!(cap(0x00FF_FFFF, glass, BG, YIELD_BAR), 0, "white ink");
+        }
+        assert_eq!(
+            cap(0x00F0_F0F0, BG, BG, YIELD_BAR),
+            0,
+            "a page under the bar"
+        );
+        // The bar is §4's 5.25:1: Default Light's red is 5.34:1 on the page itself, between the
+        // bar and 5.35 (the bar with the glass's lerp guard over it), so a glass that leaves the
+        // page no darker keeps it whole, where 5.35 would cut it at every alpha.
+        let pale = aterm_render::over_premul(BG, 0x0005_0505, 3) & 0x00FF_FFFF;
+        assert_eq!(
+            cap(0x00C4_262E, pale, BG, YIELD_BAR),
+            255,
+            "#c4262e over #{pale:06x}"
+        );
     }
 
     /// §4 rules 1-3 and 6: an app's red word takes no glass, the grey word beside it and the
@@ -1457,6 +1561,72 @@ mod tests {
         }
     }
 
+    /// A composed row's cells outside the step's pane (another session's) bound nothing: rules 5
+    /// and 6 read the pane's own columns. Two blanks at the pane's left edge, between a
+    /// neighbour pane on a dark page and an app's red word, keep their glass by the edge, the
+    /// one beside the word easing back to whole; the same row recorded with no pane (the whole
+    /// row, the negative control) takes the neighbour's off-page cells as yielded and cuts the
+    /// two blanks between them and the word.
+    #[test]
+    fn a_neighbour_pane_bounds_nothing() {
+        let at = Instant::now();
+        let whole = u32::from(GLASS.1);
+        let run = |pane: Option<(u16, u16)>| {
+            let mut input = page(b"              \x1b[38;2;196;38;46mtwo\x1b[39m");
+            // The neighbour pane's twelve cells, on its own dark ground.
+            for cell in &mut input.cells[0][..12] {
+                cell.bg = [26, 27, 38];
+            }
+            let quad = GlowQuad::flat(
+                0,
+                (12 * CW) as u16,
+                0,
+                (12 * CW) as u16,
+                CH as u16,
+                GLASS.0,
+                GLASS.1,
+            );
+            input.glow_under = vec![quad];
+            input.glow_under_ramps.clear();
+            let glass = GlassLaid::new(
+                at,
+                (vec![quad], GlowRamps::default()),
+                (FG, BG),
+                (0, 0, CW, CH),
+                None,
+            )
+            .in_pane(pane);
+            let _ = GlassYield::default().apply(&mut input, &glass, &[]);
+            input
+        };
+        let paned = run(Some((12, 12)));
+        assert_eq!(
+            cell_alpha(&paned, 0, 12),
+            (whole, whole),
+            "the pane's edge blank keeps its glass"
+        );
+        let (lo, hi) = cell_alpha(&paned, 0, 13);
+        assert!(
+            lo < hi,
+            "the blank beside the word eases back to whole: {lo} ..= {hi}"
+        );
+        for col in 14..17 {
+            assert_eq!(
+                cell_alpha(&paned, 0, col),
+                (0, 0),
+                "the red word's cell {col}"
+            );
+        }
+        let whole_row = run(None);
+        for col in 12..14 {
+            assert_eq!(
+                cell_alpha(&whole_row, 0, col),
+                (0, 0),
+                "control: the neighbour's cells bound cell {col}"
+            );
+        }
+    }
+
     /// §4 rule 3 over a ramp: a word's cap is the least over every row of each ramp under it,
     /// each by its own ends. A navy word over one ramp whose lower rows are a bright yellow and
     /// whose upper rows a blue the navy loses its bar over takes no glass, though the ramp's
@@ -1545,10 +1715,11 @@ mod tests {
             "a channel under its alpha"
         );
         assert_eq!(scale_end(0x0012_3456, 0x80, 1.0), (0x0012_3456, 0x80));
-        // Through the yield: a dim glass beside a red word eases from 0 without a coloured
-        // zero.
+        // Through the yield: a dim glass beside a word eases from 0 without a coloured zero.
+        // The word's green `#1a7f37` is under the bar on the page itself (§4 Measured), so it
+        // takes 0 over any glass, however dim.
         let at = Instant::now();
-        let mut input = page(b"ab \x1b[38;2;196;38;46mred\x1b[39m cd");
+        let mut input = page(b"ab \x1b[38;2;26;127;55mgrn\x1b[39m cd");
         let quad = GlowQuad::flat(0, 0, 0, 120, CH as u16, 0x0005_0505, 3);
         input.glow_under = vec![quad];
         let glass = GlassLaid::new(
@@ -1565,7 +1736,7 @@ mod tests {
                 .glow_under
                 .iter()
                 .any(|q| q.alpha == 0 || q.alpha2 == 0),
-            "premise: the red word scaled an end of the glass to alpha 0: {:?}",
+            "premise: the word scaled an end of the glass to alpha 0: {:?}",
             input.glow_under
         );
         no_coloured_zero(&input);

@@ -2236,7 +2236,7 @@ type NeedsFn = dyn Fn(&str, &[String], &str) -> bool + Send + Sync;
 type LandHoldFn = dyn Fn(&str, Option<aterm_agent::harness::acts::LandHeld>) -> bool + Send + Sync;
 
 type EpochFn = dyn Fn() -> u64 + Send + Sync;
-type StepFn = dyn Fn(&str, u32) -> String + Send + Sync;
+type StepFn = dyn Fn(&str, u32, upgrade_drive::Tell) -> String + Send + Sync;
 /// A relaunched agent's owed carry-on, taken ([`Acts::resume`]).
 type ResumeFn = dyn Fn(&str, u32, CarryPoint) -> String + Send + Sync;
 /// That carry-on settled with nothing typed where the agent rests at a point its loop withheld from the host ([`Acts::settle`]).
@@ -4361,9 +4361,17 @@ impl IdleHost for WorkerIdle {
         step
     }
 
-    /// A break of the agent's own background work its loop offers.
     fn at_background(
         &self,
+    ) -> Option<(String, aterm_agent::supervise::policy::turn_end::HostTurn)> {
+        self.at_background_on(IdlePoint::default())
+    }
+
+    /// A break of the agent's own background work its loop offers, under the guards it read there
+    /// (`point`, which hold the quiet upgrade's line: [`Self::upgrade_tell`]).
+    fn at_background_on(
+        &self,
+        point: IdlePoint,
     ) -> Option<(String, aterm_agent::supervise::policy::turn_end::HostTurn)> {
         self.points.offered(crate::upgrade_host::now_s());
         if !self.on()
@@ -4392,7 +4400,8 @@ impl IdleHost for WorkerIdle {
         if !self.on() {
             return None;
         }
-        let step = self.act(|| (hooks.acts.notice)(&self.sid, self.grace));
+        let tell = self.upgrade_tell(point);
+        let step = self.act(|| (hooks.acts.notice)(&self.sid, self.grace, tell));
         if !self.on() {
             return None;
         }
@@ -5951,7 +5960,8 @@ impl WorkerIdle {
                     if !self.on() {
                         return None;
                     }
-                    let step = self.act(|| (hooks.acts.step)(&self.sid, self.grace));
+                    let tell = self.upgrade_tell(point);
+                    let step = self.act(|| (hooks.acts.step)(&self.sid, self.grace, tell));
                     laps::lap("upgrade");
                     ("upgrade", step)
                 }
@@ -6101,6 +6111,32 @@ impl WorkerIdle {
     /// The session's Autopilot now.
     fn autopilot(&self) -> Autopilot {
         OffSessions::read(&self.hooks, self.switches.autopilot()).mode(&self.sid)
+    }
+
+    /// What a quiet upgrade round may type to this session's agent while the agent's own work
+    /// holds the move ([`upgrade_drive::Tell`]): nothing while its Autopilot is off, as a person
+    /// then reads what is typed, nor once its task finished or landed under Land (nothing is
+    /// typed after a land's defense until someone else's turn), nor while one of its loop's
+    /// guards holds a host's fact (`held`: a person's grace, their own exchange, a manager's
+    /// wait; under Cruise the last two hold it no more than they hold Cruise's carry at a break,
+    /// which types into such a session all the same); the restart the agent may run itself only
+    /// where the tab offers and promises it ([`Acts::offered`]).
+    fn upgrade_tell(&self, point: IdlePoint) -> upgrade_drive::Tell {
+        let autopilot = self.autopilot();
+        let held = point.held.filter(|guard| {
+            autopilot != Autopilot::Cruise || !matches!(guard, Guard::Exchange | Guard::Managed)
+        });
+        if autopilot == Autopilot::Off
+            || held.is_some()
+            || point.done_under_land
+            || self.finished() == Some(true)
+        {
+            upgrade_drive::Tell::Off
+        } else if (self.hooks.acts.offered)(&self.sid) == Some(true) {
+            upgrade_drive::Tell::Verb
+        } else {
+            upgrade_drive::Tell::Fact
+        }
     }
 
     /// The claim act's look at a decided idle turn end ([`credit_claim::step`]): first, every
@@ -15743,6 +15779,7 @@ pub(crate) fn window_drive_opts_with_tap(
         land: false,
         press: None,
         timings: aterm_agent::harness::Timings::for_build(),
+        tell: upgrade_drive::Tell::Off,
     }
 }
 
@@ -15813,22 +15850,23 @@ fn live_acts(store: Store, sock: String) -> Acts {
         behind: Arc::new(move |sid, since| {
             o11(sid, 0).map_or(Behind::Nothing, |o| upgrade_drive::note_behind(&o, since))
         }),
-        step: Arc::new(move |sid, grace| {
+        step: Arc::new(move |sid, grace, tell| {
             let Some(o) = o2(sid, grace) else {
                 return "refused:no-home".to_string();
             };
-            let r = upgrade_drive::step(&o);
+            let r = upgrade_drive::step(&upgrade_drive::Opts { tell, ..o });
             if r.is_act() {
                 w1(sid, "upgrade", &r);
             }
             r.step
         }),
-        notice: Arc::new(move |sid, grace| {
+        notice: Arc::new(move |sid, grace, tell| {
             let Some(o) = o9(sid, grace) else {
                 return "refused:no-home".to_string();
             };
             let r = upgrade_drive::step(&upgrade_drive::Opts {
                 background: true,
+                tell,
                 ..o
             });
             if r.is_act() {
@@ -19199,6 +19237,7 @@ fn disk_roots(
 struct DiskRuns {
     passes: std::sync::atomic::AtomicU32,
     cleanup_off: std::sync::atomic::AtomicU32,
+    discovery: Mutex<aterm_agent::harness::disk::discover::Cursor>,
 }
 
 impl DiskRuns {
@@ -19206,7 +19245,21 @@ impl DiskRuns {
         Self {
             passes: std::sync::atomic::AtomicU32::new(0),
             cleanup_off: std::sync::atomic::AtomicU32::new(0),
+            discovery: Mutex::new(aterm_agent::harness::disk::discover::Cursor::new()),
         }
+    }
+
+    /// A look outside automatic admission cannot carry an earlier cycle or exhausted pass
+    /// into a later pressure episode. Keep only the discovery position hint.
+    fn admit(&self, admitted: bool, board: &Shelf) -> bool {
+        if !admitted {
+            self.discovery
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reset_cycle();
+            board.publish(|board| board.last_pass = None);
+        }
+        admitted
     }
 
     /// What a pass that ran tells the window ([`disk_pass_outcome`] on [`Self::passes`]).
@@ -19301,10 +19354,11 @@ fn disk_look_pass(
     note: &NoteFn,
     looked: &mut disk_ask::Looked,
 ) {
+    let board = &crate::disk_board::SHELF;
     let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
+        let _ = DISK_RUNS.admit(false, board);
         return;
     };
-    let board = &crate::disk_board::SHELF;
     crate::disk_board::beat();
     let config_path = crate::app_config::config_path();
     let reading = aterm_agent::harness::cli::disk_config_read(config_path.as_deref());
@@ -19405,6 +19459,7 @@ fn disk_look_pass(
     }
     disk_sightings(board, seen, level, free, &state, now);
     if level == Level::Unknown {
+        let _ = DISK_RUNS.admit(false, board);
         return;
     }
     let reading = aterm_agent::harness::cli::DiskReading {
@@ -19431,10 +19486,12 @@ fn disk_look_pass(
     if let Some(line) = disk_private_said(&DISK_PRIVATE_SAID, line) {
         aterm_log::info!("{line}");
     }
-    if (!config.below_warn(free) && demand.is_none() && projected.is_none())
-        || config.auto_free_gib == 0
-        || private.is_some()
-    {
+    if !DISK_RUNS.admit(
+        (config.below_warn(free) || demand.is_some() || projected.is_some())
+            && config.auto_free_gib > 0
+            && private.is_none(),
+        board,
+    ) {
         if let Some(told) = disk_look_without_pass(&reading, free, &DISK_RUNS) {
             note(told);
         }
@@ -19738,12 +19795,25 @@ fn disk_look_pass(
             .as_ref()
             .and_then(aterm_agent::harness::disk::target::VolumeGuid::of_key),
     };
-    let tick = aterm_agent::harness::cli::disk_tick(
+    // LOOKING admits only one disk pass. Keep the selection hint between those passes,
+    // without holding a state lock while discovery or removal touches the filesystem.
+    let mut cursor = std::mem::take(
+        &mut *DISK_RUNS
+            .discovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    let tick = aterm_agent::harness::cli::disk_tick_paged(
         &look,
         config,
         &mut disk_remover(judge, store),
         &mut || measure().map(|s| s.free),
+        &mut cursor,
     );
+    *DISK_RUNS
+        .discovery
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = cursor;
     board.tally_freed(&disk_pass_removals(&tick));
     let left: &[aterm_agent::harness::disk::Hog] = match &tick {
         aterm_agent::harness::cli::DiskTick::Reclaimed(_, hogs) => hogs,
@@ -22057,8 +22127,8 @@ impl Acts {
             launch: Arc::new(|_| None),
             due: Arc::new(|_| Due::No),
             behind: Arc::new(|_, _| Behind::Nothing),
-            step: Arc::new(|_, _| "current".to_string()),
-            notice: Arc::new(|_, _| "current".to_string()),
+            step: Arc::new(|_, _, _| "current".to_string()),
+            notice: Arc::new(|_, _, _| "current".to_string()),
             owed: Arc::new(|_, _| false),
             resume: Arc::new(|_, _, _| "current".to_string()),
             settle: Arc::new(|_| "current".to_string()),

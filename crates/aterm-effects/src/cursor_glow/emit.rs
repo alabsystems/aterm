@@ -236,7 +236,7 @@ impl CursorGlow {
                     comet_beam_over(out, clip, verts, thick, step, 0.0);
                 }
             }
-            let corona_th = ch * if b.branch { 0.30 } else { 0.55 };
+            let corona_th = Self::bolt_corona_th(ch, b.branch);
             let corona = if dark { cfg.color } else { light_ink };
             stroke_bolt(
                 out,
@@ -1626,14 +1626,16 @@ impl CursorGlow {
                     #[cfg(test)]
                     let vivid = !self.sparkle_paper_bold_ink;
                     let mut vivid_memo: Option<(u32, u32)> = None;
+                    let pinned = self.sparkle_pinned(cfg);
                     ctx.banded(under, &mut verts, &mut band_run, run, |s| {
                         let color = if vivid {
                             let key = s.pos.to_bits();
                             match vivid_memo {
                                 Some((prev, solved)) if prev == key => solved,
                                 _ => {
-                                    let solved = ground
-                                        .vivid_body_ink(Self::sparkle_paper_gold_at(cfg, s.pos));
+                                    let solved = ground.vivid_body_ink(
+                                        Self::sparkle_paper_gold_at(cfg, pinned, s.pos),
+                                    );
                                     vivid_memo = Some((key, solved));
                                     solved
                                 }
@@ -4947,7 +4949,7 @@ impl CursorGlow {
             ),
             GlowStyle::Water => (28.0, water_ramp(0.74)),
             GlowStyle::Phaser => (50.0, hsv2rgb(self.hue, 0.9, 1.0)),
-            GlowStyle::Sparkle => (50.0, Self::sparkle_gold(cfg)),
+            GlowStyle::Sparkle => (50.0, Self::shower_gold(cfg, self.sparkle_pinned(cfg))),
             GlowStyle::Classic => (50.0, hsv2rgb(self.hue, 0.9, 1.0)),
             GlowStyle::RainbowKitty => return,
             GlowStyle::Beam => (46.0, cfg.color),
@@ -5586,6 +5588,8 @@ impl CursorGlow {
         let grow = (0.7 + 1.0 * t) * geom.ch as f32 * rf;
         let veil = if matches!(cfg.style, GlowStyle::Fire) {
             Self::FIRE_LIGHT_LANDING
+        } else if let Some(pin) = self.paper_landing_pin(cfg) {
+            Self::light_pin_ink(pin)
         } else {
             Self::light_veil_ink(color)
         };
@@ -5629,6 +5633,52 @@ impl CursorGlow {
         let own = crate::color_math::contrast_ratio(fg & 0x00FF_FFFF, bg & 0x00FF_FFFF);
         let keep = (Self::LIGHT_VEIL_BAR / own.max(1.0)).min(1.0);
         light_alpha_keeping(veil, fg, bg, keep).clamp(0.0, 255.0) as u8
+    }
+
+    /// The colour a paper landing wears where the user chose it ([`ColourPins`]), read as
+    /// [`Self::dark_veil_ink`] reads a chosen colour: Laser's trail; another style's accent,
+    /// or its trail where it draws the trail colour and the accent is unset. An unset accent
+    /// is the pinned trail brightened ([`crate::cursor_fx::unset_accent_base`]), which takes a
+    /// pale pin to white, a colour with no hue: [`Self::light_veil_ink`]'s clean-hue lift read
+    /// it as hue 0 and laid it red (Sparkle pinned to `#b0b0c8` landed a rose ring and veil at
+    /// an Enter on paper, the trail gallery's `sparkle-pin` `enter-bottom`, review9fix round
+    /// 1). The paper wears the pin itself instead. `None` for a colour nobody chose; a test's
+    /// control ([`Self::paper_pin_unread`]) reads every colour as unchosen.
+    #[inline]
+    const fn paper_landing_pin(&self, cfg: &GlowConfig) -> Option<u32> {
+        #[cfg(test)]
+        if self.paper_pin_unread {
+            return None;
+        }
+        let pins = self.colour_pins;
+        let pin = match cfg.style {
+            GlowStyle::Laser if pins.trail => cfg.color,
+            GlowStyle::Laser => return None,
+            _ if pins.accent => cfg.accent,
+            _ if pins.trail && cfg.style.draws_trail_color() => cfg.color,
+            _ => return None,
+        };
+        Some(pin & 0x00FF_FFFF)
+    }
+
+    /// A chosen colour's paper landing ink: the colour itself, brought down to the bold ink's
+    /// luma ([`LIGHT_INK_BOLD_MAX_LUMA`]) where it is brighter by scaling its channels, so its
+    /// hue and saturation stay the colour's and a grey stays grey. Never re-hued or saturated,
+    /// as [`Self::light_veil_ink`] brings a style's own colour to a clean hue.
+    #[inline]
+    #[must_use]
+    pub(super) const fn light_pin_ink(pin: u32) -> u32 {
+        #[inline]
+        const fn ch(full: u32, k: f32, sh: u32) -> u32 {
+            ((((full >> sh) & 0xff) as f32 * k) + 0.5) as u32
+        }
+        let pin = pin & 0x00FF_FFFF;
+        let y = luma709(pin);
+        if y <= LIGHT_INK_BOLD_MAX_LUMA {
+            return pin;
+        }
+        let k = LIGHT_INK_BOLD_MAX_LUMA / y;
+        (ch(pin, k, 16) << 16) | (ch(pin, k, 8) << 8) | ch(pin, k, 0)
     }
 
     /// A light landing veil's ink for `rgb`.
@@ -5785,13 +5835,30 @@ impl CursorGlow {
         let plume_drifting = self.comet_plume_drifting;
         #[cfg(not(test))]
         let plume_drifting = false;
-        // Whether a grain of Comet's dark dust at `col` may float into row
-        // `r`: the row's cells round the grain hold no letter and lie on the
-        // page's own ground, so a powerline bar (blank but for its segment,
-        // on its own ground) keeps the dust off, and a short prompt's row
-        // (`$ ` at the far left) leaves the air past it open.
+        // Whether Comet's dark dust may float into row `r` (`col`: the
+        // grain's column, which only the control reads): the row is read,
+        // blank across, and every cell of it lies on the page's own ground,
+        // the ruled law (comet dust floats only into a row blank across with
+        // the default page background). A powerline bar (blank but for its
+        // segment, on its own ground), a selection, a prompt's row and a
+        // line of letters keep the dust off. Read by the cells round the
+        // grain's own column, a row holding letters three cells off took
+        // the dust, which went out in one frame as its drift brought it near
+        // them (looks9's review).
         let frame_text = &self.frame_text;
-        let air_at = |r: i32, col: i32| {
+        #[cfg(test)]
+        let air_by_column = self.comet_air_by_column;
+        #[cfg(not(test))]
+        let air_by_column = false;
+        let row_cols = (
+            frame_text.col0,
+            frame_text.col0 + frame_text.cols as i32 - 1,
+        );
+        // Whether row `r` is open round `col`: its cells there hold no letter
+        // and lie on the page's own ground. The dense row's seat reads this
+        // (the air a particle born at `col` would rise into), and the dust's
+        // control reads it in place of the row's.
+        let open_round = |r: i32, col: i32| {
             text.knows_row(r)
                 && (text.row_is_blank(r) || !grid.covers_within_2(r, col))
                 && (col - 2..=col + 2).all(|c| match frame_text.pair(r, c) {
@@ -5799,6 +5866,18 @@ impl CursorGlow {
                     None => true,
                 })
         };
+        let air_at = |r: i32, col: i32| {
+            if air_by_column {
+                return open_round(r, col);
+            }
+            text.knows_row(r)
+                && text.row_is_blank(r)
+                && text.grounds_read_as_page(r, row_cols, page)
+        };
+        #[cfg(test)]
+        let seat_unlatched = self.comet_seat_unlatched;
+        #[cfg(not(test))]
+        let seat_unlatched = false;
         let sparkle = matches!(cfg.style, GlowStyle::Sparkle);
         let laser = matches!(cfg.style, GlowStyle::Laser);
         // The dense row's seats ([`Self::DENSE_SEAT_CELLS`]): the caret's
@@ -5820,11 +5899,14 @@ impl CursorGlow {
             }
             _ => None,
         };
-        // Both rows beside the caret's are known and neither is air at
+        // Both rows beside the caret's are known and neither is open round
         // `col`: a row past the pane's edge, or one the frame did not read,
-        // seats nothing.
+        // seats nothing. Read as the dust's air (a row blank across), a row
+        // beside lettered anywhere was never air, so a caret stepping to a
+        // gap in the row above kept every particle seated in the caret's
+        // row where the gap's air stood open over it.
         let dense_at = |r: i32, col: i32| {
-            let dense = |side: i32| text.knows_row(side) && !air_at(side, col);
+            let dense = |side: i32| text.knows_row(side) && !open_round(side, col);
             dense(r - 1) && dense(r + 1)
         };
         let seat_r = sz as f32;
@@ -5836,6 +5918,22 @@ impl CursorGlow {
         let spark_head_only = self.laser_spark_head_only;
         #[cfg(not(test))]
         let spark_head_only = false;
+        #[cfg(test)]
+        let bars_per_frame = self.bars_cut_per_frame;
+        #[cfg(not(test))]
+        let bars_per_frame = false;
+        // Whether a Laser spark (its whole dash) or a Water drop `p` at `age`
+        // meets a filled row other than the caret's.
+        let meets_bar = |p: &Particle, age: f32| {
+            let x = p.x0 + p.vx * age;
+            let y = p.y0 + p.vy * age + 0.5 * p.gy * age * age;
+            grid.near_filled(x, y)
+                || (laser && !spark_head_only && {
+                    let vy = p.vy + p.gy * age;
+                    let (tx, ty) = (x - p.vx * LASER_SPARK_TRAIL_S, y - vy * LASER_SPARK_TRAIL_S);
+                    grid.near_filled(tx, ty) || grid.near_filled(0.5 * (x + tx), 0.5 * (y + ty))
+                })
+        };
         #[cfg(test)]
         let sparkle_wheel = self.sparkle_wheel;
         #[cfg(not(test))]
@@ -5849,18 +5947,16 @@ impl CursorGlow {
         };
         let fine_star_arm = star_arm_px(star_arm(ch, STAR_ARM_FINE));
         // A chosen trail colour is drawn as itself: the shower's family is
-        // the pin's, never brought to the gold's chroma.
-        #[cfg(test)]
-        let shower_pin_read = !self.sparkle_pin_saturated;
-        #[cfg(not(test))]
-        let shower_pin_read = true;
-        let shower_pinned =
-            shower_pin_read && self.colour_pins.trail && cfg.style.draws_trail_color();
+        // the pin's, never brought to the gold's chroma, and on paper its
+        // beads, moon and stars are the pin's ([`Self::sparkle_pinned`]).
+        let shower_pinned = self.sparkle_pinned(cfg);
         let sparkle_gold_rgb = if sparkle && dark {
             Self::shower_gold(cfg, shower_pinned)
         } else {
             0
         };
+        let (paper_beads, paper_moon, dark_moon, paper_star) =
+            Self::sparkle_marks(cfg, shower_pinned);
         let laser_light_ink = if matches!(cfg.style, GlowStyle::Laser) && !dark {
             InkRole::OverText.ink(cfg.color)
         } else {
@@ -6008,7 +6104,47 @@ impl CursorGlow {
             }
             drawn = Some(pi);
             let age = now.saturating_duration_since(p.born).as_secs_f32();
-            let t = (age / p.life).clamp(0.0, 1.0);
+            // A Laser spark (its whole dash) or a Water drop keeps off a
+            // filled row other than the caret's: on a prompt's powerline bar
+            // above the typed line Laser's spark stood as a lone violet dash
+            // apart from its bolt, and Water's drops as specks (Solarized
+            // Dark's `context`, looks9 Q8). Its first paint reads its whole
+            // flight against the page: it fades out to where the flight
+            // first meets one, and one that meets one within
+            // [`Self::BAR_SHOWN_MIN`] is never drawn; a bar the page lays in
+            // its way later puts it out for good. Put out the frame its
+            // flight met the bar, a spark rising into a bar's margin went out
+            // halfway up (looks9's review).
+            let mut latch = p.latch;
+            if bars_kept && (laser || water) {
+                if bars_per_frame {
+                    if meets_bar(&p, age) {
+                        continue;
+                    }
+                } else if !latch.judged {
+                    latch.judged = true;
+                    let mut a = age;
+                    while a < p.life {
+                        if meets_bar(&p, a) {
+                            latch.end = if a < age + Self::BAR_SHOWN_MIN {
+                                age
+                            } else {
+                                a
+                            };
+                            break;
+                        }
+                        a += Self::BAR_SCAN_S;
+                    }
+                    self.particles[pi].latch = latch;
+                } else if age < latch.end && meets_bar(&p, age) {
+                    latch.end = age;
+                    self.particles[pi].latch = latch;
+                }
+            }
+            if age >= latch.end {
+                continue;
+            }
+            let t = (age / p.life.min(latch.end)).clamp(0.0, 1.0);
             let fade = 1.0 - t;
             let raw_cov = base_cov * p.cov_scale * fade * cfg.intensity;
             if raw_cov < 1.0 {
@@ -6016,8 +6152,19 @@ impl CursorGlow {
             }
             let x = p.x0 + p.vx * age;
             let y = p.y0 + p.vy * age + 0.5 * p.gy * age * age;
+            // A Comet grain once seated keeps its row ([`DustSeat`]): seated
+            // afresh by its height every frame, a grain whose flight leaves
+            // the row's glyph band drops out of its seat to its own height.
             let leading_band = if comet_dark_leading {
-                grid.glyph_band(y)
+                match latch.seat {
+                    DustSeat::Leading { top_dy } | DustSeat::Air { top_dy, .. }
+                        if !seat_unlatched && !comet_regimented =>
+                    {
+                        let top = p.y0 + top_dy;
+                        Some((((top - oyf) * inv_ch).round() as i32, top))
+                    }
+                    _ => grid.glyph_band(y),
+                }
             } else {
                 None
             };
@@ -6057,11 +6204,48 @@ impl CursorGlow {
                         // tail, than above it.
                         let high = k < Self::COMET_DARK_DUST_ABOVE;
                         let side = if high { band_row - 1 } else { band_row + 1 };
+                        let beyond = if high { band_row - 2 } else { band_row + 2 };
                         // A grain floats only into air on the page's own
                         // ground: beside a filled row (a prompt's powerline
                         // bar) it settled on the bar as white specks (looks9
-                        // Q1).
-                        let air = !icy_dust_off && air_at(side, col);
+                        // Q1). Its seat (the air beside its row, and how
+                        // deep) is judged the frame it is seated and kept
+                        // ([`DustSeat`]): judged afresh, the frame's read of
+                        // the rows round the caret dropped the row past the
+                        // air when the caret stepped up a row, and every deep
+                        // grain snapped up a row's height and stopped
+                        // (looks9's review). A page that letters or fills its
+                        // air later puts it out for good.
+                        let (air, rows_of_air) = match latch.seat {
+                            DustSeat::Air { rows, .. } if !seat_unlatched => {
+                                if (text.knows_row(side) && !air_at(side, col))
+                                    || (rows > 1 && text.knows_row(beyond) && !air_at(beyond, col))
+                                {
+                                    self.particles[pi].latch.end = age;
+                                    continue;
+                                }
+                                (true, f32::from(rows))
+                            }
+                            DustSeat::Leading { .. } if !seat_unlatched => (false, 1.0),
+                            _ => {
+                                let air = !icy_dust_off && air_at(side, col);
+                                // The looks9 path reads the row past the air
+                                // by the column the grain was shed at.
+                                let col0 = if seat_unlatched {
+                                    ((p.x0 - oxf) * inv_cw).floor() as i32
+                                } else {
+                                    col
+                                };
+                                let rows: u8 = if air && air_at(beyond, col0) { 2 } else { 1 };
+                                let top_dy = top - p.y0;
+                                self.particles[pi].latch.seat = if air {
+                                    DustSeat::Air { top_dy, rows }
+                                } else {
+                                    DustSeat::Leading { top_dy }
+                                };
+                                (air, f32::from(rows))
+                            }
+                        };
                         let life = (age / p.life).clamp(0.0, 1.0);
                         if air && plume_even {
                             // The plume as looks9 round 1 laid it (the
@@ -6090,11 +6274,6 @@ impl CursorGlow {
                             if (p.hue * 6007.0).fract() < Self::COMET_DARK_DUST_THIN * life * life {
                                 continue;
                             }
-                            // Seated by the column the grain was shed at, so its
-                            // fan does not jump as it drifts across a column.
-                            let col0 = ((p.x0 - oxf) * inv_cw).floor() as i32;
-                            let beyond = if high { band_row - 2 } else { band_row + 2 };
-                            let rows_of_air = if air_at(beyond, col0) { 2.0 } else { 1.0 };
                             // Each grain's own disc at its largest (its size,
                             // below; looks9 round 3) keeps it short of the
                             // air's end: held to the largest grain's, one row
@@ -6273,23 +6452,6 @@ impl CursorGlow {
                 continue;
             }
             if sparkle && (grid.near_filled_from(x, y, row, col) || grid.lettered_near_at(row, col))
-            {
-                continue;
-            }
-            // A Laser spark (its whole dash) or a Water drop keeps off a
-            // filled row other than the caret's: on a prompt's powerline bar
-            // above the typed line Laser's spark stood as a lone violet dash
-            // apart from its bolt, and Water's drops as specks (Solarized
-            // Dark's `context`, looks9 Q8).
-            if bars_kept
-                && (laser || water)
-                && (grid.near_filled_from(x, y, row, col)
-                    || (laser && !spark_head_only && {
-                        let vy = p.vy + p.gy * age;
-                        let (tx, ty) =
-                            (x - p.vx * LASER_SPARK_TRAIL_S, y - vy * LASER_SPARK_TRAIL_S);
-                        grid.near_filled(tx, ty) || grid.near_filled(0.5 * (x + tx), 0.5 * (y + ty))
-                    }))
             {
                 continue;
             }
@@ -6546,7 +6708,7 @@ impl CursorGlow {
                                             centre: (ix, iy),
                                             mass: star_arm(ch, ratio) * STAR_ARM_INK,
                                             step: 0,
-                                            rgb: Self::SPARKLE_PAPER_STAR,
+                                            rgb: paper_star,
                                             gold: false,
                                             cov: Self::paper_gold_alpha(scov),
                                         },
@@ -6608,7 +6770,7 @@ impl CursorGlow {
                                         geom,
                                         (x, y),
                                         r * Self::SPARKLE_PAPER_BEAD,
-                                        (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                                        paper_beads,
                                         Self::paper_gold_alpha(scov),
                                     );
                                 }
@@ -6633,7 +6795,7 @@ impl CursorGlow {
                                     geom,
                                     (x, y),
                                     r * Self::SPARKLE_PAPER_BEAD,
-                                    (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                                    paper_beads,
                                     Self::paper_gold_alpha(cov),
                                 );
                             }
@@ -6656,7 +6818,7 @@ impl CursorGlow {
                                     geom,
                                     (x, y),
                                     r,
-                                    Self::MOON_GOLD,
+                                    dark_moon,
                                     moon,
                                     sparkle_dark_crescent_ink,
                                 );
@@ -6666,7 +6828,7 @@ impl CursorGlow {
                                     geom,
                                     (x, y),
                                     r,
-                                    Self::SPARKLE_PAPER_MOON,
+                                    paper_moon,
                                     Self::paper_gold_alpha(moon),
                                     CrescentInk::Over,
                                 );
@@ -6690,7 +6852,7 @@ impl CursorGlow {
                                     vy,
                                     0.08,
                                     thick,
-                                    Self::SPARKLE_PAPER_RIM,
+                                    paper_beads.0,
                                     Self::paper_gold_alpha(cov),
                                 );
                                 push_paper_bead(
@@ -6698,7 +6860,7 @@ impl CursorGlow {
                                     geom,
                                     (x, y),
                                     thick * 1.2,
-                                    (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                                    paper_beads,
                                     Self::paper_gold_alpha(cov),
                                 );
                             }
@@ -6940,7 +7102,7 @@ impl CursorGlow {
     #[must_use]
     pub(super) const fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         if matches!(cfg.style, GlowStyle::Sparkle) {
-            return Self::sparkle_gold_at(cfg, pos);
+            return Self::sparkle_gold_at(cfg, self.sparkle_pinned(cfg), pos);
         }
         let base = style_comet_color(cfg.style, cfg.color, cfg.accent, self.hue, pos);
         if matches!(cfg.style, GlowStyle::Water) && self.heat > 0.0 {
@@ -7034,10 +7196,13 @@ impl CursorGlow {
         if !self.night_grounded(cfg) {
             return None;
         }
+        // A pinned colour's palette is the pin's ([`Self::sparkle_pinned`]):
+        // its bit keys the memo beside the colour.
+        let pinned = self.sparkle_pinned(cfg);
         let key = (
             cfg.theme_bg & 0x00FF_FFFF,
             cfg.style,
-            cfg.color & 0x00FF_FFFF,
+            (cfg.color & 0x00FF_FFFF) | if pinned { 1 << 24 } else { 0 },
         );
         match self.night_memo {
             Some((k, ng)) if k.0 == key.0 && k.1 as u8 == key.1 as u8 && k.2 == key.2 => ng,
@@ -7047,9 +7212,9 @@ impl CursorGlow {
                     GlowStyle::Sparkle => night_ground(
                         key.0,
                         &[
-                            Self::sparkle_gold_at(cfg, 0.0),
-                            Self::sparkle_gold_at(cfg, 0.5),
-                            Self::sparkle_gold_at(cfg, 1.0),
+                            Self::sparkle_gold_at(cfg, pinned, 0.0),
+                            Self::sparkle_gold_at(cfg, pinned, 0.5),
+                            Self::sparkle_gold_at(cfg, pinned, 1.0),
                             crate::effect_util::twinkle_rgb(true),
                             cfg.color & 0x00FF_FFFF,
                         ],
@@ -7231,12 +7396,70 @@ impl CursorGlow {
     /// The warm white Sparkle's shower lifts toward ([`Self::sparkle_shower`]).
     pub(super) const SPARKLE_WARM_WHITE: u32 = 0x00FF_F6E6;
 
-    /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head).
+    /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head): a `pinned`
+    /// trail colour as itself, only darkened toward the tail
+    /// ([`Self::shade_pin_to_tail`]).
     #[inline]
     #[must_use]
-    pub(super) const fn sparkle_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
-        Self::shade_gold_to_tail(Self::sparkle_gold(cfg), pos)
+    pub(super) const fn sparkle_gold_at(cfg: &GlowConfig, pinned: bool, pos: f32) -> u32 {
+        if pinned {
+            Self::shade_pin_to_tail(cfg.color & 0x00FF_FFFF, pos)
+        } else {
+            Self::shade_gold_to_tail(Self::sparkle_gold(cfg), pos)
+        }
     }
+
+    /// A pinned colour along Sparkle's tail: its hue kept and its value
+    /// eased down toward the tail as the gold's is, its saturation never
+    /// raised, so its chroma never passes the pin's. Through the gold's own
+    /// shade and its floor of 0.72, a pinned `#b0b0c8` (saturation 0.12)
+    /// laid its body and tail at 0.73 (looks9's review).
+    #[inline]
+    const fn shade_pin_to_tail(pin: u32, pos: f32) -> u32 {
+        let (h, s, v) = crate::color_math::rgb2hsv(pin);
+        let k = 1.0 - pos.clamp(0.0, 1.0);
+        let k = k * k * (3.0 - 2.0 * k);
+        crate::color_math::hsv2rgb(h, s, v * (1.0 - 0.08 * k))
+    }
+
+    /// Whether Sparkle draws a pinned trail colour as itself
+    /// ([`crate::cursor_glow::ColourPins`]): the dark shower, the body and
+    /// tail, the bloom, the paper beads, stars and the moons are then the pin's
+    /// (looks9's review: only the dark shower read it). A test's control
+    /// ([`Self::sparkle_pin_saturated`]) reads the pin nowhere.
+    #[inline]
+    pub(super) const fn sparkle_pinned(&self, cfg: &GlowConfig) -> bool {
+        #[cfg(test)]
+        if self.sparkle_pin_saturated {
+            return false;
+        }
+        self.colour_pins.trail && cfg.style.draws_trail_color()
+    }
+
+    /// Sparkle's marks off the shower: the paper beads' rim and core, the
+    /// paper moon, the dark moon and the paper star. A `pinned` colour's are
+    /// the pin (the rim, the paper moon and the paper star the pin a shade
+    /// toward black, in its hue and short of its chroma); else the golds.
+    #[inline]
+    const fn sparkle_marks(cfg: &GlowConfig, pinned: bool) -> ((u32, u32), u32, u32, u32) {
+        if pinned {
+            let pin = cfg.color & 0x00FF_FFFF;
+            let rim = lerp_rgb(pin, 0, Self::SPARKLE_PIN_RIM_SHADE);
+            ((rim, pin), rim, pin, rim)
+        } else {
+            (
+                (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                Self::SPARKLE_PAPER_MOON,
+                Self::MOON_GOLD,
+                Self::SPARKLE_PAPER_STAR,
+            )
+        }
+    }
+
+    /// How far toward black a pinned colour's paper rim lies
+    /// ([`Self::sparkle_marks`]): the gold's rim is about this much darker
+    /// than its core.
+    const SPARKLE_PIN_RIM_SHADE: f32 = 0.35;
 
     #[inline]
     const fn shade_gold_to_tail(gold: u32, pos: f32) -> u32 {
@@ -7269,10 +7492,14 @@ impl CursorGlow {
         crate::color_math::hsv2rgb(turned, s * Self::COMET_LIGHT_ICE_SAT, v)
     }
 
-    /// Sparkle's body gold on paper at `pos`, shaded toward the tail.
+    /// Sparkle's body gold on paper at `pos`, shaded toward the tail; a
+    /// `pinned` trail colour as itself ([`Self::sparkle_gold_at`]).
     #[inline]
     #[must_use]
-    pub(crate) const fn sparkle_paper_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
+    pub(crate) const fn sparkle_paper_gold_at(cfg: &GlowConfig, pinned: bool, pos: f32) -> u32 {
+        if pinned {
+            return Self::shade_pin_to_tail(cfg.color & 0x00FF_FFFF, pos);
+        }
         let gold = if cfg.color & 0x00FF_FFFF == SPARKLE_DEFAULT_COLOR {
             Self::SPARKLE_PAPER_CORE
         } else {

@@ -7576,15 +7576,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             let card_from = card_rows_wanted.then(|| t.screen_mutations());
                             t.holder_rings();
                             cuts.observe(emitted, &t, &cast_watermark);
-                            let spine_pre = temporal_lane
-                                .0
-                                .as_ref()
-                                .map(|_| crate::temporal::SpinePre::take(&t));
                             #[cfg(unix)]
                             let mut journal_pre = journal.as_ref().map(|j| j.pre(&t));
                             if let (Some(e), Some(v)) = (edge, verdicts)
                                 && e.from != e.to
                             {
+                                let spine_pre = temporal_lane
+                                    .0
+                                    .as_ref()
+                                    .map(|_| crate::temporal::SpinePre::take(&t));
                                 handback_at = None;
                                 fg_owners.observe(
                                     e.from,

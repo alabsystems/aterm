@@ -377,6 +377,51 @@ fn a_pane_focus_move_dumps_the_same_words_twice() {
     );
 }
 
+/// Each frame's `px` line of `text`'s dump.
+fn pixels(text: &str) -> Vec<String> {
+    dumped(text)
+        .lines()
+        .filter(|line| line.starts_with("  px "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `page wallpaper` lays the rig's picture under the page (§15.1 P0.6's wallpaper page): its
+/// frames' pixels leave the opaque page's, which shows none (the negative control).
+#[test]
+fn a_wallpaper_page_lays_its_picture() {
+    let page = |page: &str| {
+        pixels(&format!(
+            "grid 4 20\nstyle rainbow kitty\nhz 60\npage {page}\nat 0 pty \"$ \"\nrun 40\n"
+        ))
+    };
+    let (wallpaper, opaque) = (page("wallpaper"), page("opaque"));
+    assert!(!wallpaper.is_empty() && wallpaper.len() == opaque.len());
+    assert!(
+        wallpaper.iter().zip(&opaque).all(|(w, o)| w != o),
+        "the wallpaper shows on every frame"
+    );
+}
+
+/// `pane <i> theme <fg> <bg>` dresses pane `i` in its own theme (§15.1 P0.6's mixed split): a
+/// split whose first pane wears a dark theme draws other pixels than the same split with none
+/// (the negative control).
+#[test]
+fn a_pane_theme_dresses_its_pane() {
+    let split = |theme: &str| {
+        pixels(&format!(
+            "grid 6 40\nstyle rainbow kitty\nhz 60\npanes 2\n{theme}focus-pane 1\n\
+             at 0 pty \"$ \"\nrun 40\n"
+        ))
+    };
+    let (dressed, plain) = (split("pane 0 theme #c0caf5 #1a1b26\n"), split(""));
+    assert!(!dressed.is_empty() && dressed.len() == plain.len());
+    assert!(
+        dressed.iter().zip(&plain).all(|(d, p)| d != p),
+        "the dark pane shows on every frame"
+    );
+}
+
 #[test]
 fn an_unknown_directive_exits_2() {
     let dir = crate::test_scratch::short_dir("trail-dump");

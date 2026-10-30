@@ -352,6 +352,21 @@ pub fn previous_release(
     Ok(Some((release, commit)))
 }
 
+/// The public release that starts a checkout's next harness release window.
+/// A checkout still at a shipped version compares against that version; one already
+/// bumped to an unshipped version compares against the last version that shipped.
+fn bump_base_release(
+    ledger_text: &str,
+    version: &str,
+    tags: &str,
+) -> Result<Option<(String, String)>> {
+    previous_release(
+        ledger_text,
+        &crate::publish::bump_minor_release(version)?,
+        tags,
+    )
+}
+
 /// `ship harness-bump` at checkout `root`.
 ///
 /// # Errors
@@ -366,7 +381,7 @@ pub fn run(root: &Path) -> Result<()> {
         &crate::publish::workspace_version(&manifest)?,
     )?;
     let tags = git_ok(&git, &["ls-remote", "--tags", "origin"])?.stdout_utf8();
-    let Some((release, commit)) = previous_release(&ledger_text, &version, &tags)? else {
+    let Some((release, commit)) = bump_base_release(&ledger_text, &version, &tags)? else {
         println!("harness-bump: no public release precedes v{version}; nothing is owed");
         return Ok(());
     };
@@ -650,6 +665,20 @@ fn read() {}
             previous_release(ledger, "0.3.0", "abc123\trefs/tags/v0.2.0\n").unwrap(),
             Some(("0.2.0".to_owned(), "abc123".to_owned())),
             "CONTROL"
+        );
+    }
+
+    #[test]
+    fn bump_uses_the_latest_shipped_release_before_and_after_the_version_bump() {
+        let ledger = "# seed\n1 0.1.0\n2 0.2.0\n3 0.3.0\n";
+        let tags = "abc123\trefs/tags/v0.1.0\ndef456\trefs/tags/v0.2.0\n";
+        let expected = Some(("0.2.0".to_owned(), "def456".to_owned()));
+        assert_eq!(bump_base_release(ledger, "0.2.0", tags).unwrap(), expected);
+        assert_eq!(bump_base_release(ledger, "0.3.0", tags).unwrap(), expected);
+        assert_eq!(
+            previous_release(ledger, "0.2.0", tags).unwrap(),
+            Some(("0.1.0".to_owned(), "abc123".to_owned())),
+            "the release gate still compares a candidate against its predecessor"
         );
     }
 

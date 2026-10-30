@@ -90,6 +90,8 @@ pub(super) fn cfg(dark: bool) -> MomentumGlowConfig {
         block: true,
         glyph_span: None,
         light_vivid: false,
+        chosen_hue: false,
+        chosen_base: false,
     }
 }
 

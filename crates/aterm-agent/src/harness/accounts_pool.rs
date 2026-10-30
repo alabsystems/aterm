@@ -2117,6 +2117,15 @@ fn session_plan_using(
         return SessionPlan::stay(StayWhy::NothingDue);
     }
     let enrolled = accounts::enrolled_in(s.cli, roster, seat.home);
+    // record_session timestamps an unstamped wall at this seat's observation
+    // time. Keep that receipt when admission happens later.
+    let point = match &s.point {
+        Point::Wall { window, at: None } => Point::Wall {
+            window: window.clone(),
+            at: Some(seat.now),
+        },
+        point => point.clone(),
+    };
     let mut excluded = std::collections::BTreeSet::new();
     let mut saw_line_failure = false;
     let (advice, line) = loop {
@@ -2128,7 +2137,7 @@ fn session_plan_using(
             &candidates,
             &enrolled,
             &me,
-            &s.point,
+            &point,
             s.mode,
             seat.now,
         );
@@ -2168,7 +2177,7 @@ fn session_plan_using(
                 cli: s.cli,
                 sid: s.sid.to_owned(),
                 supervisor: s.supervisor,
-                point: s.point.clone(),
+                point,
                 mode: s.mode,
             },
             before: snapshot,

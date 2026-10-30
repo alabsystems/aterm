@@ -47,7 +47,7 @@ pub fn kill_group(pgid: u32, signal: i32) -> io::Result<()> {
 #[must_use]
 pub fn alive(pid: u32) -> bool {
     const EPERM: i32 = 1;
-    let Ok(pid) = c_int::try_from(pid) else {
+    let Some(pid) = c_int::try_from(pid).ok().filter(|p| *p > 0) else {
         return false;
     };
     // SAFETY: `kill` takes two integers and reads no memory of ours; signal 0 sends none.
@@ -91,6 +91,9 @@ mod tests {
                 "pgid {pgid}"
             );
         }
+        assert!(!alive(0));
+        assert!(!alive(u32::MAX));
+        assert!(alive(std::process::id()));
     }
 }
 

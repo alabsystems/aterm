@@ -55,6 +55,7 @@ use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::memory::StageKey as _;
 use aterm_capacity::Machine as _;
 
 pub use checks::Check;
@@ -648,10 +649,19 @@ impl Ctx {
         self
     }
 
-    /// Measure each stage's memory and keep its peak in `book` ([`Ctx::memory`]).
+    /// Measure each stage's memory and keep its peak in `book` ([`Ctx::memory`]). Each stage's
+    /// memory claim covers the builds its children start ([`aterm_capacity::Need::covers`]): a
+    /// stage's children are handed its own claim's cover marker ([`aterm_capacity::COVER_ENV`],
+    /// [`memory::cover`]), so a build a test runs that would claim (`atpkg::build_admit`) claims
+    /// nothing more while its stage's claim is held, and every other child of the run is handed
+    /// [`aterm_capacity::NO_COVER`], so a stage that claimed nothing never borrows another's.
     #[must_use]
     pub fn with_memory(mut self, book: memory::Book) -> Self {
         self.memory = Some(book);
+        self.child_env_add.push((
+            aterm_capacity::COVER_ENV.into(),
+            aterm_capacity::NO_COVER.into(),
+        ));
         self
     }
 
@@ -1024,6 +1034,16 @@ struct MemoryClaim {
     said: String,
 }
 
+impl MemoryClaim {
+    /// The cover marker its stage's children are handed ([`memory::cover`]); `None` where it runs
+    /// unadmitted.
+    fn cover(&self) -> Option<std::sync::Arc<str>> {
+        self._claim
+            .as_ref()
+            .map(|c| std::sync::Arc::from(c.record().cover_marker()))
+    }
+}
+
 /// How `claim`, admitted as `mode` says, came to be admitted, for its stage's time line: by
 /// `--admit now`; after how long a wait for what (behind which claims, for the memory pressure to
 /// ease, or for memory no claim holds); and alone ([`aterm_capacity::Alone`]). Empty for a claim
@@ -1099,7 +1119,9 @@ fn claim_memory(
     };
     let title = &spec.title;
     let ask = |alone: bool| {
-        let need = aterm_capacity::Need::new(format!("verify {title}")).mem(spec.mem);
+        let need = aterm_capacity::Need::new(format!("verify {title}"))
+            .mem(spec.mem)
+            .covers();
         if alone { need.alone() } else { need }
     };
     let beyond = spec.mem >= budget;
@@ -1176,6 +1198,7 @@ fn staged(
             return Err(ENDING.to_owned());
         }
         let _metering = memory::metering(meter.clone());
+        let _covering = memory::covering(claim.as_ref().and_then(MemoryClaim::cover));
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
         let report = stage(ctx, spec);

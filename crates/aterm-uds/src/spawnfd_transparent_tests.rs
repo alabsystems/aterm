@@ -217,6 +217,42 @@ fn sh_run(transparent_run: bool, script: &str, out: &std::path::Path) -> (ExitSt
     (status, std::fs::read_to_string(out).unwrap_or_default())
 }
 
+/// A variable set on a [`transparent`] command reaches its child over this process's own, the
+/// last set of a key winning, and the rest of the environment is inherited. NEGATIVE CONTROL: the
+/// same command with nothing set hands the child this process's `HOME` and no such variable.
+#[test]
+fn a_variable_set_on_a_transparent_command_reaches_its_child_over_the_inherited_ones() {
+    let dir = std::env::temp_dir().join(format!("spawnfd-transparent-env-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let out = dir.join("out");
+    let out_s = out.to_str().expect("a UTF-8 scratch path");
+    let script = "printf '%s|%s|%s' \"${ATERM_UDS_SET-unset}\" \"$HOME\" \"${ATERM_UDS_TWICE-unset}\" > \"$1\"";
+    let home = std::env::var("HOME").unwrap_or_default();
+    let status = transparent("/bin/sh")
+        .args(["-c", script, "sh", out_s])
+        .env("ATERM_UDS_SET", "on")
+        .env("HOME", "/elsewhere")
+        .env("ATERM_UDS_TWICE", "first")
+        .env("ATERM_UDS_TWICE", "second")
+        .status()
+        .expect("run /bin/sh");
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("its output"),
+        "on|/elsewhere|second"
+    );
+    let status = transparent("/bin/sh")
+        .args(["-c", script, "sh", out_s])
+        .status()
+        .expect("run /bin/sh");
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("its output"),
+        format!("unset|{home}|unset")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The staged half of [`a_transparent_run_is_the_std_run_it_replaces`].
 fn staged_signals() {
     // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL`, and a mask change for this

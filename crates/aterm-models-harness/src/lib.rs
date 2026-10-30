@@ -116,6 +116,7 @@ mod models_codex_usage_walls;
 mod models_cold_resume_capability;
 mod models_cold_resume_environment;
 mod models_disk;
+mod models_disk_discovery_cycle;
 mod models_disk_projected;
 mod models_disk_worker;
 mod models_fleet_machine_assignment;
@@ -125,6 +126,7 @@ mod models_harness_host;
 mod models_harness_owed_relaunch;
 mod models_harness_policy_writer;
 mod models_harness_progress;
+mod models_harness_quiet;
 mod models_harness_snapshot_read;
 mod models_harness_state_collection;
 mod models_left;
@@ -246,6 +248,7 @@ pub use models_cold_resume_environment::cold_resume_environment_model;
 pub use models_disk::{
     disk_await_liveness, disk_await_model, disk_free_ask_model, disk_reclaim_pass_model,
 };
+pub use models_disk_discovery_cycle::disk_discovery_cycle_model;
 pub use models_disk_projected::disk_projected_hold_model;
 pub use models_disk_worker::disk_free_worker_model;
 pub use models_fleet_machine_assignment::fleet_machine_assignment_model;
@@ -264,6 +267,7 @@ pub use models_harness_policy_writer::{
     harness_policy_one_writer_liveness, harness_policy_one_writer_model,
 };
 pub use models_harness_progress::*;
+pub use models_harness_quiet::{harness_upgrade_quiet_liveness, harness_upgrade_quiet_model};
 pub use models_harness_snapshot_read::harness_snapshot_read_model;
 pub use models_harness_state_collection::{
     harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,

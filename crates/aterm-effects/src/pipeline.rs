@@ -1089,6 +1089,15 @@ impl EffectsPipeline {
         self.cursor.glow.letter_guard_work()
     }
 
+    /// A test's negative control: the frame's combining marks unread, a
+    /// marked cell short by its base letter alone
+    /// (`CursorGlow::set_frame_marks_unread`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_frame_marks_unread(&mut self, on: bool) {
+        self.cursor.glow.set_frame_marks_unread(on);
+    }
+
     /// A test's negative control: a lit page's bed laid at the page's
     /// luminance in the air too (`CursorGlow::set_bed_air_light`).
     #[cfg(any(test, debug_assertions))]
@@ -1847,6 +1856,7 @@ impl EffectsPipeline {
             .with_animate(animate)
             .with_frame_cells(Some(&input.cells))
             .with_frame_cells_cols(input.cols)
+            .with_frame_marks(&input.combining)
             .with_row_probe(match probe_row {
                 Some((row, caret)) => Some(native::RowProbe {
                     row,

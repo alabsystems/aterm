@@ -230,8 +230,17 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Record a host-typed turn (`kind`) against wall memory.
+    /// Record a host-typed turn (`kind`) against wall memory. A fact (`HostTurn::Fact`: the
+    /// quiet upgrade's line, the disk-free ask's) keeps a record of its own at an idle point as at
+    /// a break ([`super::policy::turn_end::TurnEndState::fact_typed`]), so what the loop awaits or
+    /// owes past it (a land check, a continuation's answer) stays. A replay of a tape whose
+    /// recording build had no break door with guards (`host.at_background_on`) records it as
+    /// that build did, as any host turn.
     pub(super) fn host_turn(&mut self, kind: HostTurn, seq: u64) {
+        if kind == HostTurn::Fact && !self.fx.replay_lacks_host_door("host.at_background_on") {
+            self.turn_end.fact_typed();
+            return;
+        }
         let unasked = self.turn_end.fallback_unasked();
         self.turn_end.host_typed(self.fx.mono(), kind);
         self.fallback_asked(unasked, seq);

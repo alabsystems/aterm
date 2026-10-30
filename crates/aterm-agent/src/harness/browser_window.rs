@@ -378,7 +378,7 @@ fn host_name() -> Option<String> {
 #[cfg(unix)]
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 sends nothing; it only asks whether `pid` exists and may be signalled.
-    unsafe { libc::kill(pid, 0) == 0 }
+    pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Whether the live process `pid` started after the `SingletonLock` `lock` was written (its
@@ -488,12 +488,14 @@ fn singleton_holder(profile: &Path) -> Option<Holder> {
 #[cfg(unix)]
 #[must_use]
 pub fn profile_holder(profile: &Path) -> Option<Holder> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(holder) = singleton_holder(profile) {
         return Some(holder);
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(profile.join(PROFILE_LOCK_FILE))
         .ok()?;
     match ProfileLock::try_take(file) {
@@ -519,8 +521,9 @@ pub const PROFILE_LOCK_FILE: &str = "aterm-profile.lock";
 
 /// The pid written into `profile`'s [`PROFILE_LOCK_FILE`].
 fn lock_pid(profile: &Path) -> Option<i32> {
-    std::fs::read_to_string(profile.join(PROFILE_LOCK_FILE))
-        .ok()?
+    super::accounts::read_bounded(&profile.join(PROFILE_LOCK_FILE), 256)
+        .ok()
+        .flatten()?
         .trim()
         .parse()
         .ok()
@@ -599,7 +602,10 @@ impl ProfileLock {
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
         let file = options
             .open(profile.join(PROFILE_LOCK_FILE))
             .map_err(Refusal::Unlockable)?;
@@ -626,8 +632,9 @@ pub fn quiet_password_manager(profile: &Path) -> std::io::Result<()> {
     let dir = profile.join("Default");
     aterm_types::fs_restricted::ensure_private_dir(&dir)?;
     let path = dir.join("Preferences");
-    let mut prefs = std::fs::read_to_string(&path)
+    let mut prefs = super::accounts::read_bounded(&path, 16 * 1024 * 1024)
         .ok()
+        .flatten()
         .and_then(|text| aterm_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
@@ -642,9 +649,7 @@ pub fn quiet_password_manager(profile: &Path) -> std::io::Result<()> {
         }
     }
     let text = aterm_json::to_string(&prefs).map_err(std::io::Error::other)?;
-    let staged = dir.join("Preferences.aterm-new");
-    std::fs::write(&staged, text)?;
-    std::fs::rename(&staged, &path)
+    super::upgrade_models::write_atomic(&path, &text)
 }
 
 /// The sites of identity providers whose cookies are dropped under any top-level domain
@@ -870,7 +875,7 @@ pub const MAKE_UP_WITHIN: Duration = Duration::from_secs(30);
 /// # Errors
 /// The mark could not be written.
 pub fn mark_untidied(profile: &Path) -> std::io::Result<()> {
-    std::fs::write(profile.join(UNTIDIED_MARK), "")
+    super::upgrade_models::write_atomic(&profile.join(UNTIDIED_MARK), "")
 }
 
 /// Removes `profile`'s [`UNTIDIED_MARK`] once its identity providers' cookies are gone.
@@ -893,7 +898,7 @@ pub fn make_up_tidy(
     profile: &Path,
     deadline: Instant,
 ) -> Option<Result<usize, String>> {
-    if !profile.join(UNTIDIED_MARK).exists() {
+    if std::fs::symlink_metadata(profile.join(UNTIDIED_MARK)).is_err() {
         return None;
     }
     let made = blank_target(cdp, deadline).and_then(|(target_id, page)| {
@@ -1032,7 +1037,10 @@ pub fn tidy_profile(
         .map_err(|e| format!("{} did not start ({e})", browser_name(&browser.path)))?;
     let _guard = super::headless_oauth::BrowserChild::new(child);
     let mut cdp = super::headless_oauth::CdpClient::new(cmd_write, out_read);
-    tidy_over_cdp(&mut cdp, session, Instant::now() + within)
+    let deadline = Instant::now()
+        .checked_add(within)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+    tidy_over_cdp(&mut cdp, session, deadline)
 }
 
 /// Non-Unix: nothing is tidied.
@@ -1152,7 +1160,9 @@ pub(crate) fn run_window_with(
         let _ = child.kill();
         let _ = child.wait();
     };
-    let deadline = std::time::Instant::now() + hang;
+    let deadline = std::time::Instant::now()
+        .checked_add(hang)
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(86_400));
     let asked = loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(exit_end(status)),
@@ -1174,7 +1184,9 @@ pub(crate) fn run_window_with(
         // SAFETY: a hangup to this window's own child, not yet reaped.
         unsafe { libc::kill(pid, libc::SIGHUP) };
     }
-    let until = std::time::Instant::now() + grace;
+    let until = std::time::Instant::now()
+        .checked_add(grace)
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(86_400));
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(asked),

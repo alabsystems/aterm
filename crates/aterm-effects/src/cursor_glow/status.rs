@@ -1233,7 +1233,8 @@ pub(crate) struct FrameText {
     /// Row-major cell `(ink, ground)` pairs (`0x00RRGGBB`) for each read row.
     pub(super) pairs: Vec<Option<(Option<u32>, u32)>>,
     /// Row-major, alongside [`Self::pairs`]: whether the cell's glyph keeps
-    /// under the x-height ([`super::emit::is_short_glyph`]).
+    /// under the x-height ([`super::emit::is_short_glyph`], and no combining
+    /// mark stands over it).
     pub(super) short: Vec<bool>,
     /// Row-major, alongside [`Self::pairs`]: the cell's glyph as the face's
     /// [`aterm_render::GlyphInk`] indexes it ([`aterm_render::GlyphInk::index`]).
@@ -1378,6 +1379,17 @@ impl<'a> TextView<'a> {
             c += 1;
         }
         true
+    }
+
+    /// Whether window cell `(row, col)` lies outside the pane the frame
+    /// handed ([`FrameText::past_pane`]); `false` with no frame, or a frame
+    /// that handed none.
+    #[inline]
+    pub(crate) const fn past_pane(&self, row: i32, col: i32) -> bool {
+        match self.cells {
+            Some(cells) => cells.past_pane(row, col),
+            None => false,
+        }
     }
 
     /// The frame's own read of `row`: `Some(span)` for a row it read

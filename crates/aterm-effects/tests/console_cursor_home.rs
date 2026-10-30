@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use aterm_core::render::RenderInput;
 use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
 use aterm_core::terminal::Terminal;
-use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetInputKind, PetSense};
+use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetInputKind, PetSense, head_law};
 use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
 use aterm_models_effects::console_cursor_home_model;
 use aterm_spec::derive::Model;
@@ -163,8 +163,11 @@ impl Scene {
             (rect.foot_row() - f32::from(caret.row)).abs() <= 4.5,
             "pet wandered vertically from the cursor: {rect:?}"
         );
+        // The prompt sits between lettered rows, so the head law fits the full animal to its
+        // own row, whole and smaller ([`head_law`]): no tiny marker in its place.
+        let (_, fit) = head_law(true, true);
         assert!(
-            rect.rows >= 1.5 && rect.cols >= 5.0,
+            rect.rows >= 1.5 * fit && rect.cols >= 5.0 * fit,
             "persistence must not replace the full animal with a tiny marker"
         );
     }

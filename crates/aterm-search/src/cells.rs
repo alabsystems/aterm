@@ -268,6 +268,9 @@ impl LineCells {
     /// The bytes of the cells drawn over any of columns `start_col..end_col`.
     #[must_use]
     pub fn bytes_in_columns(&self, start_col: usize, end_col: usize) -> Option<Range<usize>> {
+        if start_col >= end_col {
+            return None;
+        }
         let mut found: Option<Range<usize>> = None;
         for run in self.runs() {
             let Some(width) = NonZeroUsize::new(usize::from(run.width)) else {
@@ -484,6 +487,10 @@ mod tests {
             ((6, 100), Some(9..19)),
             ((13, 14), None),
             ((0, 0), None),
+            ((1, 1), None),
+            ((3, 3), None),
+            ((8, 8), None),
+            ((2, 1), None),
         ] {
             assert_eq!(cells.bytes_in_columns(cols.0, cols.1), want, "{cols:?}");
         }

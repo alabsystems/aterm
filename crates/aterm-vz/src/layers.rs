@@ -313,7 +313,7 @@ impl Layers {
     /// The live record, where one is whole.
     #[must_use]
     pub fn record(&self) -> Option<Record> {
-        Record::parse(&std::fs::read_to_string(self.record_path()).ok()?)
+        Record::parse(&crate::read_small_text(&self.record_path(), 64 * 1024)?)
     }
 
     /// Bring the disks up for `base` and the seed whose fingerprint is `seed`, under the

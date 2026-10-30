@@ -106,6 +106,8 @@ pub struct SixelDecoder {
 
     /// Numeric-parameter accumulator for `#`/`!`/`"` introducers.
     params: Vec<u32>,
+    /// True once more than [`SIXEL_MAX_PARAMS`] parameters have been separated in `mode`.
+    param_overflow: bool,
     /// Which introducer we are collecting parameters for.
     mode: ParamMode,
 
@@ -163,6 +165,7 @@ impl SixelDecoder {
             palette: default_palette(),
             current_color: 0,
             params: Vec::new(),
+            param_overflow: false,
             mode: ParamMode::None,
             raster: Vec::new(),
             alloc_width: 0,
@@ -182,6 +185,7 @@ impl SixelDecoder {
         self.palette = default_palette();
         self.current_color = 0;
         self.params.clear();
+        self.param_overflow = false;
         self.mode = ParamMode::None;
         self.raster.clear();
         self.alloc_width = 0;
@@ -212,16 +216,24 @@ impl SixelDecoder {
             b'"' => {
                 self.start_params(ParamMode::Raster);
             }
-            b'0'..=b'9' => {
+            b'0'..=b'9' if self.mode != ParamMode::None && !self.param_overflow => {
                 let d = u32::from(byte - b'0');
                 if let Some(slot) = self.params.last_mut() {
                     *slot = slot.saturating_mul(10).saturating_add(d);
-                } else {
+                } else if self.params.len() < SIXEL_MAX_PARAMS {
                     self.params.push(d);
                 }
             }
-            b';' if self.params.len() < SIXEL_MAX_PARAMS => {
-                self.params.push(0);
+            b';' if self.mode != ParamMode::None => {
+                if self.params.is_empty() {
+                    const _: () = assert!(SIXEL_MAX_PARAMS >= 2);
+                    self.params.push(0);
+                    self.params.push(0);
+                } else if self.params.len() < SIXEL_MAX_PARAMS {
+                    self.params.push(0);
+                } else {
+                    self.param_overflow = true;
+                }
             }
             b'$' => {
                 self.finish_params();
@@ -304,6 +316,7 @@ impl SixelDecoder {
     fn release(&mut self) {
         self.raster = Vec::new();
         self.params = Vec::new();
+        self.param_overflow = false;
         self.alloc_width = 0;
         self.alloc_height = 0;
         self.x = 0;
@@ -318,6 +331,7 @@ impl SixelDecoder {
     fn start_params(&mut self, mode: ParamMode) {
         self.finish_params();
         self.params.clear();
+        self.param_overflow = false;
         self.mode = mode;
     }
 
@@ -327,6 +341,7 @@ impl SixelDecoder {
     #[inline]
     fn finish_params(&mut self) {
         if self.mode == ParamMode::None && self.params.is_empty() {
+            self.param_overflow = false;
             return;
         }
         match self.mode {
@@ -337,6 +352,7 @@ impl SixelDecoder {
         }
         self.mode = ParamMode::None;
         self.params.clear();
+        self.param_overflow = false;
     }
 
     fn apply_color(&mut self) {

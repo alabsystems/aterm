@@ -512,6 +512,8 @@ pub struct Survey {
     pub volume_device: Option<u64>,
     /// Candidate build directories.
     pub targets: Vec<TargetDir>,
+    /// The input batch exceeded the target assessment bound, before deduplication or reads.
+    pub target_input_cut: bool,
     /// Current registered caches measured outside broad discovery's budget. These are
     /// diagnostic holders only, never additional targets or removal witnesses.
     pub registered_holders: Vec<Hog>,
@@ -556,6 +558,7 @@ impl Survey {
             free_bytes: None,
             volume_device: None,
             targets: Vec::new(),
+            target_input_cut: false,
             registered_holders: Vec::new(),
             versions: Vec::new(),
             live_version: None,
@@ -845,6 +848,9 @@ pub struct Report {
     pub warn: bool,
     /// The rows: class order, then the order the pass takes them, then path.
     pub rows: Vec<Row>,
+    /// Every target's profile walk and the bounded recent-profile plan completed. Partial
+    /// byte sizing alone does not make the eligibility assessment incomplete.
+    pub assessment_complete: bool,
     /// Notes about rows the report did not make (an unresolvable live symlink, a class with no roots).
     pub notes: Vec<String>,
     /// The largest build directories this report cannot reclaim, biggest first, at most [`MAX_HOGS`], each with what frees it.
@@ -1300,7 +1306,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
             )),
         }
     }
-    pressure_rows(survey, config, &whole, &mut rows, &mut notes);
+    let pressure_cut = pressure_rows(survey, config, &whole, &mut rows, &mut notes);
     idle_whole_rows(survey, config, &mut rows, &mut notes);
     notes.extend(survey.notes.iter().cloned());
     for holder in &survey.registered_holders {
@@ -1354,6 +1360,13 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         warn_free_bytes,
         warn,
         rows,
+        assessment_complete: !pressure_cut
+            && !survey.target_input_cut
+            && survey.targets.len() <= MAX_TARGETS
+            && survey
+                .targets
+                .iter()
+                .all(|target| target.walk_cut_short.is_none()),
         notes,
         hogs,
         home: survey.home.clone(),
@@ -1859,9 +1872,9 @@ fn pressure_rows(
     whole: &[&Path],
     rows: &mut Vec<Row>,
     notes: &mut Vec<String>,
-) {
+) -> bool {
     if survey.targets.is_empty() {
-        return;
+        return false;
     }
     let projected = survey.projected.as_ref();
     if !config.pressed(survey.free_bytes, projected) {
@@ -1877,13 +1890,13 @@ fn pressure_rows(
             "cargo-targets: {why}, so no profile written into within {}d would be taken",
             config.target_stale_days
         ));
-        return;
+        return false;
     }
     if survey.volume_device.is_none() {
         notes.push(
             "cargo-targets: the measured volume's device could not be read, so no profile inside the idle window would be taken".to_owned(),
         );
-        return;
+        return false;
     }
     let below = config.below_auto_floor(survey.free_bytes);
     let projected = projected.filter(|_| !below).copied();
@@ -1975,8 +1988,13 @@ fn pressure_rows(
             .cmp(&lru_rank(b))
             .then_with(|| a.path.cmp(&b.path))
     });
+    let cut = picks.len() > MAX_ROWS_PER_CLASS;
+    if cut {
+        notes.push(format!("cargo-targets: the recent-profile plan selected {MAX_ROWS_PER_CLASS} rows; other eligible profiles remain"));
+    }
     picks.truncate(MAX_ROWS_PER_CLASS);
     rows.extend(picks);
+    cut
 }
 
 /// Is `path` at or under `dir`, where a miss must never be read as "not under" (S1, the one path rule).
@@ -2574,6 +2592,22 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
         Unused::Unfinished => {
             "an earlier sweep renamed it aside and did not finish removing it".to_owned()
         }
+        Unused::PackageSuperseded => "its disposable package generation was superseded by another compiler; its producer and all readers retired".to_owned(),
+        Unused::PackageBudget {
+            allocated,
+            budget,
+            low_disk,
+        } => format!(
+            "its disposable package generation held {} against its {} idle budget{}; \
+             the producer retired its children and no Cargo lock or live mapping held it",
+            human_bytes(allocated),
+            human_bytes(budget),
+            if low_disk {
+                ", and the volume was below the package disk floor"
+            } else {
+                ""
+            }
+        ),
         Unused::Tooling { idle, after } => format!(
             "a pinned tool of the tooling cache nothing ran for {} (the sweep takes \
              one unused {}); `targo --unverified verify provision` lays it again (`--linux` \
@@ -2615,6 +2649,14 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
         Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
         Unused::Moved { idle, .. } => format!("in the old root, unwritten {}", sweep_span(idle)),
         Unused::Unfinished => "left half-removed by an earlier sweep".to_owned(),
+        Unused::PackageSuperseded => "another package compiler generation is waiting".to_owned(),
+        Unused::PackageBudget { low_disk, .. } => {
+            if low_disk {
+                "disposable package generation below the disk floor".to_owned()
+            } else {
+                "disposable package generation over its idle budget".to_owned()
+            }
+        }
         Unused::Tooling { idle, .. } => format!("a tool unused {}", sweep_span(idle)),
         Unused::GivenUp => "a failed provisioning run's scratch".to_owned(),
         Unused::Stale {
@@ -3327,6 +3369,7 @@ pub fn scan_with(
         config.quiet_s(),
     )
     .placed(roots.placing.clone());
+    s.target_input_cut = roots.targets.len().saturating_add(roots.found.len()) > MAX_TARGETS;
     for (t, origin) in named.chain(found).take(MAX_TARGETS) {
         let Ok(canonical) = std::fs::canonicalize(t) else {
             continue;

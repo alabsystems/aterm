@@ -143,6 +143,7 @@ fn audience(admin: &Admin) -> Audience {
         .doc
         .machines()
         .into_iter()
+        .filter(|m| !enrollment::machine_denied_in_doc(&admin.doc, &m.name, &m.recipient))
         .map(|machine| machine.name)
         .collect::<BTreeSet<_>>();
     hosts.insert(admin.config.host.clone());
@@ -162,6 +163,7 @@ fn vouched(admin: &Admin, doc: &Document) -> Vec<text::Machine> {
     doc.machines()
         .into_iter()
         .filter(|machine| hosts.contains(&machine.name))
+        .filter(|m| !enrollment::machine_denied_in_doc(doc, &m.name, &m.recipient))
         .filter(|machine| {
             Recipient::parse(&machine.recipient)
                 .is_ok_and(|key| admin.admissions.evidence(&key).is_none())
@@ -259,6 +261,7 @@ fn open_to(doc: &Document, admissions: &admission::Ledger, own: &str) -> Vec<tex
     doc.machines()
         .into_iter()
         .filter(|machine| machine.recipient != own && !code_only.contains(&machine.recipient))
+        .filter(|m| !enrollment::machine_denied_in_doc(doc, &m.name, &m.recipient))
         .filter(|machine| {
             Recipient::parse(&machine.recipient)
                 .is_ok_and(|key| admissions.evidence(&key).is_none())

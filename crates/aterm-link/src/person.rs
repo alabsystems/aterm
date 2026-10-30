@@ -1583,7 +1583,8 @@ mod tests {
     #[test]
     fn an_agent_halt_is_refused_before_it_can_append_a_fleet_row() {
         let (_dir, _server, cfg, cmd) = guarded_person("a-review", true);
-        let (mut conn, _closer) = connect(&cfg, &cmd).unwrap();
+        let (mut conn, _closer) =
+            connect_within(&cfg, &cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
         let (_, (_, before)) = conn.fetch(0, "/f/f/pub/>", 0).unwrap();
         assert_eq!(main("halt", &cmd, &cfg), ExitCode::from(2));
         let (_, (_, after)) = conn.fetch(0, "/f/f/pub/>", 0).unwrap();
@@ -1596,7 +1597,8 @@ mod tests {
     #[test]
     fn an_agents_ring_reads_and_sends_mail_but_cannot_write_a_halt() {
         let (_dir, _server, cfg, cmd) = guarded_person("a-review", false);
-        let (mut conn, _closer) = connect(&cfg, &cmd).unwrap();
+        let (mut conn, _closer) =
+            connect_within(&cfg, &cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
         let producer = astream_cap::producer_id_of("a-review");
         let (off, _) = conn
             .publish(

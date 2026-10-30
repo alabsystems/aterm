@@ -43,6 +43,8 @@ pub mod steps;
 pub mod subject;
 /// Transport-independent causal replication of independently authored records.
 pub mod sync;
+/// Fabric wake priority algebra, sender-demotion rules, and per-recipient window-budget coalescing.
+pub mod wake;
 
 pub use cut::{CausalCut, CausalEdge, CutViolation};
 pub use frame::{
@@ -61,9 +63,16 @@ pub use partition::{
     assign_partition, partition_in_bounds, partition_modulus_clamp, time_bucket, PartitionKey,
     TIME_BUCKET_MS,
 };
-pub use receipt::{deadline_elapsed, FabricReceipt, ReceiptError, ReceiptVerdict, V1Receipt};
+pub use receipt::{
+    deadline_elapsed, BarrierAckState, FabricReceipt, NodeAckState, ReceiptError, ReceiptVerdict,
+    V1BarrierAck, V1NodeAck, V1Receipt,
+};
 pub use steps::{step_prefix_advance, step_within_bounds};
 pub use subject::{
     filter_depth_contains, segment_depth_advance, Filter, FilterError, Subject, SubjectError,
 };
 pub use sync::{sync_clamp_parent_count, sync_within_capacity};
+pub use wake::{
+    wake_charge_clamp, wake_rank_max, wake_within_budget, SessionWakeLedger, WakeBudget, WakeClass,
+    WakeDecision, MAX_WAKE_WINDOW_STAMPS,
+};

@@ -2284,6 +2284,7 @@ fn a_typed_relaunch_line_is_recorded_before_anything_after_it() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };
@@ -2348,6 +2349,7 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };
@@ -2437,6 +2439,7 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };
@@ -2550,6 +2553,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };
@@ -2757,6 +2761,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };
@@ -3156,6 +3161,7 @@ fn a_dropped_tap_is_recorded_in_the_ledger() {
         instances: super::super::upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: super::super::Timings::for_build(),
     };
@@ -3318,6 +3324,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
         press: None,
         timings: crate::harness::Timings::FAST,
     };
@@ -4929,6 +4936,7 @@ fn a_harness_restart_held_by_keys_is_tried_once_its_own_grace_lets_them_go() {
         land: false,
         press: None,
         timings: crate::harness::Timings::FAST,
+        tell: crate::harness::upgrade_drive::Tell::Off,
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     let (pid, end_s) = (93_257, 1_793_034_365);
@@ -5043,6 +5051,7 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
         land: false,
         press: None,
         timings: crate::harness::Timings::FAST,
+        tell: crate::harness::upgrade_drive::Tell::Off,
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
 

@@ -23,7 +23,7 @@ use aterm_machines::init::{Base, BaseLock};
 use aterm_machines::sync::peers::Lan;
 use aterm_machines::sync::{
     AccountsRead, FabricRead, FleetDone, FleetRead, IdentityRead, NodeRead, PeersDone, PeersRead,
-    Ports, Publisher, RequestsRead, SharedRead, StewardLeaseRead, StewardRevokeRead,
+    Ports, Publisher, ReleaseRead, RequestsRead, SharedRead, StewardLeaseRead, StewardRevokeRead,
     StewardStandbyServerRead, VaultRead,
 };
 use aterm_secrets::client::Foundable;
@@ -468,6 +468,24 @@ impl Ports for Live {
             .is_ok_and(|exe| atpkg::hooks::is_installed_release_exe(&exe))
     }
 
+    fn refresh_vault_subscriber(&self) -> Result<Option<String>, String> {
+        use aterm_secrets::client::HeldMend;
+        let paths = vault_paths()?;
+        if !vault_config(&paths)?
+            .as_ref()
+            .is_some_and(aterm_secrets::client::alab_vault)
+            || aterm_secrets::service::subscriber_turned_off(&paths.home)
+        {
+            return Ok(None);
+        }
+        match aterm_secrets::client::mend_held(&paths, aterm_secrets::service::Job::Subscriber)
+            .map_err(|why| why.to_string())?
+        {
+            HeldMend::Moved(line) => Ok(Some(line)),
+            _ => Ok(None),
+        }
+    }
+
     fn window_runs(&self) -> bool {
         aterm_uds::control_socket_dir()
             .is_some_and(|dir| window_in(&dir, &aterm_uds::process::pid_alive))
@@ -807,6 +825,23 @@ impl Ports for Live {
             ),
             (false, _) => format!("finished Commons network {network}, founded already"),
         })
+    }
+
+    fn release(&self) -> Result<ReleaseRead, String> {
+        use aterm_secrets::client::release::{SigningStatus, signing_status};
+        let paths = aterm_secrets::client::Paths::live().map_err(|error| error.to_string())?;
+        Ok(
+            match signing_status(&paths).map_err(|error| error.to_string())? {
+                SigningStatus::NotApplicable(why) => ReleaseRead::NotApplicable(why),
+                SigningStatus::Pending(why) => ReleaseRead::Due(why),
+                SigningStatus::Ready(now) => ReleaseRead::Current(now),
+            },
+        )
+    }
+
+    fn sync_release(&self) -> Result<String, String> {
+        let paths = aterm_secrets::client::Paths::live().map_err(|error| error.to_string())?;
+        aterm_secrets::client::release::sync_signing(&paths).map_err(|error| error.to_string())
     }
 
     fn accounts(&self) -> Result<AccountsRead, String> {

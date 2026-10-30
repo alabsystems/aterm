@@ -9,6 +9,13 @@
 //! (§3.3.5): `notice act`, a fleet drive and a control client's gesture are refused it. The
 //! phrase goes to that sheet alone, never to a terminal, a log, `aterm ctl`, a message or a fleet
 //! reply.
+//!
+//! F16: a Mac the membership log removed that asks again shows as removed ("m12 was removed by m7
+//! on Oct 30. Allow again?") with [Allow again], which restores a plain removal; a quorum's
+//! removal offers no Allow. A Mac a member's removals took out shows "m7 removed this Mac and 3
+//! others. Undo m7's removals?" with [Undo removals], which signs its share of the quorum
+//! `Remove` of m7 ([`aterm_secrets::client::undo_removals`]), off the event loop. Both are a
+//! person's own press.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +36,9 @@ pub(crate) const KEY_PREFIX: &str = "members.ask.";
 
 /// The one row that stands for [`COLLAPSE_AT`] or more asking Macs.
 const MANY_KEY: &str = "members.ask.many";
+
+/// The key every "Undo m7's removals?" row starts with, the remover's join code after it.
+pub(crate) const UNDO_PREFIX: &str = "members.undo.";
 
 /// How often the lane looks at the desk for a change the band shows.
 const READ_EVERY: Duration = Duration::from_secs(2);
@@ -57,6 +67,9 @@ pub(crate) const NO_SCREEN: &str = "press Allow on a Mac with a screen";
 /// Why a press that is not a person's own is refused.
 const PERSON_ONLY: &str = "Allow is a person's own press on this Mac's screen";
 
+/// Why an Undo that is not a person's own press is refused.
+const UNDO_PERSON_ONLY: &str = "Undo is a person's own press on this Mac's screen";
+
 /// A desk this process serves: the fleet port's ask handler and the window share it.
 pub(crate) type Shared = Arc<Mutex<Desk>>;
 
@@ -69,6 +82,10 @@ static LIVE: Slot = Mutex::new(None);
 
 /// Set when the desk changed in a way the band shows; the next park reads it.
 static CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// The "Undo m7's removals?" rows this Mac shows while a member's removal keeps it out, as the
+/// lane last read them ([`aterm_secrets::client::undo_offers`]).
+static UNDO: Mutex<Vec<aterm_secrets::client::UndoOffer>> = Mutex::new(Vec::new());
 
 /// The fleet port's `ask` handler: the asking Mac's stream goes to [`LIVE`]'s desk.
 pub(crate) fn ask_handler() -> aterm_net::fleet::AskHandler {
@@ -206,6 +223,7 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
                 if looked.is_none_or(|at| at.elapsed() >= LOCAL_EVERY) {
                     looked = Some(std::time::Instant::now());
                     follow_local(&LIVE, &paths);
+                    follow_undo(&paths);
                 }
                 // A desk dropped reads as a change too: the window ends its rows.
                 let desk = LIVE.lock_or_recover().clone();
@@ -248,6 +266,68 @@ fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths) {
             aterm_log::warn!("members: this Mac's Commons state: {error}");
         }
     }
+}
+
+/// Read the "Undo m7's removals?" rows this Mac shows ([`UNDO`]), marking a change. Unreadable
+/// state leaves them as they were.
+fn follow_undo(paths: &aterm_secrets::client::Paths) {
+    match aterm_secrets::client::undo_offers(paths) {
+        Ok(offers) => {
+            let mut held = UNDO.lock_or_recover();
+            if *held != offers {
+                *held = offers;
+                CHANGED.store(true, Ordering::Release);
+            }
+        }
+        Err(error) => aterm_log::warn!("members: this Mac's removals: {error}"),
+    }
+}
+
+/// The row of a Mac a member's removals took out (F16): "m7 removed this Mac and 3 others. Undo
+/// m7's removals?" with [Undo removals] until this Mac signed its share, then how many more the
+/// quorum needs. Undo is never the row's default.
+pub(crate) fn undo_notice(offer: &aterm_secrets::client::UndoOffer) -> Message {
+    let others = match offer.others {
+        0 => String::new(),
+        1 => " and 1 other".to_owned(),
+        n => format!(" and {n} others"),
+    };
+    let title = format!(
+        "{} removed this Mac{others}. Undo {}'s removals?",
+        offer.label, offer.label
+    );
+    let message = Message::new(tags::PRIVACY, Severity::Warn, title);
+    let needed = match offer.needed {
+        1 => "1 more Mac's share".to_owned(),
+        n => format!("{n} more Macs' shares"),
+    };
+    let (message, then) = if offer.signed {
+        (
+            message.sentence(format!("this Mac signed its share; {needed} undo them")),
+            format!("Press Undo removals on another Mac {} removed", offer.label),
+        )
+    } else {
+        (
+            message
+                .action(Intent::UndoRemovals {
+                    remover: offer.code.clone(),
+                })
+                .sentence(format!("{needed} undo them")),
+            format!(
+                "Press Undo removals if {} should not have removed these Macs",
+                offer.label
+            ),
+        )
+    };
+    message
+        .now(Ask::standing(
+            StandingWhy::OnlyYou(Reason::new(format!(
+                "only people at the Macs {} removed undo its removals, and this Mac is one",
+                offer.label
+            ))),
+            Then::step(then),
+        ))
+        .key(&format!("{UNDO_PREFIX}{}", offer.code))
 }
 
 /// Whether this Mac's vault says it is no member, and not just for a moment: none configured,
@@ -299,8 +379,12 @@ impl Snapshot {
 }
 
 /// The row of one Mac asking to join: its name, model and address, [Allow] where this Mac can
-/// allow and [Ignore]. Allow is never the row's default ([`Intent::never_default`]).
+/// allow and [Ignore]. Allow is never the row's default ([`Intent::never_default`]). A Mac the
+/// log removed shows as removed instead ([`removed_notice`]).
 pub(crate) fn notice(row: &Row, can_allow: bool) -> Message {
+    if let Some(note) = &row.removed {
+        return removed_notice(row, note, can_allow);
+    }
     let title = format!(
         "{} wants to join ALab ({}, {})",
         row.name, row.model, row.from
@@ -328,6 +412,51 @@ pub(crate) fn notice(row: &Row, can_allow: bool) -> Message {
         .now(Ask::standing(
             StandingWhy::OnlyYou(Reason::new(format!(
                 "only a person at a member lets {} into ALab, and it shows code {}",
+                row.name, row.code
+            ))),
+            Then::step(then),
+        ))
+        .key(&format!("{KEY_PREFIX}{}", row.id))
+}
+
+/// The row of a Mac the membership log removed that asks again (F16): who removed it and when,
+/// with [Allow again] where this Mac can allow and a plain removal took it out, and [Ignore]. A
+/// Mac a quorum removed gets no Allow: one person does not bring it back.
+fn removed_notice(
+    row: &Row,
+    note: &aterm_secrets::client::RemovedNote,
+    can_allow: bool,
+) -> Message {
+    let message = Message::new(tags::PRIVACY, Severity::Warn, note.title());
+    let (message, then) = if note.quorum {
+        (
+            message.sentence(
+                "a quorum of members removed it, and one person's Allow does not bring it back",
+            ),
+            format!("Reset {} to let it in as a new Mac", row.name),
+        )
+    } else if can_allow {
+        (
+            message.action(Intent::AllowJoinAgain { request: row.id }),
+            format!(
+                "Press Allow again, then type the phrase this Mac shows on {}",
+                row.name
+            ),
+        )
+    } else {
+        (
+            message.sentence("this Mac cannot allow yet: it has no Commons binding"),
+            format!(
+                "Press Allow again on a member that can, then type its phrase on {}",
+                row.name
+            ),
+        )
+    };
+    message
+        .action(Intent::IgnoreJoin { request: row.id })
+        .now(Ask::standing(
+            StandingWhy::OnlyYou(Reason::new(format!(
+                "only a person at a member lets {} back into ALab, and it shows code {}",
                 row.name, row.code
             ))),
             Then::step(then),
@@ -411,6 +540,15 @@ impl Members {
     fn desk(&self) -> Option<Shared> {
         self.slot.lock_or_recover().clone()
     }
+
+    /// The "Undo m7's removals?" rows to show: none on a test's side.
+    fn undo(&self) -> Vec<aterm_secrets::client::UndoOffer> {
+        if std::ptr::eq(self.slot, &raw const LIVE) {
+            UNDO.lock_or_recover().clone()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl App {
@@ -426,18 +564,19 @@ impl App {
     /// Post, replace and end the rows so they match the desk; with no desk (this Mac is no
     /// member, or it left the vault) every row ends.
     pub(crate) fn refresh_member_rows(&mut self) {
-        let wanted = match self.members.desk() {
+        let mut wanted = match self.members.desk() {
             Some(desk) => {
                 Snapshot::of(&desk.lock_or_recover(), aterm_time::Instant::now()).notices()
             }
             None => Vec::new(),
         };
+        wanted.extend(self.members.undo().iter().map(undo_notice));
         let now = std::time::Instant::now();
         let shown: Vec<(String, aterm_messages::MessageId)> = self
             .messages
             .live_rows()
             .filter_map(|live| live.msg.key.clone().map(|key| (key, live.id)))
-            .filter(|(key, _)| key.starts_with(KEY_PREFIX))
+            .filter(|(key, _)| key.starts_with(KEY_PREFIX) || key.starts_with(UNDO_PREFIX))
             .collect();
         for (key, id) in shown {
             if !wanted
@@ -495,6 +634,55 @@ impl App {
         self.show_member_phrase(Some(request)).map(|_| ())
     }
 
+    /// A person's press of Allow again on request `request`, whose Mac a member's removal took
+    /// out (F16): its phrase in a sheet, and the run restores the Mac. A control client's gesture
+    /// is refused.
+    ///
+    /// # Errors
+    /// Why nothing shows: not a person's press, no screen, or the desk refused.
+    pub(crate) fn allow_member_request_again(&mut self, request: u64) -> Result<(), String> {
+        if self.person_gesture_refused() {
+            return Err(PERSON_ONLY.to_owned());
+        }
+        self.show_member_phrase_as(Some(request), true).map(|_| ())
+    }
+
+    /// A person's press of Undo removals for the Mac whose join code is `remover` (F16): this
+    /// Mac signs its share of the quorum `Remove` of it and posts it, off the event loop. A
+    /// control client's gesture is refused.
+    ///
+    /// # Errors
+    /// Not a person's press, or the signing thread did not start.
+    pub(crate) fn undo_member_removals(&mut self, remover: &str) -> Result<(), String> {
+        if self.person_gesture_refused() {
+            return Err(UNDO_PERSON_ONLY.to_owned());
+        }
+        let remover = remover.to_owned();
+        crate::qos::spawn_lane_thread(
+            "aterm-members-undo",
+            crate::qos::Role::Background,
+            move || {
+                let signed = aterm_secrets::client::Paths::live()
+                    .and_then(|paths| {
+                        let share = aterm_secrets::client::undo_removals(&paths, &remover);
+                        follow_undo(&paths);
+                        share
+                    });
+                match signed {
+                    Ok(share) => aterm_log::info!(
+                        "members: signed this Mac's share of the undo of {}'s removals ({} more needed)",
+                        share.remover,
+                        share.undo.needed()
+                    ),
+                    Err(error) => aterm_log::warn!("members: the undo of {remover}'s removals: {error}"),
+                }
+                CHANGED.store(true, Ordering::Release);
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| format!("the undo did not start: {error}"))
+    }
+
     /// Ignore request `request` on this Mac: its row ends.
     pub(crate) fn ignore_member_request(&mut self, request: u64) -> bool {
         let Some(desk) = self.members.desk() else {
@@ -510,6 +698,15 @@ impl App {
     /// sheet on this Mac's screen and nowhere else. A phrase whose sheet does not open is burned
     /// at once: nobody saw it.
     fn show_member_phrase(&mut self, request: Option<u64>) -> Result<Duration, String> {
+        self.show_member_phrase_as(request, false)
+    }
+
+    /// [`Self::show_member_phrase`], restoring the Mac a member's removal took out where `again`.
+    fn show_member_phrase_as(
+        &mut self,
+        request: Option<u64>,
+        again: bool,
+    ) -> Result<Duration, String> {
         let desk = self
             .members
             .desk()
@@ -529,6 +726,7 @@ impl App {
         let (phrase, text, lasts) = {
             let mut desk = desk.lock_or_recover();
             let phrase = match request {
+                Some(id) if again => desk.allow_again(id, now),
                 Some(id) => desk.allow(id, now),
                 None => desk.invite(now),
             }
@@ -645,23 +843,30 @@ impl App {
                 let rows = Snapshot::of(&desk.lock_or_recover(), now).rows;
                 let mut reply = format!("OK {}\n", rows.len());
                 for row in rows {
+                    let state = match (&row.removed, row.state) {
+                        (Some(note), _) => format!(
+                            "removed by={}{}",
+                            crate::control::pct_encode(&note.by.join(",")),
+                            if note.quorum { " quorum=1" } else { "" }
+                        ),
+                        (None, RowState::Allowed(_)) => "allowed".to_owned(),
+                        (None, _) => "asking".to_owned(),
+                    };
                     reply.push_str(&format!(
-                        "request name={} model={} from={} code={} state={}\n",
+                        "request name={} model={} from={} code={} state={state}\n",
                         crate::control::pct_encode(&row.name),
                         crate::control::pct_encode(&row.model),
                         row.from,
                         row.code,
-                        if matches!(row.state, RowState::Allowed(_)) {
-                            "allowed"
-                        } else {
-                            "asking"
-                        }
                     ));
                 }
                 return reply;
             }
             Asked::Allow(name) => named(name)
                 .and_then(|id| self.show_member_phrase(Some(id)))
+                .map(Some),
+            Asked::AllowAgain(name) => named(name)
+                .and_then(|id| self.show_member_phrase_as(Some(id), true))
                 .map(Some),
             Asked::Invite => self.show_member_phrase(None).map(Some),
             Asked::Ignore(name) => named(name).map(|id| {
@@ -684,6 +889,9 @@ pub(crate) enum Asked {
     Requests,
     /// `allow <name|code>`: its phrase on this Mac's screen.
     Allow(String),
+    /// `allow --again <name|code>`: a removed Mac's phrase on this Mac's screen; the run
+    /// restores it (F16).
+    AllowAgain(String),
     /// `invite`: a phrase for whichever Mac types it first.
     Invite,
     /// `ignore <name|code>`: hide its row here.
@@ -692,10 +900,10 @@ pub(crate) enum Asked {
 
 /// The usage line every malformed `members` form answers.
 pub(crate) const USAGE: &str =
-    "ERR usage: members requests | allow <name> | invite | ignore <name>\n";
+    "ERR usage: members requests | allow [--again] <name> | invite | ignore <name>\n";
 
 impl Asked {
-    /// Parse `requests`, `allow <name>`, `invite` or `ignore <name>`.
+    /// Parse `requests`, `allow [--again] <name>`, `invite` or `ignore <name>`.
     ///
     /// # Errors
     /// [`USAGE`].
@@ -703,6 +911,7 @@ impl Asked {
         let words: Vec<&str> = rest.split_whitespace().collect();
         match words.as_slice() {
             ["requests"] => Ok(Self::Requests),
+            ["allow", "--again", name] => Ok(Self::AllowAgain((*name).to_owned())),
             ["allow", name] => Ok(Self::Allow((*name).to_owned())),
             ["invite"] => Ok(Self::Invite),
             ["ignore", name] => Ok(Self::Ignore((*name).to_owned())),

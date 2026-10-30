@@ -73,12 +73,15 @@ admin (a machine in [admins]):
                                          every one, asked at a terminal), or a key by name
                                          (how a machine joins a <path> vault)
   aterm secrets revoke <host|code> [--drop-sections] [--stolen]
-                                         remove it from the vault (first retiring its Commons
-                                         membership, denying its swarm label/node, and releasing
-                                         its pool slots); --stolen also rotates aterm-fleet-code
-                                         and prints a NEEDS YOU: provider rotation list; a
-                                         section naming only it must be empty unless
-                                         --drop-sections drops it too
+                                         remove it from the vault: where this Mac is seated in
+                                         the vault's membership log, as `aterm members remove`
+                                         (any member, no admin key); else, as an admin (first
+                                         retiring its Commons membership, denying its swarm
+                                         label/node, and releasing its pool slots); --stolen
+                                         also rotates aterm-fleet-code and prints a NEEDS YOU:
+                                         provider rotation list; a section naming only it must
+                                         be empty unless --drop-sections drops it too (an
+                                         admin's edit)
   aterm secrets retire <host|code|age1...>... permanently retire Commons membership alone;
                                          a full age key can name a device already removed
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
@@ -1170,7 +1173,6 @@ mod unix {
     /// The machines `words` name in `doc`, each by [`client::machine_named`]: the tests' reading
     /// of a document alone, where the verbs read the vault ([`machines_named_in_vault`]).
     #[cfg(test)]
-    #[cfg(test)]
     pub(super) fn machines_named(
         doc: &text::Document,
         words: &[String],
@@ -1797,6 +1799,18 @@ mod unix {
                 status.names.len(),
                 status.names.join(", ")
             );
+        }
+        match client::release::signing_status(paths) {
+            Ok(client::release::SigningStatus::Ready(now)) => {
+                println!("release signing: ready ({now})")
+            }
+            Ok(client::release::SigningStatus::Pending(why)) => {
+                println!("release signing: pending ({why})")
+            }
+            Ok(client::release::SigningStatus::NotApplicable(_)) => {}
+            Err(_) => println!(
+                "release signing: pending (local state unreadable; automatic setup will retry)"
+            ),
         }
         match client::conflicts(paths) {
             Ok(conflicts) if !conflicts.is_empty() => println!(
@@ -3312,12 +3326,66 @@ mod unix {
         Ok(chosen)
     }
 
+    /// `revoke <host> [--drop-sections] [--stolen]`. Where this Mac removes through a trusted
+    /// membership log and the log names `host` ([`client::revoke_by_log`]) it is F16's member
+    /// removal, with no admin key ([`client::remove_member`]); the admin's revoke is the fallback
+    /// for a vault with no log (ALab until F12b), for a Mac the log does not seat (a founder that
+    /// proved no device key, or one only `[machines]` names, which the envelope 0.145 Macs read
+    /// still lists), for another admin of that envelope ([`client::vault_admin_named`]: the admin
+    /// path rotates the envelope's signing key it holds, or refuses while Commons authority may be
+    /// pinned to it), and for `--drop-sections`, an edit of host lists that only an admin makes
+    /// (it writes a log `Remove` too, and rotates the log's epochs away from the Mac).
     fn revoke(
         paths: &Paths,
         host: &str,
         drop_sections: bool,
         stolen: bool,
     ) -> crate::Result<ExitCode> {
+        let by_log = client::removes_by_log(paths);
+        let vault_admin = client::vault_admin_named(paths, host);
+        if !drop_sections && by_log && vault_admin.is_none() && client::revoke_by_log(paths, host) {
+            let done = client::remove_member(paths, host, stolen)?;
+            println!(
+                "removed {} through the membership log: {} records, new keys for {}.",
+                done.label,
+                done.signed,
+                done.rotated.join(", ")
+            );
+            if !done.could_read.is_empty() {
+                println!(
+                    "{} could read {} secrets ({}); rotate them if it was lost or compromised",
+                    done.label,
+                    done.could_read.len(),
+                    done.could_read.join(", ")
+                );
+            }
+            if done.fleet_code_rotated {
+                println!("rotated aterm-fleet-code in [everyone].");
+            }
+            for note in &done.envelope_notes {
+                println!("{note}");
+            }
+            if let Some(line) = done.needs_you {
+                println!("{line}");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        if let Some(name) = vault_admin.as_deref().filter(|_| !drop_sections) {
+            println!(
+                "{name} is an admin of the vault 0.145 Macs read: revoking with the admin key, \
+                 which rotates the signing key it holds (`aterm members remove {name}` removes it \
+                 from the membership log alone, leaving it that key)"
+            );
+        } else if !drop_sections && by_log {
+            println!(
+                "{host} has no seat in this Mac's membership log (a founder that proved no device \
+                 key, or a Mac only the vault's machine list names): revoking with the admin key"
+            );
+        } else if !drop_sections {
+            println!(
+                "this Mac removes no Mac through a membership log here: revoking with the admin key"
+            );
+        }
         let admin = client::admin_open(paths)?;
         let host = &client::machine_named_in_vault(paths, &admin, host)?;
         let held = exposure(&admin.doc, host);
@@ -3892,6 +3960,7 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
+            lan: false,
             allowed: None,
             proof: None,
         };
@@ -4048,6 +4117,7 @@ mod tests {
             host: host.into(),
             code: code.into(),
             at: None,
+            lan: false,
             allowed: None,
             proof: None,
         };
@@ -4136,6 +4206,7 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
+            lan: false,
             allowed: None,
             proof: None,
         };

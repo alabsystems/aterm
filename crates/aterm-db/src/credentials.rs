@@ -50,6 +50,7 @@ pub const MAX_NOTE: usize = 160;
 pub const MAX_EVIDENCE: usize = 96;
 const COMMAND_DOMAIN: &[u8] = b"aterm/credentials/command/1\0";
 const REQUEST_KEY_DOMAIN: &[u8] = b"aterm/credentials/request-key/1\0";
+const SUCCESSOR_DOMAIN: &[u8] = b"aterm/credentials/schema-successor/1\0";
 const MS: u64 = 1000;
 
 /// The record kinds this build reads. A custodian's `Policy` record is step 5's: this build
@@ -223,7 +224,7 @@ fn hex_field<const N: usize>(value: &Value) -> Option<[u8; N]> {
 /// Check a record's closed schema: the fields its kind allows, each well formed.
 fn check(record: &Record) -> Result<()> {
     let allowed: &[&str] = match record.kind.as_str() {
-        "request" => &["nonce", "want", "purpose", "refused", "supersedes"],
+        "request" => &["nonce", "want", "purpose", "refused", "supersedes", "entry"],
         "offer" => &[],
         "sweep" => &["covers"],
         "still" => &["at"],
@@ -253,7 +254,17 @@ fn check(record: &Record) -> Result<()> {
             body.get("nonce")
                 .and_then(hex_field::<16>)
                 .ok_or_else(|| Error::new("a request names its ledger nonce"))?;
-            Want::parse(text(body, "want", 160)?).map_err(|_| Error::new("unknown want"))?;
+            let want =
+                Want::parse(text(body, "want", 160)?).map_err(|_| Error::new("unknown want"))?;
+            if want == Want::Notary {
+                if body.contains_key("entry") {
+                    text(body, "entry", 160)?;
+                }
+            } else if body.contains_key("entry") {
+                return Err(Error::new(
+                    "only a notary request binds its credential entry",
+                ));
+            }
             Purpose::parse(text(body, "purpose", 64)?)
                 .ok_or_else(|| Error::new("unknown purpose"))?;
             optional(body, "refused", Value::as_u64)?;
@@ -462,6 +473,10 @@ impl Book {
             .iter()
             .filter(|entry| entry.record.kind == "request")
         {
+            if check(&entry.record).is_err() {
+                inert(entry.id, "request does not match its closed schema");
+                continue;
+            }
             let body = &entry.record.body;
             let (Ok(id), Ok(want), Some(purpose)) = (
                 ids(&entry.record.key),
@@ -475,6 +490,15 @@ impl Book {
                 inert(entry.id, "request does not parse");
                 continue;
             };
+            if want == Want::Notary
+                && body.get("entry").and_then(Value::as_str)
+                    != Some(aterm_secrets::need::catalog::NOTARY_ENTRY)
+            {
+                // Decode legacy requests so their author's journal remains writable,
+                // but never answer them under a different credential meaning.
+                inert(entry.id, "notary request does not bind the supported entry");
+                continue;
+            }
             if !want.posted() {
                 inert(entry.id, "the catalog never posts this want");
                 continue;
@@ -740,6 +764,46 @@ fn with_store<T>(
     crate::documents::application::with_store(paths, true, descriptor, action)
 }
 
+/// A read of the request table's verified retained prefix. It makes no request, sweep or
+/// decision, and does not advance the local need ledger.
+#[derive(Debug, Clone)]
+pub struct Observation {
+    /// This replica's actor, used only to identify its own requests.
+    pub observer: Actor,
+    /// The current members against which sweep coverage was checked.
+    pub members: BTreeSet<Actor>,
+    /// Unix milliseconds at which this read began.
+    pub at_ms: u64,
+    /// All retained operations, including those this build cannot interpret.
+    pub retained_operations: usize,
+    /// Operations eligible for this build's request projection, before protocol checks.
+    pub interpreted_operations: usize,
+    /// Requests and checked answers retained here; not a read of other replicas.
+    pub book: Book,
+}
+
+/// Read existing credential requests without acquiring a journal writer or settling needs.
+/// An uninitialized table is unavailable, rather than created by its inspection.
+///
+/// # Errors
+/// Local vault facts, membership, the catalog or the initialized table cannot be read.
+pub fn observe(paths: &Paths) -> Result<Observation> {
+    let at_ms = now_ms();
+    let facts = facts(paths, at_ms)?;
+    crate::documents::application::observe_store(paths, descriptor, |session, store, scope| {
+        let context = context(&facts, session, scope, at_ms);
+        let log = Log::read_with(session, store, scope, decode)?;
+        Ok(Observation {
+            observer: session.actor(),
+            members: context.members.clone(),
+            at_ms,
+            retained_operations: log.snapshot().retained,
+            interpreted_operations: log.eligible().len(),
+            book: Book::read(&log, &context),
+        })
+    })
+}
+
 fn commit(session: &Session<'_>, store: &mut Store, log: &Log, record: &Record) -> Result<Receipt> {
     let command = record.command()?;
     if let Some(id) = log.retry(session.actor(), &command)? {
@@ -755,10 +819,38 @@ fn request_record(me: &Actor, need: &Need) -> Record {
     body.insert("nonce".into(), Value::from(hex::encode_lower(&need.id)));
     body.insert("want".into(), Value::from(need.want.key()));
     body.insert("purpose".into(), Value::from(need.purpose.id()));
+    if need.want == Want::Notary {
+        body.insert(
+            "entry".into(),
+            Value::from(aterm_secrets::need::catalog::NOTARY_ENTRY),
+        );
+    }
     if let Some(seq) = need.refused {
         body.insert("refused".into(), Value::from(seq));
     }
     Record::new("request", &request_key(me, &need.id), body)
+}
+
+/// A schema successor has a deterministic nonce so a crash after either table write
+/// retries the same retirement and request, before the local ledger adopts it.
+fn successor_record(me: &Actor, need: &Need) -> Result<([u8; 16], Record)> {
+    let current = request_record(me, need);
+    let mut material = SUCCESSOR_DOMAIN.to_vec();
+    material.extend_from_slice(me);
+    material.extend_from_slice(&canonical(&current.body)?);
+    let digest = Sha256::digest(&material);
+    let mut nonce = [0; 16];
+    nonce.copy_from_slice(&digest[..16]);
+    let successor = Need {
+        id: nonce,
+        ..need.clone()
+    };
+    let mut record = request_record(me, &successor);
+    record.body.insert(
+        "supersedes".into(),
+        Value::from(hex::encode_lower(&request_key(me, &need.id))),
+    );
+    Ok((nonce, record))
 }
 
 fn retired_record(id: &[u8; 16], reason: Reason, evidence: &str, note: &str) -> Record {
@@ -857,6 +949,25 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 .threads
                 .get(&key)
                 .filter(|thread| thread.requester == me);
+            if writer && need.posted && !need.state.ended() && thread.is_none() {
+                let (nonce, _) = successor_record(&me, need)?;
+                if let Some(successor) = book
+                    .threads
+                    .get(&request_key(&me, &nonce))
+                    .filter(|thread| thread.requester == me)
+                {
+                    // The two table writes landed before a crash, but the ledger did not
+                    // adopt them. Recover that exact successor even when the table is full.
+                    moves.push((
+                        need.id,
+                        Absorb::Reissued {
+                            nonce,
+                            record: successor.operation.to_vec(),
+                        },
+                    ));
+                    continue;
+                }
+            }
             let allowed = context.policy.allows(&need.want);
             let room = open < need::MAX_OPEN;
             match (need.state, thread) {
@@ -869,6 +980,34 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 (State::AwaitingPerson, None) if writer && allowed && room && !need.posted => {
                     let receipt = commit(session, store, &log, &request_record(&me, need))?;
                     moves.push((need.id, Absorb::Posted(receipt.id.to_vec())));
+                    report.posted += 1;
+                    open += 1;
+                }
+                (State::Open | State::Offered | State::Published | State::AwaitingPerson, None)
+                    if writer && allowed && room && need.posted =>
+                {
+                    // Older readers must see the old request end before they encounter
+                    // the successor whose binding they do not understand.
+                    commit(
+                        session,
+                        store,
+                        &log,
+                        &retired_record(
+                            &key,
+                            Reason::Superseded,
+                            "the requester replaced an obsolete request schema",
+                            "",
+                        ),
+                    )?;
+                    let (nonce, successor) = successor_record(&me, need)?;
+                    let receipt = commit(session, store, &log, &successor)?;
+                    moves.push((
+                        need.id,
+                        Absorb::Reissued {
+                            nonce,
+                            record: receipt.id.to_vec(),
+                        },
+                    ));
                     report.posted += 1;
                     open += 1;
                 }
@@ -922,6 +1061,10 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             let standing: BTreeSet<[u8; 16]> = needs
                 .iter()
                 .map(|need| request_key(&me, &need.id))
+                .chain(moves.iter().filter_map(|(_, step)| match step {
+                    Absorb::Reissued { nonce, .. } => Some(request_key(&me, nonce)),
+                    _ => None,
+                }))
                 .collect();
             for thread in book.threads.values().filter(|thread| {
                 thread.requester == me && !thread.ended() && !standing.contains(&thread.id)
@@ -1034,9 +1177,11 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
     let facts = facts(paths, now_ms)?;
     let mut report = Custodian::default();
     let (plans, network) = with_store(paths, |session, store, scope| {
+        session.writer()?;
         let mut context = context(&facts, session, scope, now_ms);
         context.signer = Some(admin.custodian_signer().map_err(crate::table::failure)?);
         let log = Log::read_with(session, store, scope, decode)?;
+        log.writable(session.actor())?;
         let book = Book::read(&log, &context);
         let mut plans = Vec::new();
         for thread in book.threads.values() {
@@ -1179,8 +1324,9 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
         .map(|record| record.attest(&sign))
         .collect::<Result<Vec<_>>>()?;
     with_store(paths, |session, store, scope| {
-        let log = Log::read_with(session, store, scope, decode)?;
         session.writer()?;
+        let log = Log::read_with(session, store, scope, decode)?;
+        log.writable(session.actor())?;
         for record in &records {
             commit(session, store, &log, record)?;
         }

@@ -3102,6 +3102,15 @@ mod macos {
         }
         let mtm = MainThread::new()?;
         let _park = crate::watchdog::park_modal();
+        let _up = crate::alert_keys::ConfirmationUp::hold();
+        // No key queued before the question opened (a burst's, or one typed ahead) answers it;
+        // a queue that will not drain leaves Return and Escape on Cancel.
+        let default = if crate::hwkey::fence_queued_keys(mtm) {
+            default
+        } else {
+            aterm_log::warn!("confirmation: the key queue would not drain; Return cancels");
+            AlertDefault::Cancel
+        };
         let (Some(title), Some(body), Some(proceed), Some(cancel)) = (
             appkit::nsstring(title),
             appkit::nsstring(body),

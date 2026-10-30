@@ -236,7 +236,12 @@ fn ensure_dir(prefix: &Path) -> io::Result<PathBuf> {
     let created = std::fs::DirBuilder::new().create(&d);
     match created {
         Ok(()) => Ok(d),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(d),
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) =>
+        {
+            Ok(d)
+        }
         Err(e) => Err(e),
     }
 }
@@ -288,7 +293,7 @@ pub fn take(
     let d = ensure_dir(prefix)?;
     let stem = subject.stem();
     let gate: std::fs::File = open_rendezvous(&d.join(format!("{stem}{GATE_SUFFIX}")))?;
-    let deadline = Instant::now() + wait;
+    let deadline = Instant::now().checked_add(wait);
     loop {
         #[expect(
             clippy::disallowed_methods,
@@ -297,7 +302,9 @@ pub fn take(
         let taken = gate.try_lock_shared();
         match taken {
             Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Err(std::fs::TryLockError::WouldBlock)
+                if deadline.is_none_or(|d| Instant::now() < d) =>
+            {
                 std::thread::sleep(GATE_POLL);
             }
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -966,6 +973,20 @@ mod tests {
         );
         assert!(matches!(seen, Holders::Unknown(_)), "{seen:?}");
         assert!(seen.in_use());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn non_directory_at_leases_path_and_unbounded_wait_are_handled_cleanly() {
+        let p = prefix("nondir-and-max-wait");
+        let ok = take(&p, &trust(1), "max-wait", Duration::MAX).expect("unbounded wait succeeds");
+        drop(ok);
+        let _ = std::fs::remove_dir_all(&p);
+
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(dir(&p), b"not a directory").unwrap();
+        let err = take(&p, &trust(1), "blocked", Duration::ZERO).expect_err("file at leases path");
+        assert!(matches!(err, LeaseError::Io(ref e) if e.kind() == io::ErrorKind::AlreadyExists));
         let _ = std::fs::remove_dir_all(&p);
     }
 }

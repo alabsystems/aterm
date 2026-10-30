@@ -138,6 +138,7 @@ fn opts() -> Opts {
         timings: crate::harness::Timings::FAST,
         agents_off: Vec::new(),
         land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
     }
 }
 

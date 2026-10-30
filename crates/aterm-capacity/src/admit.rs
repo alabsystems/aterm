@@ -647,6 +647,76 @@ pub(crate) fn covered(pid: u32, records: &[&Record], procs: Option<&Procs>) -> b
         || procs.is_some_and(|p| p.ancestors(pid).iter().any(|a| holders.contains(a)))
 }
 
+/// The claim among `records` that covers the builds of the process `pid` ([`covered_memory`]):
+/// the first held one of memory that asked to cover its tree ([`Need::covers`]) whose holder is
+/// `pid` or one of its ancestors in `procs`.
+fn covering_of<'r>(pid: u32, records: &[&'r Record], procs: Option<&Procs>) -> Option<&'r Record> {
+    let ancestors = std::cell::OnceCell::new();
+    records.iter().copied().find(|r| {
+        r.held.is_some()
+            && r.need.mem > 0
+            && r.need.covers
+            && (r.pid == pid
+                || ancestors
+                    .get_or_init(|| procs.map(|p| p.ancestors(pid)).unwrap_or_default())
+                    .contains(&r.pid))
+    })
+}
+
+/// Whether a held claim covers the builds of the process `pid` (BUILD-ADMIT): `pid` itself, or
+/// one of its ancestors in `procs`, holds a claim of memory that asked to cover its tree's builds
+/// ([`Need::covers`]). Modelled on [`covered`], which does this for quiet claims. Required, not a
+/// nicety: [`counted`] keeps a nested claim from waiting on its ancestors, but every third party
+/// still counts both its reservation and its ancestor's, since [`Procs::trees`] credits each
+/// process to its nearest claimant, so the ancestor's stays near its whole need. A claim that
+/// waits covers nothing, and nor does one of no memory (a disk claim) or one that did not ask
+/// (a VM's, whose memory lies outside the tree its holder runs).
+#[must_use]
+pub fn covered_memory(pid: u32, records: &[&Record], procs: Option<&Procs>) -> bool {
+    covering_of(pid, records, procs).is_some()
+}
+
+/// THE CLAIM THAT COVERS THE BUILDS OF `pid` ([`covered_memory`]), read from `ledger` on
+/// `machine`; `None` where none does. `marker` is the [`crate::COVER_ENV`] value `pid`
+/// inherited: [`crate::NO_COVER`] covers nothing; a claim's marker ([`Record::cover_marker`])
+/// whose holder is `pid` or one of its ancestors ([`Machine::lineage`]) is answered by that
+/// holder's claims alone ([`Ledger::of_pid`]), and covers only while that claim is held and
+/// covers, never by another claim of its holder's; any other marker, or none, leaves every claim
+/// to answer.
+///
+/// # Errors
+/// The ledger could not be read.
+pub fn covering(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    pid: u32,
+    marker: Option<&str>,
+) -> io::Result<Option<Record>> {
+    let lineage = std::cell::OnceCell::new();
+    let line = || lineage.get_or_init(|| machine.lineage(pid)).as_ref();
+    let marker = marker.map(str::trim);
+    if marker == Some(crate::NO_COVER) {
+        return Ok(None);
+    }
+    let named = marker.and_then(|m| Some((m, Record::marker_holder(m)?)));
+    if let Some((marker, holder)) =
+        named.filter(|(_, h)| *h == pid || line().is_some_and(|p| p.ancestors(pid).contains(h)))
+    {
+        return Ok(ledger.of_pid(holder)?.into_iter().find(|r| {
+            r.cover_marker() == marker && r.held.is_some() && r.need.mem > 0 && r.need.covers
+        }));
+    }
+    let all = ledger.list()?;
+    let all: Vec<&Record> = all.iter().collect();
+    if !all
+        .iter()
+        .any(|r| r.held.is_some() && r.need.mem > 0 && r.need.covers)
+    {
+        return Ok(None);
+    }
+    Ok(covering_of(pid, &all, line()).cloned())
+}
+
 /// The claims a waiter of the process `pid` is held to: every other claim but those its
 /// ancestors hold or wait for. A waiter whose ancestor holds a claim is that admitted work going
 /// on (verify's run starting the lab's VM boot, which claims the VM's disk for itself), so it is

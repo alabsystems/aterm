@@ -354,7 +354,15 @@ fn edit_and_await_edit_over_a_real_socket() {
             Ok(self.0.clone())
         }
         fn send(&mut self, sock: &str, request: &str, reply: Duration) -> io::Result<String> {
-            crate::front_door_send_within(sock, request, HANG_DETECTOR, reply.max(HANG_DETECTOR))
+            // The mock window serves: its accept waits the hang detector, not the 10 s cap.
+            crate::with_accept_within(HANG_DETECTOR, || {
+                crate::front_door_send_within(
+                    sock,
+                    request,
+                    HANG_DETECTOR,
+                    reply.max(HANG_DETECTOR),
+                )
+            })
         }
         fn pause(&mut self, wait: Duration) {
             std::thread::sleep(wait);

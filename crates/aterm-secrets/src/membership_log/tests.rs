@@ -685,6 +685,216 @@ fn two_removers_that_shield_each_other_are_both_undone() {
     assert_eq!(lab.membership().quorums().len(), 2);
 }
 
+/// Every Mac the actor removed signs its share of the Undo at [`Log::undo_cutoff`], as F16's
+/// "Undo m7's removals" row does.
+fn undo_shares(log: &mut Log, actor: Mac, signers: &[Mac]) {
+    let cutoff = log.undo_cutoff(&actor.id()).expect("an undo cutoff");
+    for &who in signers {
+        log.keep(remove(log, who, actor, &cutoff));
+    }
+}
+
+/// F16's Undo against a stolen Mac that first lets Macs of its own in where nobody sees them,
+/// more of them than the lab has members, and then removes every other member: every honest Mac
+/// computes one cutoff, before the hidden `Admit`s, so those Macs never vote, the honest shares
+/// are a quorum, and the lab is back with the Sybils out.
+///
+/// NEGATIVE CONTROL: in `Graph::undo_cutoff`, push only `Remove`s into `acts` (an `Admit` no act):
+/// the cutoff falls after the hidden `Admit`s, X, Y, Z and W outvote B, C and D, and the
+/// `"the lab is back"` assert fails.
+#[test]
+fn the_undo_cutoff_falls_before_admits_nobody_saw_so_their_macs_never_vote() {
+    let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4")]);
+    let genesis = *lab.network();
+    // B signs once in the open: A's record before its branch is the genesis.
+    let mut log = lab.clone();
+    log.keep(sign(&log, B, Body::Name { name: "b".into() }));
+    let mut branch = log.clone();
+    for (who, label) in [(X, "m5"), (Y, "m6"), (Z, "m7"), (W, "m8")] {
+        branch.keep(admit(&branch, A, who, label));
+    }
+    for who in [B, C, D] {
+        branch.keep(remove(&branch, A, who, &genesis));
+    }
+    heal(&mut log, &mut branch);
+    assert_eq!(members(&log), ids(&[A, X, Y, Z, W]));
+    assert_eq!(log.undo_cutoff(&A.id()), Some(genesis));
+    let undo = log.undo(&A.id()).expect("an undo");
+    assert_eq!(undo.voters, ids(&[B, C, D]));
+    assert_eq!(undo.needed(), 2);
+    undo_shares(&mut log, A, &[B, C, D]);
+    let undo = log.undo(&A.id()).expect("an undo");
+    assert_eq!(undo.signed, ids(&[B, C, D]));
+    assert!(undo.took_effect && undo.needed() == 0);
+    assert_eq!(members(&log), ids(&[B, C, D]), "the lab is back");
+    assert!(log.membership().removal(&A.id()).unwrap().quorum);
+}
+
+/// An act the lab carried on from stands: A removed E, a stolen Mac, and B built on that before
+/// A, stolen in turn, removed B, C and D. The Undo's cutoff is A's removal of E, so the quorum
+/// brings B, C and D back and keeps E out.
+///
+/// NEGATIVE CONTROL: in `Graph::undo_cutoff`, never push to `acknowledged`: the cutoff falls
+/// before A's removal of E, the quorum voids it, and the `"E stays out"` assert fails.
+#[test]
+fn the_undo_keeps_a_removal_the_lab_carried_on_from() {
+    let mut log = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4"), (E, "m5")]);
+    let genesis = *log.network();
+    let removed_e = log.keep(remove(&log, A, E, &genesis));
+    log.keep(sign(&log, B, Body::Name { name: "b".into() }));
+    for who in [B, C, D] {
+        log.keep(remove(&log, A, who, &genesis));
+    }
+    assert_eq!(members(&log), ids(&[A]));
+    assert_eq!(log.undo_cutoff(&A.id()), Some(*removed_e.id()));
+    undo_shares(&mut log, A, &[B, C, D]);
+    assert_eq!(members(&log), ids(&[B, C, D]), "E stays out");
+    assert!(!log.membership().removal(&E.id()).unwrap().quorum);
+}
+
+/// A Mac whose removals nobody contests has no Undo: one that removed nothing, and one whose
+/// one removal the lab built on.
+#[test]
+fn a_member_with_no_contested_act_has_no_undo() {
+    let mut log = found(&[(A, "m1"), (B, "m2"), (C, "m3")]);
+    assert_eq!(log.undo_cutoff(&A.id()), None);
+    let genesis = *log.network();
+    log.keep(remove(&log, A, C, &genesis));
+    log.keep(sign(&log, B, Body::Name { name: "b".into() }));
+    assert_eq!(log.undo_cutoff(&A.id()), None);
+    assert!(log.undo(&A.id()).is_none());
+}
+
+/// F16's review: a Mac the actor let in through a Mac it let in is no more independent than
+/// one it let in itself. A stolen A lets X in where nobody sees it, X lets Y in, A removes B, C
+/// and D, and Y signs: Y's record is no acknowledgment of A's acts, so the cutoff is before X's
+/// admission, B, C and D vote, and their quorum leaves A, X and Y out.
+///
+/// NEGATIVE CONTROL: in `Graph::undo_cutoff`, drop the loop that adds the Macs those let in
+/// (`let_in` holds A's own entrants alone): Y's record acknowledges every act of A,
+/// `undo_cutoff` is `None`, and the `"an undo cutoff"` expect fails.
+#[test]
+fn a_mac_let_in_by_a_mac_the_actor_let_in_never_acknowledges_its_acts() {
+    let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4")]);
+    let genesis = *lab.network();
+    let mut log = lab.clone();
+    log.keep(sign(&log, B, Body::Name { name: "b".into() }));
+    let mut branch = log.clone();
+    branch.keep(admit(&branch, A, X, "m5"));
+    branch.keep(admit(&branch, X, Y, "m6"));
+    for who in [B, C, D] {
+        branch.keep(remove(&branch, A, who, &genesis));
+    }
+    branch.keep(sign(&branch, Y, Body::Name { name: "y".into() }));
+    heal(&mut log, &mut branch);
+    assert_eq!(members(&log), ids(&[A, X, Y]));
+    undo_shares(&mut log, A, &[B, C, D]);
+    assert_eq!(log.undo_cutoff(&A.id()), Some(genesis));
+    assert_eq!(members(&log), ids(&[B, C, D]), "the lab is back");
+}
+
+/// F16's review: removing the remover contests it, so neither that `Remove` nor what its signer
+/// signs after it acknowledges the remover's acts. A removes B, C and D; E, still in, removes A
+/// and signs on. The Undo of A still stands before A's removals, and B, C and D's shares bring
+/// them back.
+///
+/// NEGATIVE CONTROL: in `Graph::undo_cutoff`, leave `contests` empty: E's records acknowledge
+/// A's removals, `undo_cutoff` is `None`, and the `"an undo cutoff"` expect fails.
+#[test]
+fn removing_the_remover_leaves_its_removals_to_undo() {
+    let mut log = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4"), (E, "m5")]);
+    let genesis = *log.network();
+    let mut last = genesis;
+    for who in [B, C, D] {
+        last = *log.keep(remove(&log, A, who, &genesis)).id();
+    }
+    log.keep(remove(&log, E, A, &last));
+    log.keep(sign(&log, E, Body::Name { name: "e".into() }));
+    assert_eq!(members(&log), ids(&[E]));
+    undo_shares(&mut log, A, &[B, C, D]);
+    assert_eq!(log.undo_cutoff(&A.id()), Some(genesis));
+    assert_eq!(members(&log), ids(&[B, C, D, E]));
+}
+
+/// F16's review, the split: on one side A removes S while on the other S removes C and D.
+/// Removals are never cut off (two Macs that remove each other are both out), so after the heal
+/// C and D are out, and whatever A's side signs next (an epoch the coverage rule mints, here a
+/// name) holds A's removal of S in its past: it contests S, so C and D keep their Undo of S, and
+/// a quorum with A brings them back.
+///
+/// NEGATIVE CONTROL: as above, leave `contests` empty: A's record acknowledges S's removals and
+/// the `"an undo"` expect fails.
+#[test]
+fn a_record_after_a_removal_of_the_remover_leaves_its_split_removals_to_undo() {
+    let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4"), (S, "m5")]);
+    let genesis = *lab.network();
+    let (mut one, mut two) = (lab.clone(), lab);
+    one.keep(remove(&one, A, S, &genesis));
+    for who in [C, D] {
+        two.keep(remove(&two, S, who, &genesis));
+    }
+    heal(&mut one, &mut two);
+    one.keep(sign(&one, A, Body::Name { name: "a".into() }));
+    assert_eq!(members(&one), ids(&[A, B]));
+    let undo = one.undo(&S.id()).expect("an undo");
+    assert_eq!(undo.voters, ids(&[A, B, C, D]));
+    undo_shares(&mut one, S, &[A, C, D]);
+    assert_eq!(members(&one), ids(&[A, B, C, D]));
+}
+
+/// F16's review: a stolen Mac that lets one member stay to carry on from its first removals and
+/// then removes that one too cannot leave a lab no quorum can bring back. The acknowledgment that
+/// would walk the cutoff past the first removals leaves one voter, so it is set aside. In one
+/// batch, every Mac comes back; removed one at a time, each removal carried on from by the Macs
+/// still in, the last two come back, and they allow the rest again.
+///
+/// NEGATIVE CONTROL: in `Graph::undo_cutoff`, return `Some(settled)` at once (no step back): the
+/// cutoff is A's removal of D, where E alone votes, and the first `undo_cutoff` assert fails.
+#[test]
+fn a_mac_left_to_carry_on_and_then_removed_still_brings_the_lab_back() {
+    // In one batch: A removes B, C and D, E signs on, A removes E.
+    let mut log = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4"), (E, "m5")]);
+    let genesis = *log.network();
+    for who in [B, C, D] {
+        log.keep(remove(&log, A, who, &genesis));
+    }
+    log.keep(sign(&log, E, Body::Name { name: "e".into() }));
+    log.keep(remove(&log, A, E, &genesis));
+    assert_eq!(members(&log), ids(&[A]));
+    assert_eq!(log.undo_cutoff(&A.id()), Some(genesis));
+    let undo = log.undo(&A.id()).expect("an undo");
+    assert_eq!(undo.voters, ids(&[B, C, D, E]));
+    undo_shares(&mut log, A, &[B, C, D]);
+    assert_eq!(members(&log), ids(&[B, C, D, E]), "every Mac comes back");
+
+    // One at a time, each removal carried on from by the Macs still in.
+    let mut log = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4"), (E, "m5")]);
+    let genesis = *log.network();
+    let mut by_c = genesis;
+    for (who, rest) in [(B, &[C, D, E][..]), (C, &[D, E]), (D, &[E])] {
+        let removal = log.keep(remove(&log, A, who, &genesis));
+        if who.0 == C.0 {
+            by_c = *removal.id();
+        }
+        for &on in rest {
+            log.keep(sign(&log, on, Body::Name { name: "on".into() }));
+        }
+    }
+    log.keep(remove(&log, A, E, &genesis));
+    assert_eq!(members(&log), ids(&[A]));
+    assert_eq!(log.undo_cutoff(&A.id()), Some(by_c));
+    assert_eq!(log.undo(&A.id()).expect("an undo").voters, ids(&[D, E]));
+    undo_shares(&mut log, A, &[D, E]);
+    assert_eq!(members(&log), ids(&[D, E]), "the last two are back");
+    log.keep(admit(&log, D, B, "m2"));
+    log.keep(admit(&log, E, C, "m3"));
+    assert_eq!(
+        members(&log),
+        ids(&[B, C, D, E]),
+        "and allow the rest again"
+    );
+}
+
 #[test]
 fn two_admissions_of_one_mac_agree_in_either_order() {
     let lab = found(&[(A, "m1"), (B, "m2")]);

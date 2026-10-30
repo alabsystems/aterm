@@ -450,7 +450,7 @@ fn retained_directory_limit_survives_changing_subscription_selection() {
         .commit_catalog(&sa, &existing.encode().unwrap())
         .unwrap();
     drop(catalog);
-    for _ in 1..MAX_TABLES {
+    for _ in 1..CATALOG_SLOTS {
         let scope = Scope::fresh(a.trust()).unwrap();
         Store::join(&sa, &dir.path(scope).unwrap(), scope).unwrap();
     }
@@ -464,7 +464,7 @@ fn retained_directory_limit_survives_changing_subscription_selection() {
     assert!(Store::open(&sa, &dir.path(existing.scope).unwrap(), existing.scope).is_err());
     assert_eq!(
         std::fs::read_dir(&dir.root).unwrap().count(),
-        MAX_TABLES + 1
+        CATALOG_SLOTS + 1
     );
     let mut catalog = dir.catalog(&sa).unwrap();
     catalog

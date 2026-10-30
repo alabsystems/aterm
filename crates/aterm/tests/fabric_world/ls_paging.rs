@@ -50,6 +50,11 @@ fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     let mut c = Command::new(harness::aterm_to_launch());
     c.arg("link");
     c.env("XDG_RUNTIME_DIR", runtime.path());
+    // The stub broker serves: its late answer on a loaded machine is waited for, not its 3 s.
+    c.env(
+        harness::FABRIC_IO_WAIT.0,
+        harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
+    );
     (c, runtime)
 }
 

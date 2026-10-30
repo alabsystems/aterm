@@ -4222,6 +4222,35 @@ fn the_test_reader_never_reads_the_thermal_state() {
     }
 }
 
+/// The OS's exact thermal state, Low Power Mode with it, wins over the counter reader's
+/// estimate, which stands in only where the OS says nothing.
+#[test]
+fn the_oss_exact_thermal_state_wins_over_the_counters_estimate() {
+    let mut reader = Reader::new(Arc::default());
+    let req = Request {
+        self_pid: std::process::id(),
+        ..Request::default()
+    };
+    let estimate = Thermal {
+        level: Throttle::Light,
+        raw: 1,
+        low_power: None,
+        exact: false,
+    };
+    reader.thermal = || Some(thermal_of(2, Some(true)));
+    // Each read finds the estimate cached an hour ahead, so its 10 s cadence never decides
+    // however long the host reads before it take.
+    let cached = Instant::now() + Duration::from_secs(3_600);
+    reader.counter_throttle = Some((cached, Some(estimate)));
+    assert_eq!(
+        reader.machine_sample(&req, 0).thermal,
+        Some(thermal_of(2, Some(true)))
+    );
+    reader.thermal = || None;
+    reader.counter_throttle = Some((cached, Some(estimate)));
+    assert_eq!(reader.machine_sample(&req, 0).thermal, Some(estimate));
+}
+
 /// With no window, an idle view holding a program at macOS's program check, or a backed-up
 /// episode still owing its closing reading, is read again after 30 s; a live job's faster cadence
 /// stands beside it, and with neither nothing is due before the disk watch's next look.

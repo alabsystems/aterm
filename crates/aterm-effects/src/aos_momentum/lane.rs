@@ -128,7 +128,7 @@ impl Presentation {
             e.i32(first);
             e.i32(end);
         });
-        e.bool(c.light_vivid);
+        e.u8(c.ink_byte());
     }
 
     #[inline]
@@ -1153,6 +1153,8 @@ const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
         block: true,
         glyph_span: Some((0, col as i32)),
         light_vivid: false,
+        chosen_hue: false,
+        chosen_base: false,
     }
 }
 

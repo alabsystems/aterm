@@ -328,11 +328,13 @@ fn bounded_wait<T: Send + 'static>(
         }
     }
     let meter = crate::memory::current();
+    let cover = crate::memory::cover();
     let scope = Close(std::sync::Arc::new(output::Scope::metered(meter.clone())));
     let executor = std::sync::Arc::clone(&scope.0);
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let _metering = crate::memory::metering(meter);
+        let _covering = crate::memory::covering(cover);
         aterm_uds::output::with_executor(
             std::sync::Arc::new(move |command| executor.output(command)),
             || {
@@ -402,6 +404,9 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
         }
         for (k, v) in env.add_env {
             c.env(k, v);
+        }
+        if let Some(marker) = crate::memory::cover() {
+            c.env(aterm_capacity::COVER_ENV, &*marker);
         }
     }
     for (k, v) in &cmd.envs {
@@ -1843,6 +1848,33 @@ mod tests {
             run(&ask, env_in(&tmp)).trimmed_output(),
             "x unset /usr/bin:/bin"
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A child is handed the cover marker of its stage's claim ([`crate::memory::cover`]) over
+    /// the run's, from the stage's own thread and from a worker of its pool alike. NEGATIVE
+    /// CONTROL: outside a stage that holds a claim, the run's own (`NO_COVER`) reaches it.
+    #[test]
+    fn a_child_is_handed_its_stages_cover_marker() {
+        let tmp = crate::mktemp_dir("atv-cover").expect("mktemp");
+        let added = [(
+            OsString::from(aterm_capacity::COVER_ENV),
+            OsString::from(aterm_capacity::NO_COVER),
+        )];
+        let env = ExecEnv {
+            add_env: &added,
+            ..env_in(&tmp)
+        };
+        let ask = Cmd::new("/bin/sh").args(["-c", "printf %s \"$ATERM_CAPACITY_COVER\""]);
+        assert_eq!(run(&ask, env).trimmed_output(), aterm_capacity::NO_COVER);
+        {
+            let _covering = crate::memory::covering(Some("0000000000001-7-0".into()));
+            assert_eq!(run(&ask, env).trimmed_output(), "0000000000001-7-0");
+            let pooled =
+                crate::testrun::pool(1, &[0], 1, |_| run(&ask, env).trimmed_output().to_owned());
+            assert_eq!(pooled, [Some("0000000000001-7-0".to_string())]);
+        }
+        assert_eq!(run(&ask, env).trimmed_output(), aterm_capacity::NO_COVER);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

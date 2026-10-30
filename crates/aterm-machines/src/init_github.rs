@@ -495,11 +495,14 @@ impl Item for Auth {
         if sys.euid() != self.user.uid {
             return Err("GitHub bootstrap must run as its local user".into());
         }
-        if answered(sys, &self.user, &self.config)?.is_some() {
-            return Ok(());
-        }
+        let already_answered = answered(sys, &self.user, &self.config)?.is_some();
         let git = Git::keychain(sys);
-        let (helper, held, shadowed) = readiness(sys, &self.user, &self.config)?;
+        if !git.installed(sys) {
+            return Err(NEEDS_GIT.into());
+        }
+        let owners = [self.config.owner.as_str()];
+        let (helper, shadowed) =
+            git.configured_or_shadowed(sys, &self.user, &self.config.account, &owners)?;
         if let Some((xdg_file, _)) = shadowed
             && shadowed_vault_answers(sys, &self.user, &self.config, &xdg_file)?
         {
@@ -512,6 +515,10 @@ impl Item for Auth {
             }
             return Ok(());
         }
+        if already_answered {
+            return Ok(());
+        }
+        let held = stored(sys, &self.user, &self.config.account)?;
         if held.is_none() {
             crate::port::no_core_dumps();
             let token = read_token(sys, &self.user, &self.config)?;
@@ -1247,38 +1254,42 @@ mod tests {
     }
 
     #[test]
-    fn auth_converts_shadowed_keychain_gitconfig_without_writing_keychain() {
-        let (sys, auth, context) = fixture();
-        let u = auth.user.clone();
-        script::shadowed(&sys, &u, "octocat");
-        script::shadowed(&sys, &u, "octocat");
-        script::alike(&sys, &u);
-        script::alike(&sys, &u);
-        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
-        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
-        script::lookups_hold(&sys, &u, GITHUB, "octocat", STORED);
-        script::lookups_hold(&sys, &u, GITHUB, "octocat", VALUE);
-        script::lookups_hold(&sys, &u, GITHUB, "octocat", VALUE);
-        script::lookups_hold_xdg(&sys, &u, GITHUB, "octocat", VALUE);
-        script::lookups_hold_xdg(&sys, &u, GITHUB, "octocat", VALUE);
-        let unsets = script::unconfigure(&sys, &u);
-        signs_in(&sys, &u, "octocat");
-        let probed = auth.probe(&sys, &context);
-        assert!(matches!(probed, Probe::Change { .. }), "{probed:?}");
-        assert!(
-            auth.revert().as_deref().is_some_and(
-                |r| r.contains("--add credential.https://github.com.helper osxkeychain")
-            )
-        );
-        auth.apply(&sys, &context).unwrap();
-        let calls = sys.calls();
-        assert!(unsets.iter().all(|k| calls.contains(k)), "{calls:?}");
-        assert!(
-            calls
-                .iter()
-                .all(|c| !c.contains("approve") && !c.contains("--replace-all")),
-            "{calls:?}"
-        );
-        clean(&sys);
+    fn auth_converts_shadowed_keychain_gitconfig_even_when_its_token_is_current() {
+        for cached in [STORED, VALUE] {
+            let (sys, auth, context) = fixture();
+            let u = auth.user.clone();
+            script::shadowed(&sys, &u, "octocat");
+            script::shadowed(&sys, &u, "octocat");
+            if cached == VALUE {
+                // The current token also passes the ordinary helper's uniformity read.
+                script::shadowed(&sys, &u, "octocat");
+            }
+            script::alike(&sys, &u);
+            script::alike(&sys, &u);
+            script::holds(&sys, Some(&u), GITHUB, "octocat", cached);
+            script::holds(&sys, Some(&u), GITHUB, "octocat", cached);
+            script::lookups_hold(&sys, &u, GITHUB, "octocat", cached);
+            script::lookups_hold(&sys, &u, GITHUB, "octocat", VALUE);
+            script::lookups_hold(&sys, &u, GITHUB, "octocat", VALUE);
+            script::lookups_hold_xdg(&sys, &u, GITHUB, "octocat", VALUE);
+            script::lookups_hold_xdg(&sys, &u, GITHUB, "octocat", VALUE);
+            let unsets = script::unconfigure(&sys, &u);
+            signs_in(&sys, &u, "octocat");
+            let probed = auth.probe(&sys, &context);
+            assert!(matches!(probed, Probe::Change { .. }), "{probed:?}");
+            assert!(auth.revert().as_deref().is_some_and(|r| {
+                r.contains("--add credential.https://github.com.helper osxkeychain")
+            }));
+            auth.apply(&sys, &context).unwrap();
+            let calls = sys.calls();
+            assert!(unsets.iter().all(|k| calls.contains(k)), "{calls:?}");
+            assert!(
+                calls
+                    .iter()
+                    .all(|c| !c.contains("approve") && !c.contains("--replace-all")),
+                "{calls:?}"
+            );
+            clean(&sys);
+        }
     }
 }
