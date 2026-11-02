@@ -161,6 +161,52 @@ fn address(n: u8) -> IpAddr {
 }
 
 #[test]
+fn lan_bootstrap_delivers_credentials_without_an_allow_or_typed_phrase() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let desk = member(root.path(), "member");
+    let (paths, device) = mac(root.path(), "newcomer");
+    let value = token();
+    let (served, bundle) = exchange(&desk, "192.168.1.20".parse().unwrap(), &value, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::run_lan(stream, &greeting, &joining(&device, [8; 32], "newcomer"))
+    });
+    assert!(served.unwrap().is_some());
+    let bundle = bundle.unwrap();
+    let report = client::write_from_bundle(&paths, &bundle).unwrap();
+    assert!(!report.written.is_empty());
+    assert_eq!(
+        std::fs::read(paths.home.join(".secrets/gh_access_token")).unwrap(),
+        value.as_bytes()
+    );
+    assert!(
+        desk.lock()
+            .unwrap()
+            .rows(Instant::now())
+            .iter()
+            .all(|row| row.state == RowState::Closed)
+    );
+}
+
+#[test]
+fn automatic_bootstrap_refuses_non_lan_connections() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let desk = member(root.path(), "member");
+    let (_, device) = mac(root.path(), "newcomer");
+    let (served, received) = exchange(
+        &desk,
+        "203.0.113.20".parse().unwrap(),
+        "never-sent",
+        |stream| {
+            let greeting = joiner::greeting(stream)?;
+            joiner::run_lan(stream, &greeting, &joining(&device, [8; 32], "newcomer"))
+        },
+    );
+    assert!(served.is_err());
+    assert!(received.is_err());
+    assert!(desk.lock().unwrap().rows(Instant::now()).is_empty());
+}
+
+#[test]
 fn an_allowed_round_trips_and_refuses_a_changed_byte_or_its_own_writer() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (_, joiner) = mac(root.path(), "j");

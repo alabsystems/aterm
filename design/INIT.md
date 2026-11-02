@@ -103,7 +103,9 @@ The managed primer now directs Codex and other agents to bundled `aterm agh` for
 Validated locally with Trust's explicitly unverified build lane (no proof claim):
 
 - `aterm-machines --lib`: 1,132 passed.
-- `aterm-secrets --lib`: 1,058 passed, one ignored.
+- `aterm-secrets --lib`: 1,061 passed, one ignored.
+- `aterm-agent --lib members_cli`: 11 passed.
+- Full `aterm` executable: built successfully.
 - `aterm-cli --lib`: 712 passed, including recovery, background tool provisioning, and LAN profile activation.
 - `aterm-gui --lib system_state`: 448 passed across the panel, window, and permission handlers.
 - `aterm-primer`: 61 passed.
@@ -117,3 +119,13 @@ Delivery remains local on `codex/lan-init`. GitHub's routed write decision is `w
 The Secrets stage also retains indefinite retry with its existing one-to-four-minute capped backoff. Failures no longer become a permanent hold after two attempts. Input changes still bypass the deadline, and unknown reads preserve known fingerprints without resetting the failure history.
 
 The native System State admission now starts and resumes an automatic offer without recent keyboard or mouse activity. Busy operations and explicit stops still hold it, and OS permission gestures retain their separate checks. Verified discovery of the pinned LAN service enables the full default profile before membership completes; credentials remain prerequisites only for the tasks that consume them. An actively retrying row no longer displays as failed because its persisted text came from the older two-attempt policy.
+
+## Peer bootstrap correction
+
+The installed peer bootstrap also gated `~/.secrets` delivery on a member's Allow button and a typed phrase. That gate is independent of the vault queue, so changing vault approval alone did not complete a fresh machine's provisioning.
+
+The default CLI join and the subscriber now use automatic LAN bootstrap. The member checks the connection's LAN origin, validates the signed device request, and completes the existing encrypted bundle exchange with a one-use transport secret sent on the connection. No UI displays that secret and no person supplies it. The client writes the bundle through the existing private-file materializer and starts following updates. Explicit legacy phrase commands remain optional; no default init path invokes them. Non-LAN requests cannot use this automatic exchange.
+
+The CLI and transport regression tests verify a direct join with no Allow or typed phrase, creation of `~/.secrets/gh_access_token`, and retryable failure with no prompt when no peer is ready. Bonjour on the inspected LAN advertised 35 member services, including m11 and m12; live credential delivery still needs verification with the rebuilt executable and a peer serving the corrected exchange.
+
+Live verification of the automatic peer flow reached 35 advertised endpoints: 25 rejected the new exchange because they still run the older approval protocol; ten were unavailable. Both the small linked bootstrap executable and the full rebuilt `aterm members join --no-wait --at ...` reproduced that mismatch. No credential values were printed, and `~/.secrets` is still absent on this Mac. Deploying the fixed member side to an already-provisioned LAN Mac is required before it can hand credentials to this new client; this is a software rollout dependency, not a request for manual tokens or a new admission approval.

@@ -806,12 +806,12 @@ FILES
     },
     Topic {
         name: "members",
-        tagline: "Macs joining ALab: ask every member, Allow on any one, type the phrase it shows; any member removes (requests | allow | invite | ignore | join | status | list | remove | undo)",
+        tagline: "Macs joining ALab automatically on the LAN; any member removes (requests | allow | invite | ignore | join | status | list | remove | undo)",
         body: Some(
             r#"members — Macs joining ALab, and the members that let them in (macOS and Linux;
 `aterm members --help` has every verb). No member is a leader: any one lets a Mac in.
 
-  aterm members join                 a new Mac: find ALab on this network and ask every member
+  aterm members join                 find a LAN member and sync credentials automatically
   aterm members join <phrase>        type the phrase the member that allowed this Mac shows
   aterm members requests             on a member: the Macs asking that it hears
   aterm members allow <name>         on a member: show a phrase for that Mac on this screen
@@ -822,28 +822,15 @@ FILES
                                      person's press of one in the window signs a share
 
 HOW A MAC JOINS
-  1. The new Mac runs `aterm members join` (install.sh runs `members join --no-wait`,
-     which asks, joins the ALab vault and starts this Mac's vault subscriber, which asks
-     again every minute; the join System State and `aterm init` make at the ALab vault
-     asks the same way). It finds the members by Bonjour on macOS (on Linux, name one:
-     `aterm members join --at <host>`), with no account and no password, and asks each
-     one at once on the fleet port's `ask` ALPN, the one op a caller without the fleet
-     secret reaches.
-  2. Every member shows "<name> wants to join ALab (<model>, <ip>)" with Allow and
-     Ignore. Allow is a person's own press on that Mac's screen: `aterm ctl notice act`,
-     a fleet drive and a harness answer are refused.
-  3. Allow shows a three-word phrase in a sheet on that Mac alone, for 5 minutes (an
-     invite's, 10). The person types it into the new Mac. `members allow` and `members invite` in a terminal
-     answer only that the phrase is on this Mac's screen; a Mac with no screen refuses.
-  4. The phrase runs CPace with that member. The member hands over a signed `Allowed`
-     and, until the membership log ships, its own decrypted `[everyone]` files, so the
-     new Mac writes `~/.secrets` at once (GitHub, publishing and AI-account credentials).
-  5. The new Mac asks the vault's server with the `Allowed`; an admin's approver lets
-     it in once one is reachable, and from then it follows every vault change.
+  Being on the LAN is the admission rule. Init and the vault subscriber discover an ALab
+  member, join automatically, and write the shared credentials to ~/.secrets. No Allow
+  button, phrase, account or password is needed. The same flow runs with no window open.
 
-  A wrong phrase burns it (one run each); a source gets 3 runs a minute. `Ignore` hides
-  the request on that Mac only. `aterm members status` says whether this Mac is in,
-  waiting, or neither.
+  `aterm members join` runs that flow now. `--no-wait` leaves a pending join to the
+  subscriber, which retries as members become available. The member sends the bundle
+  through the existing encrypted exchange; the new Mac follows subsequent vault updates.
+  Automatic admission is restricted to LAN connections. The explicit phrase commands
+  remain available for older installations, but init never prompts for a phrase.
 
 HOW A MAC LEAVES
   Where the vault holds a membership log, any member removes a Mac, no admin needed:

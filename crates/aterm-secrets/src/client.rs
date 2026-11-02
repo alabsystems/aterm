@@ -4275,11 +4275,9 @@ fn ask_members_if_due(
     }
     asked.at = Some(Instant::now());
     let said = match ask(paths) {
-        Ok(0) => "asked ALab's members to let this Mac in: none answers on this network".to_owned(),
-        Ok(heard) => format!(
-            "asked ALab's members to let this Mac in: {heard} show its request; press Allow on any one"
-        ),
-        Err(error) => format!("asking ALab's members to let this Mac in failed: {error}"),
+        Ok(0) => "waiting for an ALab member on this LAN".to_owned(),
+        Ok(heard) => format!("automatic LAN credential sync completed through {heard} member(s)"),
+        Err(error) => format!("automatic LAN credential sync will retry: {error}"),
     };
     if said != asked.said {
         log(&said);
@@ -8829,7 +8827,8 @@ fn let_go(old: &Document, doc: &Document) -> Vec<String> {
 }
 
 /// `doc` with a `code-only` line for each key it lets go of `old`'s machines, on any vault, and,
-/// in a version that opens the vault, for each request already waiting from a key not in it;
+/// in a version that opens the vault, for each request already waiting from a key not in it
+/// except a LAN request eligible for the default ALab admission policy;
 /// whether a key was let go from an open vault (the one a person is told about, [`Published`]);
 /// and the requests held. A let-go key's line keeps its request, still queued, from being let in
 /// when the vault opens and from being shown as asking by an approver that never read it
@@ -8850,7 +8849,9 @@ fn code_only_for(
         requests_for(config, Some(doc))?
             .into_iter()
             .filter(|request| {
-                !named.contains(&request.recipient) && !gone.contains(&request.recipient)
+                !named.contains(&request.recipient)
+                    && !gone.contains(&request.recipient)
+                    && !(alab_vault(config) && request.lan)
             })
             .collect()
     };
@@ -12951,6 +12952,42 @@ mod tests {
         let signer = admin.config.signer.unwrap();
         let done = retiring(Vec::new(), signer, || auto_approve(&paths)).unwrap();
         assert_eq!(done.approved, ["m2"]);
+        server.stop();
+    }
+
+    #[test]
+    fn opening_the_default_lan_vault_does_not_quarantine_waiting_machines() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let socket = bound();
+        let server = serve(&root.path().join("store"), &socket);
+        let url = format!("http://{}/v1/alab", server.addr);
+        let paths = Paths::for_home(&root.path().join("admin"));
+        let created = create(&paths, &url, None, Some("admin")).unwrap();
+        let newcomer = Paths::for_home(&root.path().join("newcomer"));
+        join_pinned(&newcomer, &format!("{url}#{}", created.signer), "newcomer");
+        let admin = admin_open(&paths).unwrap();
+        let mut closed = admin.published_doc.clone();
+        closed.set_open(false).unwrap();
+        let mut opened = closed.clone();
+        opened.set_open(true).unwrap();
+        let signer = admin.config.signer.unwrap();
+        retiring(Vec::new(), signer, || {
+            let (changed, _, waiting) = code_only_for(&admin.config, &closed, &opened).unwrap();
+            assert!(changed.is_none());
+            assert!(
+                waiting.is_empty(),
+                "LAN join remains eligible for automatic admission"
+            );
+            // An explicit removal still creates a code-only entry, even on this LAN.
+            let removed = Identity::generate().unwrap().recipient().to_bech32();
+            let mut before_removal = closed.clone();
+            before_removal.add_machine("removed", &removed).unwrap();
+            let (changed, _, _) = code_only_for(&admin.config, &before_removal, &opened).unwrap();
+            assert!(changed.unwrap().code_only().contains(&removed));
+        });
+        // A personal vault retains its explicit opening policy.
+        let (_, _, waiting) = code_only_for(&admin.config, &closed, &opened).unwrap();
+        assert_eq!(waiting.len(), 1);
         server.stop();
     }
 

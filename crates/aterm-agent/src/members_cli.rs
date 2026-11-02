@@ -45,7 +45,7 @@ const USAGE: &str = "aterm members: Macs joining ALab and the members that let t
   undo [<name>]         the Undo rows this Mac shows for <name>'s removals; a person's
                         press of the row on the Machines view signs this Mac's share
   join [<phrase>] [--member <name>] [--at <host:port>]... [--no-wait]
-                        find ALab, ask every member, and type the phrase one shows
+                        join and sync credentials automatically from an ALab member on this LAN
   status                whether this Mac is a member, waiting, or neither";
 
 /// How long the joiner browses for members.
@@ -531,13 +531,55 @@ fn run_join(args: &JoinArgs) -> ExitCode {
         join_vault: &join_alab_vault,
         follow: &Follows::live,
     };
-    ExitCode::from(join_as(
-        &me,
-        args,
-        &reach,
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
-    ))
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    ExitCode::from(if args.phrase.is_none() {
+        join_automatically(&me, args, &reach, &mut out, &mut err)
+    } else {
+        join_as(&me, args, &reach, &mut out, &mut err)
+    })
+}
+
+/// Default LAN bootstrap. The background subscriber keeps retrying if no member is ready.
+fn join_automatically(
+    me: &Me,
+    args: &JoinArgs,
+    reach: &Reach<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    if client::status(&me.paths)
+        .is_ok_and(|status| matches!(status.membership, client::Membership::In { .. }))
+    {
+        let _ = writeln!(out, "This Mac is already in ALab as {}.", me.name);
+        return 0;
+    }
+    // Keep the subscriber alive even when every member is temporarily unavailable.
+    let follows = wait_at_vault(&me.paths, reach);
+    let result = (|| {
+        let ats = if args.at.is_empty() {
+            (reach.browse)()?
+        } else {
+            args.at.clone()
+        };
+        join::run_automatic(&me.paths, reach.dial, &me.joining(), &ats)
+    })();
+    match result {
+        Ok(joined) => {
+            let follows = (reach.follow)(&me.paths.home);
+            for line in joined_lines(&joined, &follows) {
+                let _ = writeln!(out, "{line}");
+            }
+            0
+        }
+        Err(error) => {
+            let _ = writeln!(err, "Waiting for automatic LAN credential sync: {error}");
+            if let Err(why) = follows {
+                let _ = writeln!(err, "Vault subscriber: {why}");
+            }
+            if args.no_wait { 0 } else { 75 }
+        }
+    }
 }
 
 /// `join` as `me`, through `reach`, saying what it did on `out` and `err`: the exit code.
@@ -830,11 +872,9 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
     let ats = aterm_secrets::discover::browse_members(BROWSE_WITHIN)
         .map_err(|error| error.to_string())?;
     let dial: &Dial<'_> = &dial;
-    let (heard, _) = join::ask_all(dial, &me.joining(), &ats);
-    if heard.is_empty() {
-        return Err("no ALab member answers on this network".to_owned());
-    }
-    Ok(heard.len())
+    join::run_automatic(&me.paths, dial, &me.joining(), &ats)
+        .map(|_| 1)
+        .map_err(|error| error.to_string())
 }
 
 /// Ask every member again every [`ASK_EVERY`] until one says a person allowed this Mac.
@@ -995,6 +1035,14 @@ mod tests {
     /// desk serving each connection on its own thread with a one-minute hang detector on both
     /// ends; and how many times it was dialed.
     fn with_member<T>(desk: &Mutex<Desk>, body: impl FnOnce(&Dial<'_>) -> T) -> (T, usize) {
+        with_member_from(desk, IpAddr::from([192, 0, 2, 9]), body)
+    }
+
+    fn with_member_from<T>(
+        desk: &Mutex<Desk>,
+        from: IpAddr,
+        body: impl FnOnce(&Dial<'_>) -> T,
+    ) -> (T, usize) {
         let dials = std::sync::atomic::AtomicUsize::new(0);
         let said = std::thread::scope(|scope| {
             let dial = |at: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
@@ -1008,7 +1056,7 @@ mod tests {
                 }
                 scope.spawn(move || {
                     let mut ours = ours;
-                    let _ = desk::serve(desk, &mut ours, IpAddr::from([192, 0, 2, 9]), &bundle);
+                    let _ = desk::serve(desk, &mut ours, from, &bundle);
                 });
                 Ok(Box::new(theirs))
             };
@@ -1038,6 +1086,49 @@ mod tests {
     fn joined(me: &Me, args: &JoinArgs, reach: &Reach<'_>) -> (u8, String) {
         let (code, out, err) = joined_apart(me, args, reach);
         (code, out + &err)
+    }
+
+    #[test]
+    fn default_join_writes_secrets_without_input_or_an_allow_action() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let desk = member(root.path(), "m1");
+        let me = me(root.path(), "newcomer");
+        let (code, _) = with_member_from(&desk, IpAddr::from([192, 168, 1, 9]), |dial| {
+            let reach = Reach {
+                browse: &|| Ok(vec![M1.into()]),
+                dial,
+                join_vault: &no_vault,
+                follow: &|_| Follows::Runs,
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = join_automatically(&me, &JoinArgs::default(), &reach, &mut out, &mut err);
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+            assert!(!String::from_utf8_lossy(&out).contains("press Allow"));
+            code
+        });
+        assert_eq!(code, 0);
+        assert!(me.paths.home.join(".secrets/gh_access_token").is_file());
+    }
+
+    #[test]
+    fn automatic_join_without_a_member_stays_retryable_and_asks_no_question() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let me = me(root.path(), "newcomer");
+        let reach = Reach {
+            browse: &|| Ok(Vec::new()),
+            dial: &|_| unreachable!(),
+            join_vault: &no_vault,
+            follow: &|_| Follows::Runs,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            join_automatically(&me, &JoinArgs::default(), &reach, &mut out, &mut err),
+            75
+        );
+        assert!(out.is_empty());
+        assert!(!String::from_utf8_lossy(&err).contains("phrase"));
     }
 
     /// Let `j` in through `m1`: it asks, a person allows the row, and `j` runs the phrase with

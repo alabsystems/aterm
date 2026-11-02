@@ -154,6 +154,37 @@ fn state(line: &str) -> Result<Answer> {
         .ok_or_else(|| Error::new("the member answered an unknown state"))
 }
 
+/// Obtain the credential bundle automatically on the LAN connection.
+/// No phrase is supplied by the caller or shown to a person.
+pub fn run_lan<S: Read + Write + ?Sized>(
+    stream: &mut S,
+    greeting: &Greeting,
+    joining: &Joining<'_>,
+) -> Result<Bundle> {
+    let request = joining.request(greeting)?;
+    let name = wire::unescape(&wire::escape(&joining.name))?;
+    let model = wire::unescape(&wire::escape(&joining.model))?;
+    let signature = sign(
+        joining.device,
+        &ask_message(&greeting.key, &joining.node, &name, &model, request.bytes()),
+    )?;
+    wire::write_line(
+        stream,
+        &format!(
+            "lan request={} node={} name={} model={} sig={}",
+            wire::b64(request.bytes()),
+            wire::hex(&joining.node),
+            wire::escape(&name),
+            wire::escape(&model),
+            wire::hex(signature.as_ref())
+        ),
+    )?;
+    let answer = wire::read_line(stream)?;
+    let words = wire::answer(&answer)?.text("exchange")?;
+    let phrase = Phrase::parse(&words)?;
+    run(stream, greeting, joining, &phrase)
+}
+
 /// Run `phrase` with the member `greeting` came from: a run line signed by this Mac's writer key
 /// over the greeting's challenge ([`run_message`]), CPace, then the possession challenge
 /// (answered only after the member's tag checked), then the bundle, opened under the run's

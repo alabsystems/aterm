@@ -956,6 +956,7 @@ pub fn serve<S: Read + Write + ?Sized>(
         "ask" => ask(desk, &parsed, from),
         "done" => done(desk, &parsed).map(|()| Answer::Closed),
         "run" => return run(desk, stream, &parsed, from, &challenge, bundle),
+        "lan" => return run_lan(desk, stream, &parsed, from, &challenge, bundle),
         _ => Err(Error::new(
             "the other Mac asked for something this Mac does not serve",
         )),
@@ -970,6 +971,57 @@ pub fn serve<S: Read + Write + ?Sized>(
             Err(error)
         }
     }
+}
+
+/// LAN presence admits the request; the existing encrypted exchange carries its bundle.
+/// The one-use exchange words are delivered over this connection, never through a UI.
+fn run_lan<S: Read + Write + ?Sized>(
+    desk: &Mutex<Desk>,
+    stream: &mut S,
+    line: &Line<'_>,
+    from: IpAddr,
+    challenge: &[u8; CHALLENGE_LEN],
+    bundle: Hand<'_>,
+) -> Result<Option<Let>> {
+    let prepare = || {
+        if !crate::server::lan_join_peer(from) {
+            return Err(Error::new("automatic admission requires a LAN connection"));
+        }
+        ask(desk, line, from)?;
+        let wire = line.b64("request")?;
+        let mut desk = desk.lock_or_recover();
+        let request = desk.checked(&wire)?;
+        let at = desk
+            .find(&request)
+            .ok_or_else(|| Error::new("LAN request disappeared"))?;
+        let id = desk.heard[at].id;
+        let now = Instant::now();
+        let phrase = desk.allow(id, now)?;
+        let words = desk
+            .words(phrase, now)
+            .ok_or_else(|| Error::new("LAN exchange expired"))?;
+        Ok((phrase, words.join(" ")))
+    };
+    let (phrase, words) = match prepare() {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = wire::write_line(stream, &wire::refusal(&error.to_string()));
+            return Err(error);
+        }
+    };
+    let result = (|| {
+        wire::write_line(stream, &format!("OK exchange={}", wire::escape(&words)))?;
+        let next = wire::read_line(stream)?;
+        let parsed = Line::parse(&next);
+        if parsed.verb != "run" {
+            return Err(Error::new("LAN admission expected its bundle exchange"));
+        }
+        run(desk, stream, &parsed, from, challenge, bundle)
+    })();
+    if result.is_err() {
+        desk.lock_or_recover().withdraw(phrase);
+    }
+    result
 }
 
 fn ask(desk: &Mutex<Desk>, line: &Line<'_>, from: IpAddr) -> Result<Answer> {

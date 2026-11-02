@@ -2932,11 +2932,9 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
             .expect("cleanly");
     });
     assert!(
-        logged
-            .lock()
-            .expect("log")
-            .iter()
-            .any(|line| line.contains("2 show its request; press Allow on any one")),
+        logged.lock().expect("log").iter().any(
+            |line| line.contains("automatic LAN credential sync completed through 2 member(s)")
+        ),
         "{:?}",
         logged.lock().expect("log")
     );

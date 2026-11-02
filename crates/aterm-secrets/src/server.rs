@@ -1211,7 +1211,7 @@ fn expire(queue: &mut Vec<Queued>, now: u64) {
 }
 
 /// Whether a join came directly from this machine or a private/link-local LAN address.
-fn lan_join_peer(peer: IpAddr) -> bool {
+pub(crate) fn lan_join_peer(peer: IpAddr) -> bool {
     match peer {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
         IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(

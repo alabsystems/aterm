@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The joining Mac's flow (`aterm members join`, `docs/DESIGN-fluid-swarm-2026-10-28.md`
-//! §3.3.1): ask every member it found, all at once; then run the phrase a person typed with the
-//! member that shows it, write `~/.secrets` from that member's bundle (F10's interim handover),
-//! ask the vault's server with the `Allowed`, and tell the other members it was let in. How a
-//! member is reached is the caller's: the CLI dials the `ask` ALPN, a test a stream pair.
+//! A new Mac obtains its credential bundle automatically from a LAN member.
+//! The explicit phrase flow remains available for older members. Both paths write
+//! through the same private-file materializer and follow the vault afterwards.
 
 use super::bundle::Handed;
 use super::desk::Answer;
@@ -18,8 +16,7 @@ use std::io::{Read, Write};
 
 /// What a Mac that asked does next: the words `aterm members join --no-wait`, `status` and
 /// `aterm init` give it (§3.3.3).
-pub const LET_IN: &str =
-    "press Allow on any Mac in ALab, then run `aterm members join <phrase>` here";
+pub const LET_IN: &str = "waiting for automatic credential sync from a LAN member";
 
 /// A stream to one member's `ask` op.
 pub trait Stream: Read + Write + Send {}
@@ -204,6 +201,18 @@ pub fn run_phrase(
     }
     let bundle = joiner::run(&mut stream, &greeting, joining, phrase)?;
     drop(stream);
+    let joined = accept_bundle(paths, &greeting.name, &bundle)?;
+    for other in heard.iter().filter(|other| other.at != chosen.at) {
+        let told = dial(&other.at).and_then(|mut stream| {
+            let greeting = joiner::greeting(&mut stream)?;
+            joiner::done(&mut stream, &greeting, joining)
+        });
+        drop(told);
+    }
+    Ok(joined)
+}
+
+fn accept_bundle(paths: &Paths, member: &str, bundle: &super::Bundle) -> Result<Joined> {
     let (report, admission) = match bundle.handed {
         Handed::Log { .. } => {
             let report = client::write_from_log_bundle(paths, &bundle)?;
@@ -219,17 +228,34 @@ pub fn run_phrase(
             (report, Admission::Asked(asked))
         }
     };
-    for other in heard.iter().filter(|other| other.at != chosen.at) {
-        let told = dial(&other.at).and_then(|mut stream| {
-            let greeting = joiner::greeting(&mut stream)?;
-            joiner::done(&mut stream, &greeting, joining)
-        });
-        drop(told);
-    }
     Ok(Joined {
-        member: greeting.name,
+        member: member.to_owned(),
         name: bundle.allowed.name().to_owned(),
         report,
         admission,
     })
+}
+
+/// Try the available LAN members automatically, accepting the first complete bundle.
+/// A failed transfer leaves the next member eligible and the next background pass retryable.
+pub fn run_automatic(
+    paths: &Paths,
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    ats: &[String],
+) -> Result<Joined> {
+    let mut last = Error::new("no ALab member answers on this LAN");
+    for at in ats {
+        let result = (|| {
+            let mut stream = dial(at)?;
+            let greeting = joiner::greeting(&mut stream)?;
+            let bundle = joiner::run_lan(&mut stream, &greeting, joining)?;
+            accept_bundle(paths, &greeting.name, &bundle)
+        })();
+        match result {
+            Ok(joined) => return Ok(joined),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
 }
