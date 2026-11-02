@@ -395,6 +395,8 @@ it as privileged:
   Its embedded certificate and key are public and identify nobody; the secret
   to guard is `<state>/fleet.key`.
 - Capture paths are confined to server-managed runtime directories.
+- Browser automation never adds Chromium's `--no-sandbox` flag. On Linux, run
+  it as an unprivileged user so Chromium can keep its sandbox enabled.
 - Terminal-side powers other programs could abuse — window operations,
   notifications, palette reconfiguration, kitty-graphics reads of host files,
   OSC 52 clipboard reads (`allow_osc52_query`) — are off by default, and a

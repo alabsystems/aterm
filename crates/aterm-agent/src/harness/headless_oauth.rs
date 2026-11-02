@@ -2545,11 +2545,8 @@ pub fn profile_args(profile_dir: &Path) -> Vec<OsString> {
     ] {
         args.push(flag.into());
     }
-    // Chromium requires this exception as root; ordinary Linux users keep its sandbox.
-    #[cfg(target_os = "linux")]
-    if aterm_uds::peer::our_uid() == 0 {
-        args.push("--no-sandbox".into());
-    }
+    // Never disable Chromium's sandbox to accommodate a root caller. Linux browser
+    // automation must run as an unprivileged user instead.
     args
 }
 

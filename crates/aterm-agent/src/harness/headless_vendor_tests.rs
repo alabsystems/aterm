@@ -3486,11 +3486,9 @@ fn the_headless_launch_hides_nothing_from_a_bot_check() {
             path: PathBuf::from("/opt/chrome-headless-shell"),
             is_headless_shell,
         };
-        // Linux's root alone adds `--no-sandbox`, which Chromium requires there.
         let args: Vec<String> = headless_launch_args(&browser, profile)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
-            .filter(|a| a != "--no-sandbox")
             .collect();
         let want: Vec<&str> = lead.iter().chain(tail.iter()).copied().collect();
         assert_eq!(args, want);
