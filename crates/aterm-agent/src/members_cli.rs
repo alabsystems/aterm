@@ -1112,6 +1112,44 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_credential_writes_remain_retryable_until_repaired() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let desk = member(root.path(), "m1");
+        let me = me(root.path(), "newcomer");
+        let blocked = me.paths.home.join(".secrets/gh_access_token");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let ((first, second), _) =
+            with_member_from(&desk, IpAddr::from([192, 168, 1, 9]), |dial| {
+                let reach = Reach {
+                    browse: &|| Ok(vec![M1.into()]),
+                    dial,
+                    join_vault: &no_vault,
+                    follow: &|_| Follows::Runs,
+                };
+                let first = join_automatically(
+                    &me,
+                    &JoinArgs::default(),
+                    &reach,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                assert_eq!(first, 75, "a partial materialization is not complete");
+                // Repair only the empty fixture directory that blocked the credential file.
+                std::fs::remove_dir(&blocked).unwrap();
+                let second = join_automatically(
+                    &me,
+                    &JoinArgs::default(),
+                    &reach,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                (first, second)
+            });
+        assert_eq!((first, second), (75, 0));
+        assert!(blocked.is_file());
+    }
+
+    #[test]
     fn automatic_join_without_a_member_stays_retryable_and_asks_no_question() {
         let root = aterm_tempfile::tempdir().unwrap();
         let me = me(root.path(), "newcomer");

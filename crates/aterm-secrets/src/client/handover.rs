@@ -386,7 +386,7 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
     state.failed = apply_failed(&report);
     state.proof = None;
     state.refused = None;
-    state.source_identity = Some(source_identity(&config));
+    state.source_identity = (!state.failed).then(|| source_identity(&config));
     save_state(paths, &state)?;
     keep_allowed(paths, &bundle.allowed)?;
     Ok(report)

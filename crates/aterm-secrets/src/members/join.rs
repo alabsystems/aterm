@@ -250,7 +250,13 @@ pub fn run_automatic(
             let mut stream = dial(at)?;
             let greeting = joiner::greeting(&mut stream)?;
             let bundle = joiner::run_lan(&mut stream, &greeting, joining)?;
-            accept_bundle(paths, &greeting.name, &bundle)
+            let joined = accept_bundle(paths, &greeting.name, &bundle)?;
+            if !joined.report.failed.is_empty() {
+                return Err(Error::new(
+                    "credential files are incomplete; automatic sync will retry",
+                ));
+            }
+            Ok(joined)
         })();
         match result {
             Ok(joined) => return Ok(joined),

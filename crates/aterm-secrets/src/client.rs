@@ -4265,10 +4265,13 @@ fn ask_members_if_due(
         .flatten()
         .filter(|config| matches!(config.source, Source::Url(_)) && alab_vault(config));
     let waiting = config.as_ref().is_some_and(|config| {
-        load_state(paths).is_ok_and(|state| state.membership == Stored::Pending)
-            && (!holds_allowed(paths)
-                || log_entries::trusted_configured_log(paths, config)
-                    .is_ok_and(|log| log.is_some()))
+        load_state(paths).is_ok_and(|state| {
+            state.membership == Stored::Pending
+                && (state.failed
+                    || !holds_allowed(paths)
+                    || log_entries::trusted_configured_log(paths, config)
+                        .is_ok_and(|log| log.is_some()))
+        })
     });
     if !waiting {
         return;

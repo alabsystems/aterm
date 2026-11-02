@@ -2989,9 +2989,32 @@ fn a_waiting_mac_asks_alabs_members_once_a_minute_until_a_member_allows_it() {
     ask_members_if_due(&admin, &mut theirs, &ask, &log);
     assert_eq!(count(), 3, "a Mac that is in asks nobody");
     super::handover::test_hand_allowed(&admin, &mb, "mb");
+    let mut complete = load_state(&mb).unwrap();
+    complete.failed = false;
+    save_state(&mb, &complete).unwrap();
     asked.at = Some(a_minute_ago());
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(count(), 3, "a Mac a member allowed asks nobody");
+    let mut incomplete = load_state(&mb).unwrap();
+    incomplete.failed = true;
+    incomplete.source_identity = None;
+    save_state(&mb, &incomplete).unwrap();
+    asked.at = Some(a_minute_ago());
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(
+        count(),
+        4,
+        "an incomplete credential bundle is requested again"
+    );
+    incomplete.failed = false;
+    save_state(&mb, &incomplete).unwrap();
+    asked.at = Some(a_minute_ago());
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(
+        count(),
+        4,
+        "a repaired bundle no longer needs a peer handoff"
+    );
     crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
     server.stop();
 }
