@@ -97,7 +97,7 @@ serde = { package = "aterm-serde", path = "crates/aterm-serde" }
 # Resolves to crates/aterm-libc through [patch.crates-io] below.
 libc = "0.2"
 # TLS for aterm-http and aterm-net (the fleet); `ring` backend, no aws-lc C build.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Shared version floor for every direct `ring` edge; default features off so each
 # member enables only what it needs (`alloc` in atpkg for RSA, `default` in
 # signing tools and tests).
