@@ -1937,10 +1937,7 @@ impl TerminalHandler<'_> {
         let (Ok(width), Ok(height)) = (u16::try_from(canvas_w), u16::try_from(canvas_h)) else {
             return Err("ENOSPC:frame too large");
         };
-        let size = usize::from(width) * usize::from(height) * 4;
-        if size > MAX_KITTY_IMAGE_BYTES {
-            return Err("ENOSPC:frame too large");
-        }
+        let size = kitty_rgba_len(width, height)?;
         let under = match (edit, base) {
             (Some(index), _) => Some(&frames.get(index).ok_or("EINVAL:no such frame")?.image),
             (None, Some(n)) => Some(
@@ -2321,14 +2318,21 @@ struct KittyRgba<'a> {
     size: (u16, u16),
 }
 
+/// Bound decoded frame bytes before allocation, including on 32-bit targets.
+fn kitty_rgba_len(width: u16, height: u16) -> Result<usize, &'static str> {
+    usize::from(width)
+        .checked_mul(usize::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|&bytes| bytes <= MAX_KITTY_IMAGE_BYTES)
+        .ok_or("ENOSPC:frame too large")
+}
+
 fn kitty_rgba(frame: &ImageData) -> Result<KittyRgba<'_>, &'static str> {
     let (width, height) = raster_size(frame).ok_or(KITTY_BAD_PNG)?;
     let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
         return Err("ENOSPC:frame too large");
     };
-    if usize::from(width) * usize::from(height) * 4 > MAX_KITTY_IMAGE_BYTES {
-        return Err("ENOSPC:frame too large");
-    }
+    kitty_rgba_len(width, height)?;
     let pixels = match frame.format {
         ImageFormat::RawRgba8 { .. } => Cow::Borrowed(frame.bytes.as_slice()),
         ImageFormat::Png => {
@@ -2716,6 +2720,18 @@ impl TerminalHandler<'_> {
 mod kitty_display_tests {
     use crate::terminal::Terminal;
     use crate::terminal::kitty_graphics::zlib_zeros;
+
+    #[test]
+    fn rgba_frame_size_rejects_oversize_and_32_bit_overflow_dimensions() {
+        assert_eq!(super::kitty_rgba_len(1, 1), Ok(4));
+        assert_eq!(super::kitty_rgba_len(1024, 1024), Ok(4 * 1024 * 1024));
+        for (width, height) in [(1024, 1025), (32768, 32768), (u16::MAX, u16::MAX)] {
+            assert_eq!(
+                super::kitty_rgba_len(width, height),
+                Err("ENOSPC:frame too large")
+            );
+        }
+    }
 
     fn apc_g(control: &str, raw_payload: &[u8]) -> Vec<u8> {
         let mut v = b"\x1b_G".to_vec();
