@@ -104,7 +104,8 @@ Validated locally with Trust's explicitly unverified build lane (no proof claim)
 
 - `aterm-machines --lib`: 1,132 passed.
 - `aterm-secrets --lib`: 1,058 passed, one ignored.
-- `aterm-cli --lib macos_doctor`: 527 passed, including background tool provisioning.
+- `aterm-cli --lib`: 712 passed, including recovery, background tool provisioning, and LAN profile activation.
+- `aterm-gui --lib system_state`: 448 passed across the panel, window, and permission handlers.
 - `aterm-primer`: 61 passed.
 - Interactive workflow model: 14 checks passed.
 - Rust formatting and `git diff --check`: clean.
@@ -114,3 +115,5 @@ Several existing test fixtures contained doubled `/Users//` paths that disagreed
 Delivery remains local on `codex/lan-init`. GitHub's routed write decision is `write_none`; no configured owner writer is available. The installed app and remote admission service have not been replaced. The native System State interface and full single-coordinator design remain future implementation; the interactive HTML is a reviewable prototype, not a deployed feature.
 
 The Secrets stage also retains indefinite retry with its existing one-to-four-minute capped backoff. Failures no longer become a permanent hold after two attempts. Input changes still bypass the deadline, and unknown reads preserve known fingerprints without resetting the failure history.
+
+The native System State admission now starts and resumes an automatic offer without recent keyboard or mouse activity. Busy operations and explicit stops still hold it, and OS permission gestures retain their separate checks. Verified discovery of the pinned LAN service enables the full default profile before membership completes; credentials remain prerequisites only for the tasks that consume them. An actively retrying row no longer displays as failed because its persisted text came from the older two-attempt policy.

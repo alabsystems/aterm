@@ -4,7 +4,7 @@
 //! The System State tab (`docs/DESIGN-system-state-2026-10-21.md` §3): what
 //! this Mac reads now beside what aterm wants, in five groups. A group's
 //! `Set up │ Leave as is` choice takes effect at once. First launch admits
-//! its offer automatically at the first unblocked tick with a person present.
+//! its offer automatically at the first unblocked tick.
 
 mod paint;
 
@@ -354,12 +354,12 @@ impl SetupStatus {
 
     /// Whether aterm tries `row`, a failed result, again by itself (§3.5): it is transient
     /// ([`FailureKind::of_status`]), and the words it carries say so, or the run still retries
-    /// and its words do not say its own tries are spent (a vault try held after two,
-    /// [`TRIED_TWICE`]). Meanwhile it counts as waiting, and Set up now is no remedy the page
+    /// regardless of an older saved row's two-attempt wording. Meanwhile it counts as waiting,
+    /// and Set up now is no remedy the page
     /// offers for it ([`Said::words`]).
     fn retries_by_itself(&self, row: &SetupStatusRow) -> bool {
         FailureKind::of_status(&row.status).is_some_and(FailureKind::retried)
-            && (row.detail == RETRIES_NOTE || (self.retrying && row.detail != TRIED_TWICE))
+            && (row.detail == RETRIES_NOTE || self.retrying)
     }
 
     /// The reason a step the last run could not finish gives for `row` (§3.6): its words, in the
@@ -3117,9 +3117,8 @@ impl SystemStateApp {
     }
 
     /// A withdrawn offer is let go. An offer that waits for its answer is answered by the page
-    /// itself, as the plan stands, on the first tick a person is at this Mac (`present`: a
-    /// keyboard, mouse or trackpad used within the last minute, and the screen neither locked
-    /// nor switched away), focused, shown or not, whatever was clicked or typed meanwhile:
+    /// itself, as the plan stands, on the first tick, focused, shown or not,
+    /// without waiting for keyboard or mouse activity:
     /// no review, no countdown, no confirmation (design revision 4); a status that says the page
     /// is busy holds it until it is not, but for the offer of a plan an earlier process admitted,
     /// whose run is what keeps it busy ([`Self::answer_resume`]). While a setup run goes and the page is `shown` (the
@@ -3127,7 +3126,7 @@ impl SystemStateApp {
     /// view's last render showed a walking village ([`SystemStateViewState::village_walks`]).
     /// `true` when the page changed: a page nobody sees, one Check again or Restore keeps busy,
     /// or one whose shown views draw no walking village owes no repaint for the walk.
-    pub(crate) fn tick(&mut self, present: bool, shown: bool, walks: bool) -> bool {
+    pub(crate) fn tick(&mut self, _present: bool, shown: bool, walks: bool) -> bool {
         let before = (
             self.request.is_some(),
             self.status.busy,
@@ -3148,9 +3147,9 @@ impl SystemStateApp {
             .as_ref()
             .and_then(Request::take_widened)
             .is_some_and(|widened| self.widen_review(widened));
-        if self.reviewing() && present && !self.status.busy {
+        if self.reviewing() && !self.status.busy {
             self.apply(Admission::Automatic, Submission::Offer, None);
-        } else if self.resume_waits() && present && !self.stopping {
+        } else if self.resume_waits() && !self.stopping {
             // The run it resumes is going: its busy status holds nothing here. A Stop asked of
             // that run is no run to go on with, so the page gives no answer after one.
             self.answer_resume();

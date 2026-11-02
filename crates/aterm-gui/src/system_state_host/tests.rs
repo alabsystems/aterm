@@ -1439,9 +1439,8 @@ fn a_join_while_the_offer_waits_hands_the_vault_and_password_to_the_startup_once
         "system-state/password",
         "synthetic-reviewed-secret",
     );
-    app.tick_system_state(Instant::now());
-    assert!(request.pending(), "typing answers nothing");
-    // The tick's reading of the shown page is the only worker call.
+    assert!(request.pending(), "typing alone answers nothing");
+    // Discard observation calls made while entering the explicit join.
     calls();
     press(&mut app, wid, view, "system-state/vault/join");
     let mut answer = receive.try_recv().unwrap();
@@ -1463,13 +1462,10 @@ fn a_join_while_the_offer_waits_hands_the_vault_and_password_to_the_startup_once
     app.resolve_system_state_apply();
 }
 
-/// The page answers the first-launch offer by itself only while a person is at this screen
-/// (SAFE-1): a keyboard, mouse or trackpad used within the last minute, and the screen neither
-/// locked nor switched away. A window that opened with nobody there (idle ten minutes, or
-/// locked) never answers; a person who used the trackpad five seconds ago gets the answer at
-/// the first tick. A page with no offer waiting reads neither.
+/// The automatic startup offer is independent of recent input or screen visibility.
+/// A page with no offer waiting does not read either presence signal.
 #[test]
-fn the_page_answers_the_offer_only_while_a_person_is_at_the_screen() {
+fn the_page_answers_the_offer_without_waiting_for_screen_presence() {
     let answers = |input: fn(Duration) -> bool, away: fn() -> bool| {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1486,11 +1482,11 @@ fn the_page_answers_the_offer_only_while_a_person_is_at_the_screen() {
         receive.try_recv().is_ok()
     };
     assert!(answers(|within| within >= Duration::from_secs(5), || false));
-    assert!(!answers(
+    assert!(answers(
         |within| within >= Duration::from_secs(10 * 60),
         || false
     ));
-    assert!(!answers(|_| true, || true));
+    assert!(answers(|_| true, || true));
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

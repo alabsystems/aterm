@@ -2515,24 +2515,19 @@ fn a_page_asked_to_stop_gives_the_resumed_offer_no_answer() {
     }
 }
 
-/// Design revision 4: the launch's offer is answered by the page itself, as the plan stands, on
-/// the first tick a person is at this Mac, shown or not; with nobody at the Mac it waits (SAFE-1).
+/// The launch offer is answered automatically, even on an unattended Mac.
 /// The answer is aterm's own, never a choice, and carries no typed vault.
 #[test]
-fn the_offer_is_answered_on_the_first_tick_a_person_is_here_and_never_without_one() {
+fn the_offer_is_answered_on_the_first_tick_without_waiting_for_a_person() {
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(request.clone()));
-    for shown in [true, false, true] {
-        app.tick(false, shown, false);
-        assert!(app.take_action().is_none(), "nobody at this Mac");
-    }
     assert!(request.pending());
     assert_eq!(app.headline().text, STARTING_HEADLINE);
-    app.tick(true, false, false);
+    app.tick(false, false, false);
     let Some(SystemStateAction::Apply(answer, who)) = app.take_action() else {
-        panic!("the first tick with a person here answers the offer");
+        panic!("the first unattended tick answers the offer");
     };
     assert_eq!(who, Admission::Automatic);
     assert!(!answer.chosen && !answer.vault_typed && answer.password.is_none());
@@ -2788,8 +2783,8 @@ fn page_app(
 }
 
 /// The worker hears this Mac's ALab signal while the launch's offer still waits for its answer
-/// (§3.5; nobody at this Mac yet): the offer widens to the whole profile in place, the page says
-/// why, and the page's own answer, once a person is here, says it showed the widened plan.
+/// while another operation holds the page busy: the offer widens in place, and the
+/// automatic answer uses the widened plan once the operation finishes.
 #[test]
 fn an_alab_signal_widens_a_waiting_offer_in_place() {
     let (send, receive) = mpsc::channel();
@@ -2797,6 +2792,10 @@ fn an_alab_signal_widens_a_waiting_offer_in_place() {
     let request = Request::new(narrow.clone(), send);
     let mut app = SystemStateApp::new(narrow.clone());
     assert!(app.offer(request.clone()));
+    app.publish(SetupStatus {
+        busy: true,
+        ..SetupStatus::default()
+    });
     let (mut runtime, instance, view) = runtime_with_app(app);
     runtime.tick_system_state(false, true, &[view]);
     request.send_widened(Plan::default());
@@ -2809,7 +2808,8 @@ fn an_alab_signal_widens_a_waiting_offer_in_place() {
         "the page says why"
     );
     assert!(runtime.take_system_state_action().is_none());
-    runtime.tick_system_state(true, true, &[view]);
+    runtime.publish_system_state(SetupStatus::default());
+    runtime.tick_system_state(false, true, &[view]);
     let Some(SystemStateAction::Apply(answer, admission)) = runtime.take_system_state_action()
     else {
         panic!("the page answers the offer");
@@ -5732,17 +5732,16 @@ fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
         crate::system_state_access::menu_line(&held, false).map(|line| line.label),
         Some("System State: Secrets vault failed".to_owned())
     );
-    // A vault try held after two has spent its tries though the run still retries other
-    // steps: it failed, and says so with them.
+    // Resuming automatic retries replaces the legacy hold with a waiting state.
     held.retrying = true;
-    assert_eq!(line(&held).text, "1 step failed: Secrets vault");
     assert_eq!(
-        crate::system_state_access::menu_line(&held, false).map(|line| line.label),
-        Some("System State: Secrets vault failed".to_owned())
+        line(&held).text,
+        "2 steps waiting: Secrets vault, GitHub repositories"
     );
+    assert!(crate::system_state_access::menu_line(&held, false).is_none());
     assert_eq!(
         row_view(secrets, &held, Selection::all()).chip,
-        Some(Chip::Failed)
+        Some(Chip::WillChange { busy: false })
     );
     step.retrying = false;
     assert_eq!(line(&step).text, "1 step failed: GitHub repositories");
@@ -6182,9 +6181,21 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu
         );
     }
 
-    // A transient vault try held after two has spent its tries, though the run retries.
+    // An older persisted two-attempt note cannot override an active retry.
     let mut held = status_of("vault-failed");
     held.rows[0].detail = TRIED_TWICE.into();
+    held.retrying = true;
+    assert_eq!(
+        signals(&held, Subject::Setting(Setting::Secrets)),
+        (
+            "2 steps waiting: Secrets vault, GitHub repositories".into(),
+            Some(Chip::WillChange { busy: false }),
+            'D',
+            None,
+            false
+        )
+    );
+    held.retrying = false;
     assert_eq!(
         signals(&held, Subject::Setting(Setting::Secrets)),
         failed("Secrets vault")

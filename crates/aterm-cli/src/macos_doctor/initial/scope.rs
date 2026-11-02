@@ -7,8 +7,8 @@
 //! Sync rows ride it) and Rust in Spotlight (this login's rustup docs and aterm's
 //! build caches kept out of Spotlight). The rest of the profile
 //! — the workstation preferences, Dock, Repositories and the Messages and FaceTime
-//! sign-outs — only on an ALab Mac, which is one whose login opened a locker in the
-//! ALab vault under this Mac's own freshly minted recipient key. Elsewhere the
+//! sign-outs — once the pinned ALab service is found on this LAN or this login
+//! already holds ALab membership. Elsewhere the
 //! automatic plan is the base plan, saved as provisional, and the launch that finds
 //! the signal, this one or a later one, widens it to the whole profile as a new
 //! revision. A plan a person shaped is never changed, and this scoping never narrows
@@ -355,17 +355,17 @@ fn member_of_the_alab_vault(status: &aterm_secrets::client::Status) -> bool {
     }
 }
 
-/// Whether this is an ALab Mac (§3.5): a membership opened under this Mac's own
-/// recipient key in the ALab vault ([`member_of_the_alab_vault`]), kept for the
-/// process once seen. Reads this login's secrets records only, with no network
-/// probe. Nothing else is the signal: a probe that found the vault's address, a
-/// pending request to it, a plain file, another vault, or a fleet key (`aterm fleet
-/// init` makes a fleet of anyone's Macs) each start a join at most. The Secrets lane
-/// every Mac runs ([`scoped`]) does the join; this gates only the workstation
-/// profile and the sign-outs.
+/// The full default profile applies once the pinned ALab service is discovered on
+/// this LAN, or this login already holds membership. Credential delivery remains a
+/// dependency of repositories and shared data, not of unrelated workstation setup.
+/// This performs a bounded network probe and must run off the UI thread.
 pub fn alab_mac() -> bool {
     static ALAB: AtomicBool = AtomicBool::new(false);
-    kept_if_found(&ALAB, vault_member)
+    kept_if_found(&ALAB, || profile_ready(vault_member(), probe_vault))
+}
+
+fn profile_ready(member: bool, discover: impl FnOnce() -> VaultHere) -> bool {
+    member || discover() == VaultHere::Found
 }
 
 /// `found`, read only until it says yes once.
@@ -385,8 +385,8 @@ fn kept_if_found(kept: &AtomicBool, found: impl FnOnce() -> bool) -> bool {
 /// ([`aterm_types::macos_setup::BASE_PLAN`]) — aterm's own Permissions, the Secrets
 /// vault lane (the discovery look and the Sync rows ride it) and Rust in Spotlight (this
 /// login's rustup docs and aterm's build caches kept out of Spotlight). The workstation
-/// preferences, Dock, Repositories and the Messages and FaceTime sign-outs wait for the
-/// ALab signal ([`alab_mac`]); the base plan reaches every Mac so sync is on by default
+/// preferences, Dock, Repositories and the Messages and FaceTime sign-outs wait for
+/// verified LAN discovery or existing membership ([`alab_mac`]); the base plan reaches every Mac so sync is on by default
 /// (§8.1).
 fn scoped(mut plan: Plan, alab: bool) -> Plan {
     if !alab {
@@ -1112,6 +1112,21 @@ pub(super) fn settle_put_back(root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verified_lan_discovery_enables_defaults_before_membership() {
+        assert!(super::profile_ready(false, || super::VaultHere::Found));
+        assert!(super::profile_ready(true, || panic!(
+            "membership needs no probe"
+        )));
+        for here in [
+            super::VaultHere::Unasked,
+            super::VaultHere::Absent,
+            super::VaultHere::Unreached,
+        ] {
+            assert!(!super::profile_ready(false, || here));
+        }
+    }
+
     use super::*;
 
     /// One look per network: another vault's answer at the ALab vault's address, kept by any
