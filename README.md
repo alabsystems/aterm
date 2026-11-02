@@ -370,8 +370,17 @@ it as privileged:
 - Scoped capabilities can grant a single kind of operation on a single session
   without handing over the instance's owner token; owner-only verbs stay
   owner-only.
-- Nothing on the network drives aterm unless its person names who may. The
-  one network door is the opt-in fleet listener (`[fleet] listen`): it accepts
+- Default LAN initialization treats membership of the trusted physical LAN as
+  authorization to join. A reachable, compatible member automatically admits a
+  signed device request and supplies its configured shared credential bundle,
+  without an Allow action, invitation phrase, or second approval. The connection
+  must come from a loopback, private, or link-local address. Initialization writes
+  credentials to user-private files in `~/.secrets` and retries incomplete writes
+  and unavailable peers. An updated member is required for this automatic path.
+  Use this on a LAN whose connected machines are trusted to receive those
+  credentials; public internet bootstrap is outside this model. The embedded TLS
+  certificate and key are public and do not establish a peer's identity.
+- Fleet control uses a separate listener (`[fleet] listen`): it accepts
   loopback, private and link-local addresses only, admits a peer that proves
   the shared fleet secret with an HMAC over the TLS 1.3 exporter, and answers
   the read verbs marked `fleet` (`survey`, `version`), at `facts` or `content`

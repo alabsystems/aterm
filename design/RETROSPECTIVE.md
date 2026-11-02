@@ -45,18 +45,18 @@ Relevant validation passed: 1,132 machine tests; 1,061 secrets tests with one ig
 
 The peer tests include a no-approval credential write, rejection of a non-LAN automatic request, and recovery after a blocked credential path becomes writable. These tests do not substitute for a successful live join.
 
-The live sweep found 25 endpoints rejecting the new exchange and ten unavailable endpoints. Fleet control refused this unadmitted Mac, SSH to m11 and m12 rejected the available credentials, and targeted Keychain checks found no matching credentials. No remote agent received the release task. No credential values were printed.
+The live sweep found 25 endpoints rejecting the new exchange and ten unavailable endpoints. Fleet control refused this unadmitted Mac, SSH to existing members rejected the available credentials, and targeted Keychain checks found no matching credentials. No remote agent received the release task. No credential values were printed.
 
 The new exchange requires an updated member. That rollout dependency must be explicit; a client-only update cannot make the old server protocol grant a new operation.
 
 ## How this should have worked, fully automatically
 
-The person connects m60 to the LAN and opens aterm. Initialization starts immediately, with no setup button, open panel, recent input, password, invitation phrase, or per-machine approval. The person can start working while independent setup tasks run.
+The person connects a new machine to the LAN and opens aterm. Initialization starts immediately, with no setup button, open panel, recent input, password, invitation phrase, or per-machine approval. The person can start working while independent setup tasks run.
 
 | Step | Automatic behavior | Evidence of completion |
 | --- | --- | --- |
 | Discover | Find the existing aterm members through the existing LAN transport. Start all ready local setup tasks at once. | Reachable peers and their supported bootstrap capabilities are known. |
-| Identify and admit | Create m60's own device identity, reconcile its recorded fleet name, and admit it under the LAN policy. Show the macOS hostname separately if it differs. | The same device has a consistent identity across discovery, membership, and System State. |
+| Identify and admit | Create the new machine's own device identity, reconcile its recorded fleet name, and admit it under the LAN policy. Show the macOS hostname separately if it differs. | The same device has a consistent identity across discovery, membership, and System State. |
 | Bootstrap credentials | A reachable member supplies the configured shared credentials over the existing protected peer connection. The bootstrap uses the app's bundled code and needs no Git, compiler, GitHub token, fleet secret, or completed tool installation first. | The bundle is received and bound to this device. |
 | Materialize | Create `~/.secrets` with private permissions and write the required files safely. Verify each required file and retry any partial write. | The required credential files exist and their complete materialization is recorded; an accepted request alone is not success. |
 | Activate services | Start the credential subscriber, fleet/node services, and agent communication automatically. Select the proper `aterm agh` identities from the synced files. | Sync is running, peer communication works, and routed authentication resolves the intended accounts. |
@@ -94,7 +94,7 @@ Roll out a compatible member-side bootstrap before sending a new client that nee
 
 For this interrupted rollout, use the offered bootstrap keys or an already-provisioned release machine to land the changes in the development repository and publish through the normal signing pipeline. This is recovery from the present defect, not the intended onboarding process. After a member updates, verify that this Mac's running subscriber receives the credentials automatically and that `aterm agh` resolves the intended writer. Then verify fleet-wide rollout and replace the temporary pinned subscriber with the released program through the normal updater.
 
-The prior subscriber configuration is saved at `/Users/ayates/.local/state/aterm-init-audit/subscriber-before-5b55fd73.plist`. Its current program is `/Users/ayates/.local/libexec/aterm-lan-init-5b55fd73`.
+The private operational handoff records the subscriber backup and the stable executable used for this interrupted rollout.
 
 ## Final fresh attempt
 
@@ -103,4 +103,4 @@ The final requested attempt used the updated executable and fresh LAN discovery.
 
 ## Naming mismatch
 
-The operator identifies this machine as m60. Its actual macOS ComputerName is `Andrew’s MacBook Pro`, LocalHostName is `Andrews-MacBook-Pro`, and HostName is unset. Its current LAN address was 192.168.1.84 when checked. Aterm's fallback name selection produced the pending join name `andrews` because no `m<number>` tag exists in those OS names. I should have stated the inventory label, OS discovery name, and pending join name separately instead of treating them as interchangeable. The operator's m60 label has not been independently resolved from the missing fleet inventory.
+The machine's inventory label differed from its macOS discovery name and its pending admission name. The fallback selected a name from the operating system because no fleet label was available there. I should have reported these identities separately instead of treating them as interchangeable. Init should reconcile the inventory identity automatically while showing the OS hostname separately; it must not silently rename the operating system or claim an unverified inventory match.
