@@ -4,6 +4,8 @@
 
 The intended contract was simple: a machine on this LAN should initialize itself, receive its shared credentials in `~/.secrets`, and become useful without a button, approval, phrase, or manual credential setup.
 
+**Current policy: joining the trusted physical LAN is sufficient authentication and authorization to join aterm.** There is no second approval step for LAN membership. Device keys and encrypted transport are created and used automatically; they do not ask the person to authenticate again. Additional channels, internet exposure, and their protections are future work, not prerequisites for this LAN-only flow.
+
 That contract is not yet met end to end on this Mac. The source fixes are committed and tested, and its credential subscriber runs a stable copy of the corrected build. However, the existing member machines still run the earlier admission protocol. No new version has been published, and `~/.secrets` has not materialized here. The final fresh LAN attempt is recorded below.
 
 ## What broke
@@ -47,18 +49,50 @@ The live sweep found 25 endpoints rejecting the new exchange and ten unavailable
 
 The new exchange requires an updated member. That rollout dependency must be explicit; a client-only update cannot make the old server protocol grant a new operation.
 
-## How this should work
+## How this should have worked, fully automatically
 
-1. Make cold-start readiness an executable contract, not a collection of individually successful tasks. Include credential materialization, routed authentication, source readiness, and the absence of user interaction.
-2. Exercise that contract with a fresh machine, an already-running member, no terminal input, and no manual approval. Include an older member version, offline/rejoin, partial writes, interrupted work, and process restarts.
-3. Keep one persisted dependency graph and explicit states: discovered, joining, syncing, materializing, and ready. Surface the blocked dependency and the next automatic attempt concisely. Never label an attempted or waiting task done.
-4. Ship member-side compatibility first and advertise supported bootstrap capabilities. A mixed-version LAN must have a deliberate migration path, rather than discovering incompatibility after the client is installed.
-5. Establish one already-provisioned release route before relying on an unprovisioned client to repair the fleet. LAN discovery, credential handoff, and release capability must be tested separately.
-6. Start verification with the live acceptance checks. Use focused tests for the changed boundary, then integration tests, and report source, running-local, and deployed-fleet outcomes separately.
+The person connects m60 to the LAN and opens aterm. Initialization starts immediately, with no setup button, open panel, recent input, password, invitation phrase, or per-machine approval. The person can start working while independent setup tasks run.
+
+| Step | Automatic behavior | Evidence of completion |
+| --- | --- | --- |
+| Discover | Find the existing aterm members through the existing LAN transport. Start all ready local setup tasks at once. | Reachable peers and their supported bootstrap capabilities are known. |
+| Identify and admit | Create m60's own device identity, reconcile its recorded fleet name, and admit it under the LAN policy. Show the macOS hostname separately if it differs. | The same device has a consistent identity across discovery, membership, and System State. |
+| Bootstrap credentials | A reachable member supplies the configured shared credentials over the existing protected peer connection. The bootstrap uses the app's bundled code and needs no Git, compiler, GitHub token, fleet secret, or completed tool installation first. | The bundle is received and bound to this device. |
+| Materialize | Create `~/.secrets` with private permissions and write the required files safely. Verify each required file and retry any partial write. | The required credential files exist and their complete materialization is recorded; an accepted request alone is not success. |
+| Activate services | Start the credential subscriber, fleet/node services, and agent communication automatically. Select the proper `aterm agh` identities from the synced files. | Sync is running, peer communication works, and routed authentication resolves the intended accounts. |
+| Provision tools and source | Install and verify Apple Command Line Tools through the background service, provision the bundled tools, then obtain the authoritative development checkout once its credentials are ready. | Git and the compiler actually work; the correct source and toolchain are available. |
+| Continue work across machines | Discover an already-running agent and route authorized work to an appropriate ready machine when that machine has the needed capabilities. Communication must not depend on the very credential handoff it is trying to repair. | A task is received, executed, and its result can be verified from this machine. |
+| Publish when requested | Route an authorized release to an already-provisioned signing host, land the changes, publish the new version, and let the other Macs update through their normal updater. Keep device-specific signing identities on their owning machines. | Remote main contains the changes, a verified release exists, and peers report the updated version. |
+
+These are dependencies, not one long serial script. Local preferences and developer-tool installation can run while credential sync is in progress. Private source access waits for credentials. A release waits for verified code and a ready publishing host. When a dependency becomes ready, its dependents start immediately without another command or click.
+
+The bootstrap must not contain a circular requirement such as “receive the fleet credential before talking to the peer that supplies it,” “have GitHub credentials before obtaining bootstrap code,” or “publish the admission fix before this machine is allowed to ask an existing release agent to publish it.” Under the LAN policy, the existing peer transport must support discovery, bootstrap, and routing that initial request before service-specific credentials arrive.
+
+A slow download is allowed to take time; starting it must be immediate and automatic. A sleeping peer, an unavailable vault, or a temporary network failure means waiting and retrying, not giving up after a fixed number of attempts. Reconnect, credential arrival, peer wake-up, and successful tool installation should trigger reconciliation at once. A restart resumes the recorded workflow and verifies interrupted operations instead of losing them or repeating completed side effects.
+
+If macOS itself requires an unavoidable OS permission grant, isolate it to the task that needs it and let the rest continue. That platform requirement must not become a second LAN admission check or a blanket blocker for credential delivery.
+
+System State should show verified progress, what is running, and each waiting task's actual dependency in a short line. For example: `Credentials — waiting for a LAN member` and `Private source — waiting for credentials`. Completed tasks count only after verification. Detailed diagnostics belong behind the row, not in paragraphs on the main panel. A missing credential in this flow is an initialization failure to repair, not a request for the person to fetch a token manually.
+
+### What would prove this works
+
+Start with a fresh machine on the LAN, an empty credential directory, no developer tools, and no previously granted aterm membership. Do not open System State or provide any input after launch. Verify that the machine is admitted, the shared credentials appear, `aterm agh` selects the intended identity, tools and source become ready, and the agent can contact an existing machine. Then request a release and verify automatic delegation to a provisioned release host, publication, and peer update.
+
+Repeat that test with an older peer version, one unavailable peer, a network interruption, a partial file-write failure, and a process restart. Verify that ready work continues, incomplete work remains incomplete, and recovery requires no approval, phrase, “check again,” or repeated init command. Test real transitions, not only individual functions or mocked success counts.
+
+Roll out a compatible member-side bootstrap before sending a new client that needs it. Keep at least one reachable bootstrap/release route working throughout an update. A mixed-version LAN must not strand a fresh machine behind the old approval gate.
+
+### Process changes for the investigation
+
+1. Check the cold-start contract first: actual credential files, actual routed identity, actual peer communication, and actual source access.
+2. Trace the entire dependency chain before patching individual symptoms. Identify every independent admission implementation and every runtime version involved.
+3. Maintain one persisted workflow with explicit dependencies and automatic event-driven continuation.
+4. Verify the source change, the locally running behavior, and the deployed fleet behavior separately. Say which one is fixed in each report.
+5. Treat the no-approval LAN policy as the requirement throughout the investigation. Do not quietly reintroduce manual keys, phrases, or approval as the proposed normal path.
 
 ## Remaining work
 
-Obtain the bootstrap keys or use an already-provisioned release machine, land the changes in the development repository, and publish through the normal signing pipeline. After a member updates, verify that this Mac's running subscriber receives the credentials automatically and that `aterm agh` resolves the intended writer. Then verify fleet-wide rollout and replace the temporary pinned subscriber with the released program through the normal updater.
+For this interrupted rollout, use the offered bootstrap keys or an already-provisioned release machine to land the changes in the development repository and publish through the normal signing pipeline. This is recovery from the present defect, not the intended onboarding process. After a member updates, verify that this Mac's running subscriber receives the credentials automatically and that `aterm agh` resolves the intended writer. Then verify fleet-wide rollout and replace the temporary pinned subscriber with the released program through the normal updater.
 
 The prior subscriber configuration is saved at `/Users/ayates/.local/state/aterm-init-audit/subscriber-before-5b55fd73.plist`. Its current program is `/Users/ayates/.local/libexec/aterm-lan-init-5b55fd73`.
 

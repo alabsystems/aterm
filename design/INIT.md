@@ -1,5 +1,11 @@
 # LAN-first initialization
 
+## Trust policy for this phase
+
+Joining the trusted physical LAN is sufficient authentication and authorization to join aterm. Default initialization must not add an approval button, invitation phrase, password, GitHub sign-in, or completed fleet membership as a prerequisite for receiving the credentials that establish that membership. Device identity and transport protection happen automatically. Additional channels, internet access, and further protections are later work.
+
+The complete ideal startup sequence and the live acceptance test are recorded in `RETROSPECTIVE.md` under “How this should have worked, fully automatically.” Manual bootstrap keys in this session are a recovery measure for a broken rollout, not the design.
+
 ## Current decision
 
 Everything is selected, on, and active by default on this LAN. Joining does not require an Allow button, a phrase, or the old `[join] open` opt-in. New channels, internet operation, a new server, and additional protection modes are outside this change.
@@ -104,7 +110,7 @@ Validated locally with Trust's explicitly unverified build lane (no proof claim)
 
 - `aterm-machines --lib`: 1,132 passed.
 - `aterm-secrets --lib`: 1,061 passed, one ignored.
-- `aterm-agent --lib members_cli`: 11 passed.
+- `aterm-agent --lib members_cli`: 12 passed.
 - Full `aterm` executable: built successfully.
 - `aterm-cli --lib`: 712 passed, including recovery, background tool provisioning, and LAN profile activation.
 - `aterm-gui --lib system_state`: 448 passed across the panel, window, and permission handlers.
