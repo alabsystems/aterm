@@ -1096,3 +1096,31 @@ fn read_standby_steward_labels_filters_denied_stewards() {
     );
     running.stop();
 }
+
+#[test]
+fn credential_debug_redacts_account_bundle_and_route() {
+    let marker = "synthetic-private-signin-value";
+    let route = SealedRoute {
+        login: marker.into(),
+        webmail_url: Some(marker.into()),
+        imap_url: Some(marker.into()),
+        http_url: Some(marker.into()),
+        password: Some(marker.into()),
+        mailbox_password: Some(marker.into()),
+        totp_secret: Some(marker.into()),
+    };
+    let bundle = SealedAccountBundle {
+        password: Some(marker.into()),
+        mailbox_password: Some(marker.into()),
+        totp_secret: Some(marker.into()),
+        route: Some(route.clone()),
+    };
+    for output in [
+        format!("{route:?}"),
+        format!("{route:#?}"),
+        format!("{bundle:?}"),
+        format!("{bundle:#?}"),
+    ] {
+        assert!(!output.contains(marker));
+    }
+}

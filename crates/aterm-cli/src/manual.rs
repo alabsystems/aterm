@@ -2465,7 +2465,7 @@ CUT — from a clean clone of the dev repo on main, never the shared checkout
       withdraws a claimed, unpublished cut (the claim commit stays).
 
   aterm ship --help          every flag and exit code, recovery included
-  docs/RELEASING.md          the runbook, including a cut that stops half-way
+  aterm help ship           this release and recovery runbook
 "#;
 
 /// `aterm help update`.

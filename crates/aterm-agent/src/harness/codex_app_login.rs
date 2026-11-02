@@ -234,7 +234,7 @@ fn token_user(id_token: Option<&str>, access_token: &str) -> TokenUser {
     token_user_claims(id_claims.as_ref(), access_claims.as_ref())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct StoredAuth {
     doc: Value,
     id_token: Option<String>,
@@ -244,6 +244,12 @@ struct StoredAuth {
     last_refresh_secs: Option<i64>,
     id_claims: Option<JwtClaims>,
     access_claims: Option<JwtClaims>,
+}
+
+impl std::fmt::Debug for StoredAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredAuth").finish_non_exhaustive()
+    }
 }
 
 /// Path to `auth.json` inside `home` (or `home` itself when `home` names a `.json` file).
@@ -574,13 +580,19 @@ impl Drop for AuthLock {
 }
 
 /// The tokens a refresh response named, and what its publication adds beside them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct RefreshedTokens {
     access_token: String,
     id_token: Option<String>,
     refresh_token: Option<String>,
     account_id: Option<String>,
     last_refresh: String,
+}
+
+impl std::fmt::Debug for RefreshedTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshedTokens").finish_non_exhaustive()
+    }
 }
 
 impl RefreshedTokens {

@@ -3129,3 +3129,33 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
     );
     assert!(!elsewhere.exists());
 }
+
+#[test]
+fn credential_debug_redacts_stored_and_refreshed_tokens() {
+    let marker = "synthetic-private-token-value";
+    let stored = super::StoredAuth {
+        doc: json!({"private": marker}),
+        id_token: Some(marker.into()),
+        access_token: marker.into(),
+        refresh_token: Some(marker.into()),
+        account_id: Some(marker.into()),
+        last_refresh_secs: None,
+        id_claims: None,
+        access_claims: None,
+    };
+    let refreshed = super::RefreshedTokens {
+        access_token: marker.into(),
+        id_token: Some(marker.into()),
+        refresh_token: Some(marker.into()),
+        account_id: Some(marker.into()),
+        last_refresh: marker.into(),
+    };
+    for output in [
+        format!("{stored:?}"),
+        format!("{stored:#?}"),
+        format!("{refreshed:?}"),
+        format!("{refreshed:#?}"),
+    ] {
+        assert!(!output.contains(marker));
+    }
+}

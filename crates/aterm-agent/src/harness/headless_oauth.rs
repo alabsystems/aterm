@@ -108,7 +108,7 @@ fn insert_credential(values: &mut BTreeMap<String, String>, key: String, value: 
 }
 
 /// Configuration for fetching incoming OAuth verification emails (magic links or 6-digit OTPs).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct MailboxConfig {
     /// Local Maildir / spool directory containing verification message files.
     pub dir: Option<PathBuf>,
@@ -168,6 +168,12 @@ pub struct MailboxConfig {
     pub routed: bool,
     /// On such a view of an entry that is not ready, why it is never tried.
     pub unready: Option<&'static str>,
+}
+
+impl std::fmt::Debug for MailboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailboxConfig").finish_non_exhaustive()
+    }
 }
 
 impl MailboxConfig {
@@ -8580,6 +8586,32 @@ mod uri_authority_tests {
             assert_eq!(parsed.userinfo, userinfo, "{url}");
             assert_eq!(parsed.port, 1777, "{url}");
             assert_eq!(parsed.target, target, "{url}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::MailboxConfig;
+
+    #[test]
+    fn mailbox_debug_does_not_disclose_credentials_or_identity() {
+        let marker = "synthetic-private-mailbox-value";
+        let config = MailboxConfig {
+            bearer_token: Some(marker.into()),
+            password: Some(marker.into()),
+            mailbox_password: Some(marker.into()),
+            totp_secret: Some(marker.into()),
+            user: Some(marker.into()),
+            http_url: Some(marker.into()),
+            passwords: [(marker.into(), marker.into())].into(),
+            mailbox_passwords: [(marker.into(), marker.into())].into(),
+            totp_secrets: [(marker.into(), marker.into())].into(),
+            ..MailboxConfig::default()
+        };
+        for output in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!output.contains(marker));
+            assert!(output.contains("MailboxConfig"));
         }
     }
 }

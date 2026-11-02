@@ -68,7 +68,7 @@ pub struct AiSigninDoc {
 /// where the account's own `[[mailboxes]]` entry is sealed to it ([`sealed_route_for`]), that
 /// entry under `route`. A Mac built before `route` ignores the field whole, so it never files
 /// the entry's secrets as the address's own per-email ones.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedAccountBundle {
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
@@ -80,8 +80,15 @@ struct SealedAccountBundle {
     route: Option<SealedRoute>,
 }
 
+impl std::fmt::Debug for SealedAccountBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedAccountBundle")
+            .finish_non_exhaustive()
+    }
+}
+
 /// The account's own `[[mailboxes]]` entry, sealed whole: its login, URLs and secrets.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedRoute {
     login: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +103,12 @@ struct SealedRoute {
     mailbox_password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     totp_secret: Option<String>,
+}
+
+impl std::fmt::Debug for SealedRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedRoute").finish_non_exhaustive()
+    }
 }
 
 impl SealedAccountBundle {
