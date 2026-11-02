@@ -36,7 +36,7 @@ fn failed_follow_up(doctor: &mut Withholding, root: &Path) {
 fn spent_follow_ups(root: &Path) -> (Withholding, u64) {
     let (mut doctor, revision) = admitted_withheld_widgets(root);
     failed_follow_up(&mut doctor, root);
-    doctor.wait(SECOND_TRY_AFTER);
+    doctor.wait(RETRY_AFTER);
     failed_follow_up(&mut doctor, root);
     let owed = load_withheld(root).unwrap();
     assert_eq!(owed.failed.len(), 1);

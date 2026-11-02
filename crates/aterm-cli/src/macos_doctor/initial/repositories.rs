@@ -8,6 +8,25 @@ use aterm_machines::items::Ctx;
 use aterm_machines::model::Mode;
 use aterm_machines::port::System;
 
+/// Provision the repository prerequisite in the worker, before checking vault inputs.
+/// A missing token or a hidden System State page must not defer developer tools.
+pub(super) fn prepare_tools(
+    sys: &dyn System,
+    verify: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if !sys.macos() || aterm_machines::init_github::git_installed(sys) {
+        return Ok(());
+    }
+    if let Some(why) = aterm_machines::items::developer::low_data(sys) {
+        return Err(why.into());
+    }
+    aterm_machines::items::developer::install_automatically(sys)?;
+    if !aterm_machines::init_github::git_installed(sys) {
+        return Err("Developer tools installation has not supplied Git yet".into());
+    }
+    verify()
+}
+
 pub(super) fn run(
     sys: &dyn System,
     ctx: &Ctx,
@@ -168,6 +187,52 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn worker_installs_tools_without_vault_inputs_or_a_window() {
+        use aterm_machines::port::Ran;
+        let sys = Fake::default();
+        let install = "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 26.6-26.6'";
+        sys.on(
+            "/usr/sbin/softwareupdate -l",
+            Ran::ok("* Label: Command Line Tools for Xcode 26.6-26.6\n"),
+        );
+        sys.on(install, Ran::ok("Done")).on_write(
+            install,
+            Path::new(aterm_machines::items::github::CLT_GIT),
+            b"",
+        );
+        let verified = std::cell::Cell::new(false);
+        prepare_tools(&sys, || {
+            verified.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(verified.get());
+        assert!(sys.calls().iter().all(|call| !call.contains("sudo")
+            && !call.contains("xcode-select --install")
+            && !call.contains("tty ")));
+        // The verified dependency prevents another download on the next pass.
+        let before = sys.calls().len();
+        prepare_tools(&sys, || panic!("already installed")).unwrap();
+        assert_eq!(sys.calls().len(), before);
+    }
+
+    #[test]
+    fn worker_keeps_an_unverified_install_pending() {
+        use aterm_machines::port::Ran;
+        let sys = Fake::default();
+        sys.on(
+            "/usr/sbin/softwareupdate -l",
+            Ran::ok("No new software available."),
+        );
+        assert!(prepare_tools(&sys, || panic!("nothing installed")).is_err());
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("xcode-select --install"))
+        );
+    }
 
     const TOKEN: &str = "fixture_repository_token_only";
 
@@ -336,9 +401,8 @@ mod tests {
             };
             sys.stat_fails(missing.to_str().unwrap(), std::io::ErrorKind::NotFound);
             let seen = observe(&sys, &ctx, Some(&plan), false).unwrap();
-            // Each needs a person (a token in the vault, Apple's tools): never a wait the run
-            // retries (System State design §3.6).
-            assert_eq!(seen.standing, Standing::NeedsYou, "{wait:?}");
+            // Both dependencies are supplied automatically; keep waiting for them.
+            assert_eq!(seen.standing, Standing::Waiting, "{wait:?}");
             assert_eq!(seen.note.as_deref(), Some(wait.note()), "{wait:?}");
             assert!(
                 !sys.calls()

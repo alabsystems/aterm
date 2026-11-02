@@ -824,7 +824,7 @@ mod tests {
             name: "admin".into(),
             uid: 501,
             gid: 20,
-            home: "/Users//admin".into(),
+            home: "/Users/admin".into(),
             shell: "/bin/zsh".into(),
             admin: true,
         }
@@ -904,15 +904,15 @@ mod tests {
             Ran::ok("/Library/Management/aterm/stage/sudoers.check: parsed OK\n"),
         );
         fake.on(
-            "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
+            "admin$ /bin/cat /Users/admin/.ssh/authorized_keys",
             Ran::exit(
                 1,
-                "cat: /Users//admin/.ssh/authorized_keys: No such file or directory",
+                "cat: /Users/admin/.ssh/authorized_keys: No such file or directory",
             ),
         );
         fake.on(
-            "admin$ /Library/Management/aterm/bin/aterm machines agent put-file /Users//admin/.ssh/authorized_keys 600",
-            Ran::ok("ok /Users//admin/.ssh/authorized_keys\n"),
+            "admin$ /Library/Management/aterm/bin/aterm machines agent put-file /Users/admin/.ssh/authorized_keys 600",
+            Ran::ok("ok /Users/admin/.ssh/authorized_keys\n"),
         );
     }
 
@@ -1020,16 +1020,16 @@ mod tests {
             Ran::ok("/Library/Management/aterm/stage/sudoers.check: parsed OK\n"),
         );
         fake.on(
-            "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
+            "admin$ /bin/cat /Users/admin/.ssh/authorized_keys",
             Ran::exit(
                 1,
-                "cat: /Users//admin/.ssh/authorized_keys: No such file or directory",
+                "cat: /Users/admin/.ssh/authorized_keys: No such file or directory",
             ),
         );
         let pid = std::process::id();
         fake.on(
-            "admin$ /Library/Management/aterm/bin/aterm machines agent put-file /Users//admin/.ssh/authorized_keys 600",
-            Ran::ok("ok /Users//admin/.ssh/authorized_keys\n"),
+            "admin$ /Library/Management/aterm/bin/aterm machines agent put-file /Users/admin/.ssh/authorized_keys 600",
+            Ran::ok("ok /Users/admin/.ssh/authorized_keys\n"),
         );
         let exe = Path::new("/Library/Management/aterm/.staging/payload/aterm-machines-dev");
         let mut out = Vec::new();
@@ -1064,7 +1064,7 @@ mod tests {
             fake.mode_of("/Library/Management/aterm/allowed_signers"),
             Some(0o644)
         );
-        assert!(fake.written("/Users//admin/.ssh/authorized_keys").is_none());
+        assert!(fake.written("/Users/admin/.ssh/authorized_keys").is_none());
         assert!(
             calls.iter().all(|c| !c.starts_with("write /Users/")),
             "{calls:#?}"
@@ -1476,15 +1476,15 @@ mod tests {
         fake.file("/etc/sudoers.d/aterm-machines", b"rule");
         let admin = admin();
         fake.on(
-            "admin$ /bin/rm -fv /Users//admin/.ssh/aterm_github_ed25519 /Users//admin/.ssh/aterm_github_ed25519.pub",
+            "admin$ /bin/rm -fv /Users/admin/.ssh/aterm_github_ed25519 /Users/admin/.ssh/aterm_github_ed25519.pub",
             Ran::ok(""),
         )
         .on(
-            "admin$ /bin/rm -rfv /Users//admin/Library/Caches/aterm-machines",
-            Ran::ok("/Users//admin/Library/Caches/aterm-machines\n"),
+            "admin$ /bin/rm -rfv /Users/admin/Library/Caches/aterm-machines",
+            Ran::ok("/Users/admin/Library/Caches/aterm-machines\n"),
         )
         .on(
-            "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
+            "admin$ /bin/cat /Users/admin/.ssh/authorized_keys",
             Ran::ok("ssh-ed25519 OWNKEY admin@laptop\n"),
         );
         fake.on(
@@ -1496,7 +1496,7 @@ mod tests {
             Ran::ok("GroupMembership: root admin\n"),
         )
         .on(
-            "/usr/bin/dscl . -read /Users//admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users/admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::ok(&format!(
                 "NFSHomeDirectory: {}\nPrimaryGroupID: 20\nUniqueID: 501\nUserShell: /bin/zsh\n",
                 admin.home
@@ -1569,7 +1569,7 @@ mod tests {
             err.contains("`sudo rm -rf /Library/Management/aterm /etc/sudoers.d/aterm-machines`"),
             "{err}"
         );
-        assert!(err.contains("/Users//admin/.ssh/authorized_keys"), "{err}");
+        assert!(err.contains("/Users/admin/.ssh/authorized_keys"), "{err}");
         assert!(!err.contains('\n'), "one line: {err}");
         assert!(
             !err.contains("more minute(s)"),
@@ -1646,10 +1646,10 @@ mod tests {
             Ran::ok("/Library/Management/aterm/stage/sudoers.check: parsed OK\n"),
         );
         fake.on(
-            "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
+            "admin$ /bin/cat /Users/admin/.ssh/authorized_keys",
             Ran::exit(
                 1,
-                "cat: /Users//admin/.ssh/authorized_keys: Permission denied",
+                "cat: /Users/admin/.ssh/authorized_keys: Permission denied",
             ),
         );
         let mut out = Vec::new();
@@ -1678,7 +1678,7 @@ mod tests {
         let err = install(
             &fake,
             &layout,
-            Path::new("/Users//admin/aterm"),
+            Path::new("/Users/admin/aterm"),
             &args,
             &admin(),
             &mut out,
@@ -1690,7 +1690,7 @@ mod tests {
         let exe = Path::new("/Library/Management/aterm/.staging/payload/aterm-machines-dev");
         assert!(install(&fake, &layout, exe, &other, &admin(), &mut out).is_err());
         let mut other = args;
-        other.allowed_signers = "/Users//admin/allowed_signers".into();
+        other.allowed_signers = "/Users/admin/allowed_signers".into();
         assert!(install(&fake, &layout, exe, &other, &admin(), &mut out).is_err());
         assert!(
             !fake

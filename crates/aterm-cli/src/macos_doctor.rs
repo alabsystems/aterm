@@ -945,21 +945,17 @@ fn automatic_retry_due(
     Ok(age.map_or(true, |age| age >= std::time::Duration::from_secs(60)))
 }
 
-const HELD: &str = "aterm tried this by itself and it did not take, so this build does not try it again on its own; Set up now in System State, or run aterm doctor --apply, to try again";
-
-const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own at setup's next try or aterm's next launch once ten minutes have passed; Set up now in System State, or run aterm doctor --apply, to try now";
+const WAITING: &str = "Waiting to retry automatically";
 
 const SETTLED: &str = "this setup had it as wanted once and it has changed since; Set up now in System State, or run aterm doctor --apply, to set it again";
 
 const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's own step for it, whose row says how that went; aterm set the rest once in this setup and leaves it as it is now; Set up now in System State, or run aterm doctor --apply, to set it all now";
 
-const TRIES: u32 = 2;
-
 /// What an item held as it is says ahead of the hold's words when its probe found a change
 /// (`aterm_converge::left_as_is`): the words before it are what it reads now.
 const LEFT_AS_IS: &str = "; left as it is: ";
 
-const SECOND_TRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 const HELD_BUILDS: usize = 16;
 
@@ -1066,19 +1062,15 @@ fn held_back(failed: &[Failed], build: &str, now: u64) -> Vec<(String, Hold)> {
         .iter()
         .filter(|f| f.build == build)
         .filter_map(|failed| {
-            let why = if failed.tries >= TRIES {
-                HELD
-            } else if now < failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()) {
-                WAITING
-            } else {
+            if now >= failed.at.saturating_add(RETRY_AFTER.as_secs()) {
                 return None;
-            };
-            Some((failed.item.clone(), Hold::Back(why.into())))
+            }
+            Some((failed.item.clone(), Hold::Back(WAITING.into())))
         })
         .collect()
 }
 
-/// A second automatic Mac settings try is due in this run and build. Return
+/// An automatic Mac settings retry is due in this run and build. Return
 /// the latest due deadline so an older, still-blocked item cannot hide another
 /// item's deadline. Reading this never spends or restarts an attempt.
 fn mac_settings_retry_due(
@@ -1087,12 +1079,12 @@ fn mac_settings_retry_due(
     build: &str,
     now: u64,
 ) -> Result<Option<u64>, String> {
-    mac_settings_second_try(root, revision, build, |dues| {
+    mac_settings_retry_deadlines(root, revision, build, |dues| {
         dues.filter(|due| *due <= now).max()
     })
 }
 
-/// The earliest second automatic Mac settings try in this run and build that is not due yet
+/// The earliest automatic Mac settings retry in this run and build that is not due yet
 /// ([`mac_settings_retry_due`]'s deadlines still ahead of `now`): when a parked worker looks
 /// again by itself, with no timer before it.
 fn mac_settings_retry_ahead(
@@ -1101,13 +1093,13 @@ fn mac_settings_retry_ahead(
     build: &str,
     now: u64,
 ) -> Result<Option<u64>, String> {
-    mac_settings_second_try(root, revision, build, |dues| {
+    mac_settings_retry_deadlines(root, revision, build, |dues| {
         dues.filter(|due| *due > now).min()
     })
 }
 
-/// The deadline `pick` takes from each second automatic Mac settings try this run and build owes.
-fn mac_settings_second_try(
+/// The deadline `pick` takes from each automatic Mac settings retry this run and build owes.
+fn mac_settings_retry_deadlines(
     root: &Path,
     revision: u64,
     build: &str,
@@ -1120,10 +1112,10 @@ fn mac_settings_second_try(
                 .iter()
                 .filter(|failed| {
                     failed.build == build
-                        && failed.tries == 1
+                        && failed.tries > 0
                         && !record.settled.contains(&failed.item)
                 })
-                .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs())),
+                .map(|failed| failed.at.saturating_add(RETRY_AFTER.as_secs())),
         )
     });
     // A separate Full Disk Access follow-up can fail without an ordinary pass
@@ -1140,12 +1132,12 @@ fn mac_settings_second_try(
                 .iter()
                 .filter(|failed| {
                     failed.build == build
-                        && failed.tries == 1
+                        && failed.tries > 0
                         && record.items.contains(&failed.item)
                         && aterm_machines::init_preferences::setting_of(&failed.item)
                             .is_some_and(|setting| chosen.contains(setting))
                 })
-                .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs())),
+                .map(|failed| failed.at.saturating_add(RETRY_AFTER.as_secs())),
         ))
     })();
     if initial::revision_at(root)? != revision {
@@ -1279,7 +1271,6 @@ impl Automatic {
         {
             match holds.iter_mut().find(|(held, _)| *held == item) {
                 None => holds.push((item, hold)),
-                Some((_, held @ Hold::Back(_))) if hold == Hold::Back(HELD.into()) => *held = hold,
                 Some(_) => {}
             }
         }
@@ -5486,7 +5477,7 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_that_does_not_verify_stays_recorded_and_is_tried_twice_per_build() {
+    fn a_follow_up_that_does_not_verify_keeps_retrying_until_it_verifies() {
         let mut widgets = Selection::none();
         widgets.set(Setting::Widgets, true);
         let root = aterm_tempfile::tempdir().unwrap();
@@ -5525,15 +5516,16 @@ mod tests {
         );
         doctor.wait(std::time::Duration::from_secs(5 * 60));
         held(&mut doctor, root.path(), WAITING);
-        doctor.wait(SECOND_TRY_AFTER);
+        doctor.wait(RETRY_AFTER);
         tried(&mut doctor, root.path());
         assert_eq!(doctor.notification_center_writes(), 4);
         for _ in 0..3 {
-            doctor.wait(SECOND_TRY_AFTER);
-            held(&mut doctor, root.path(), HELD);
+            held(&mut doctor, root.path(), WAITING);
+            doctor.wait(RETRY_AFTER);
+            tried(&mut doctor, root.path());
         }
-        doctor.build = "1.0.1+gtest";
         doctor.host.failing.clear();
+        doctor.wait(RETRY_AFTER);
         let report = doctor
             .follow_up(root.path())
             .unwrap()
@@ -6201,8 +6193,8 @@ mod tests {
         assert!(!widgets.hidden.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             never.applies(),
-            2,
-            "the Dock's two tries, and setup still retries"
+            3,
+            "the pending Dock keeps retrying while the verified widget setting stays alone"
         );
         assert!(!first_run_complete(root.path()).unwrap());
         assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
@@ -6684,7 +6676,7 @@ mod tests {
         assert_eq!(applies(), (1, 1));
         tick(&mut host, 10, BUILD);
         assert_eq!(applies(), (2, 1), "the second try");
-        quiet(&mut host, 11..20, HELD);
+        quiet(&mut host, 11..20, WAITING);
         assert_eq!(applies(), (2, 1));
         tick(&mut host, 21, "1.0.1+gbbbb");
         assert_eq!(
@@ -7422,7 +7414,7 @@ mod tests {
     const BUILD: &str = "1.0.0+gaaaa";
 
     #[test]
-    fn mac_settings_deadlines_name_only_unspent_current_run_and_build_attempts() {
+    fn mac_settings_deadlines_include_repeated_failures_in_the_current_run_and_build() {
         let root = aterm_tempfile::tempdir().unwrap();
         initial::save_explicit_workstation_plan(root.path()).unwrap();
         let revision = initial::revision_at(root.path()).unwrap();
@@ -7450,7 +7442,7 @@ mod tests {
         };
         assert_eq!(due(revision, BUILD, 599), None);
         assert_eq!(due(revision, BUILD, 600), Some(600));
-        assert_eq!(due(revision, BUILD, 1_199), Some(600));
+        assert_eq!(due(revision, BUILD, 1_199), Some(602));
         assert_eq!(due(revision, BUILD, 1_200), Some(1_200));
         assert_eq!(
             due(revision, BUILD, 599),
@@ -7462,7 +7454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_standing_failure_is_tried_twice_and_then_never_again_by_the_automatic_worker() {
+    fn a_standing_failure_keeps_retrying_without_repeating_verified_settings() {
         let root = aterm_tempfile::tempdir().expect("scratch");
         let (dock, widgets) = (wanted()[0].0.clone(), wanted()[1].0.clone());
         let mut host = Fake {
@@ -7510,12 +7502,16 @@ mod tests {
         automatic_pass(&mut host, root.path(), BUILD, at(10)).expect("second try");
         assert_eq!(host.restarts, ["Dock", "Dock"]);
         assert_eq!(sign_outs(&host), 2);
-        quiet(&mut host, 11..40, HELD);
+        quiet(&mut host, 11..20, WAITING);
+        automatic_pass(&mut host, root.path(), BUILD, at(20)).expect("third try");
+        quiet(&mut host, 21..30, WAITING);
+        automatic_pass(&mut host, root.path(), BUILD, at(30)).expect("fourth try");
+        quiet(&mut host, 31..40, WAITING);
         assert!(host.values.contains_key(&widgets));
         assert!(!first_run_complete(root.path()).unwrap());
         automatic_pass(&mut host, root.path(), "1.0.1+gbbbb", at(41)).expect("new build");
-        assert_eq!(host.restarts.len(), 3);
-        assert_eq!(sign_outs(&host), 3);
+        assert_eq!(host.restarts.len(), 5);
+        assert_eq!(sign_outs(&host), 5);
         let record = Automatic::load(root.path(), 0).unwrap();
         assert_eq!(record.settled, [widgets.describe()], "{record:?}");
         assert_eq!(
@@ -7529,7 +7525,7 @@ mod tests {
         );
         host.held.clear();
         execute(&mut host, root.path(), Action::Apply).expect("explicit apply");
-        assert_eq!(host.restarts.len(), 4);
+        assert_eq!(host.restarts.len(), 6);
     }
 
     #[test]
@@ -7548,7 +7544,11 @@ mod tests {
         turns(&mut host, 0..8);
         assert_eq!(host.restarts, ["Dock", "Dock"], "one try each");
         turns(&mut host, 20..40);
-        assert_eq!(host.restarts.len(), 4, "a second try each, and no more");
+        assert_eq!(
+            host.restarts.len(),
+            6,
+            "each build retries after its own delay"
+        );
     }
 
     #[test]
@@ -7583,7 +7583,7 @@ mod tests {
         assert!(!builds.contains(&build(1).as_str()), "{builds:?}");
         assert_eq!(
             record.holds(&build(0), now, &Withheld::default()),
-            [("dock".to_owned(), Hold::Back(HELD.into()))],
+            [("dock".to_owned(), Hold::Back(WAITING.into()))],
             "{builds:?}"
         );
         assert!(
@@ -7628,13 +7628,13 @@ mod tests {
             at,
         };
         let back = |item: &str, why: &str| (item.to_owned(), Hold::Back(why.into()));
-        let now = SECOND_TRY_AFTER.as_secs() * 2;
+        let now = RETRY_AFTER.as_secs() * 2;
         let recent = now - 60;
         let record = Automatic {
             settled: vec!["settled".to_owned()],
             failed: vec![
                 tried("waits here, spent there", 1, recent),
-                tried("spent here, waits there", TRIES, 0),
+                tried("spent here, waits there", 2, 0),
                 tried("due here, waits there", 1, 0),
                 tried("due here, owed nothing", 1, 0),
             ],
@@ -7651,11 +7651,11 @@ mod tests {
             .map(str::to_owned)
             .to_vec(),
             failed: vec![
-                tried("waits here, spent there", TRIES, 0),
+                tried("waits here, spent there", 2, 0),
                 tried("spent here, waits there", 1, recent),
                 tried("due here, waits there", 1, recent),
                 tried("waits there", 1, recent),
-                tried("settled", TRIES, recent),
+                tried("settled", 2, recent),
                 tried("no longer named", 1, recent),
             ],
         };
@@ -7663,8 +7663,8 @@ mod tests {
             record.holds(BUILD, now, &owed),
             [
                 ("settled".to_owned(), Hold::AsIs(SETTLED_OWED.into())),
-                back("waits here, spent there", HELD),
-                back("spent here, waits there", HELD),
+                back("waits here, spent there", WAITING),
+                back("spent here, waits there", WAITING),
                 back("due here, waits there", WAITING),
                 back("waits there", WAITING),
             ]
@@ -7674,7 +7674,6 @@ mod tests {
             [
                 ("settled".to_owned(), Hold::AsIs(SETTLED.into())),
                 back("waits here, spent there", WAITING),
-                back("spent here, waits there", HELD),
             ]
         );
     }

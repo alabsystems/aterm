@@ -5,7 +5,7 @@
 
 use crate::items::{Ctx, Item};
 use crate::model::Probe;
-use crate::port::{Cmd, System};
+use crate::port::System;
 use std::path::PathBuf;
 
 /// The item's id, as `aterm init --only` and every remedy that names it spell it.
@@ -29,36 +29,16 @@ pub enum Found {
 /// The probe [`CommandLineTools`] reads.
 pub type ProbeClt = Box<dyn Fn(&dyn System) -> Found + Send + Sync>;
 
-/// `base.clt`: installs Apple's Command Line Tools by the root path that exists.
+/// `base.clt`: installs Apple's Command Line Tools through the background update service.
 pub struct CommandLineTools {
     found: ProbeClt,
-    /// The `aterm` that `sudo` runs (this executable).
-    aterm: PathBuf,
 }
 
 impl CommandLineTools {
     /// The item over `found`.
     #[must_use]
-    pub fn new(found: ProbeClt, aterm: PathBuf) -> Self {
-        Self { found, aterm }
-    }
-
-    /// The one-table baseline the root half applies.
-    #[must_use]
-    pub fn baseline() -> String {
-        format!(
-            "schema = {}\n\n[developer]\ncommand_line_tools = true\n",
-            crate::SCHEMA
-        )
-    }
-
-    /// The argv the apply runs on the person's terminal for the baseline at `baseline`.
-    #[must_use]
-    pub fn command(&self, baseline: &std::path::Path) -> Cmd {
-        Cmd::new("/usr/bin/sudo")
-            .arg(self.aterm.as_os_str())
-            .args(["machines", "here", "apply"])
-            .arg(baseline.as_os_str())
+    pub fn new(found: ProbeClt, _aterm: PathBuf) -> Self {
+        Self { found }
     }
 }
 
@@ -67,7 +47,7 @@ impl CommandLineTools {
 pub fn place() -> crate::engine::Place {
     crate::engine::Place {
         layer: aterm_converge::Layer::Base,
-        class: aterm_converge::Class::Elevate,
+        class: aterm_converge::Class::Install,
         requires: aterm_converge::Requires::Account,
         remedy: aterm_converge::Remedy::Init {
             only: ID.to_owned(),
@@ -80,11 +60,6 @@ pub fn place() -> crate::engine::Place {
 pub fn selected(word: &str) -> bool {
     aterm_converge::selects(word, ID, "developer", Some(aterm_converge::Layer::Base))
 }
-
-/// Why the item cannot install from here.
-pub const NO_TTY: &str = "installing the Command Line Tools asks for your password, and this \
-                          run has no terminal to ask it in: run `aterm init --only base.clt` \
-                          in a terminal";
 
 impl Item for CommandLineTools {
     fn id(&self) -> String {
@@ -102,11 +77,7 @@ impl Item for CommandLineTools {
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
         match (self.found)(sys) {
             Found::Present(now) => Probe::Ok { now },
-            Found::Missing(from) if !sys.has_tty() => Probe::Blocked {
-                why: format!("{from}; {NO_TTY}"),
-            },
-            // Asked before the password: the download waits for a network without Low Data
-            // Mode.
+            // The download waits for a network without Low Data Mode.
             Found::Missing(from) if let Some(why) = crate::items::developer::low_data(sys) => {
                 Probe::Blocked {
                     why: format!("{from}; {why}"),
@@ -114,13 +85,7 @@ impl Item for CommandLineTools {
             }
             Found::Missing(from) => Probe::Change {
                 from,
-                to: format!(
-                    "installed as root by `{} machines here apply <baseline>` (one password \
-                     prompt)",
-                    Cmd::new("/usr/bin/sudo")
-                        .arg(self.aterm.as_os_str())
-                        .display()
-                ),
+                to: "Command Line Tools installed automatically and verified".into(),
             },
             Found::Refuses(why) => Probe::Blocked { why },
             Found::Unknown(why) => Probe::Unusable { why },
@@ -129,25 +94,7 @@ impl Item for CommandLineTools {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        if !sys.has_tty() {
-            return Err(NO_TTY.to_owned());
-        }
-        let scratch = sys
-            .scratch_dir(None, "base-clt")
-            .map_err(|e| format!("no private scratch for the baseline: {e}"))?;
-        let baseline = scratch.path().join("command-line-tools.toml");
-        sys.write_file(&baseline, Self::baseline().as_bytes(), 0o600)
-            .map_err(|e| format!("{}: {e}", baseline.display()))?;
-        let command = self.command(&baseline);
-        match sys.run_tty(&command) {
-            Ok(Some(0)) => Ok(()),
-            Ok(status) => Err(format!(
-                "`{}` exited {}",
-                command.display(),
-                status.map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
-            )),
-            Err(e) => Err(format!("`{}`: {e}", command.display())),
-        }
+        crate::items::developer::install_automatically(sys)
     }
 }
 
@@ -186,66 +133,67 @@ mod tests {
         rows.remove(0)
     }
 
+    const LIST: &str = "/usr/sbin/softwareupdate -l";
+    const INSTALL: &str = "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 26.6-26.6'";
+    const CATALOG: &str = "* Label: Command Line Tools for Xcode 26.6-26.6\n\tTitle: Command Line Tools for Xcode, Version: 26.6\n";
+
     #[test]
-    fn missing_tools_plan_the_machines_here_argv_and_apply_runs_it_on_the_terminal() {
-        let mut sys = Fake::default();
-        sys.tty = true;
+    fn missing_tools_install_and_verify_without_a_terminal_or_sudo() {
+        let sys = Fake::default();
         let item = item(Found::Missing("no developer directory".into()));
-
         let row = run(&sys, &item, Mode::Plan);
-        assert_eq!(row.outcome, Outcome::Planned, "{row:?}");
-        assert_eq!(
-            row.to.as_deref(),
-            Some(
-                "installed as root by `/usr/bin/sudo /Applications/aterm.app/Contents/MacOS/\
-                 aterm machines here apply <baseline>` (one password prompt)"
-            ),
-            "{row:?}"
-        );
-        assert_eq!(row.layer, Some(Layer::Base));
-        assert_eq!(row.class, Some(Class::Elevate));
+        assert_eq!(row.outcome, Outcome::Planned);
+        assert_eq!(row.class, Some(Class::Install));
         assert!(
-            !sys.calls().iter().any(|call| call.starts_with("tty ")),
-            "a plan runs nothing: {:?}",
             sys.calls()
+                .iter()
+                .all(|call| !call.contains("softwareupdate"))
         );
-
-        let scratch = Fake::scratch_path(None, "base-clt", 0);
-        let baseline = scratch.join("command-line-tools.toml");
-        let argv = format!(
-            "tty /usr/bin/sudo {ATERM} machines here apply {}",
-            baseline.display()
-        );
-        sys.on(&argv, Ran::ok(""))
-            .on_write(&argv, std::path::Path::new(CC), b"");
+        sys.on(LIST, Ran::ok(CATALOG));
+        sys.on(INSTALL, Ran::ok("Done."))
+            .on_write(INSTALL, std::path::Path::new(CC), b"")
+            .on_write(
+                INSTALL,
+                std::path::Path::new(crate::items::developer::CLT_GIT),
+                b"",
+            );
         let row = run(&sys, &item, Mode::Apply);
         assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
-        let calls = sys.calls();
-        let wrote = calls
-            .iter()
-            .position(|call| call == &format!("write {} 600", baseline.display()))
-            .unwrap_or_else(|| panic!("the baseline is written: {calls:?}"));
-        let ran = calls
-            .iter()
-            .position(|call| call == &argv)
-            .unwrap_or_else(|| panic!("the argv runs on the terminal: {calls:?}"));
-        assert!(wrote < ran, "{calls:?}");
-        assert_eq!(
-            calls.iter().filter(|call| call.contains("sudo")).count(),
-            1,
-            "one password prompt: {calls:?}"
-        );
+        assert_eq!(row.layer, Some(Layer::Base));
+        assert!(sys.calls().iter().any(|call| call == INSTALL));
+        assert!(sys.calls().iter().all(|call| !call.contains("sudo")
+            && !call.starts_with("tty ")
+            && !call.contains("xcode-select --install")));
+    }
+
+    #[test]
+    fn an_empty_catalog_never_launches_apples_installer() {
+        let sys = Fake::default();
+        sys.on(LIST, Ran::ok("No new software available."));
+        let row = run(&sys, &item(Found::Missing("missing".into())), Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Failed);
         assert!(
-            calls
+            sys.calls()
                 .iter()
-                .any(|call| call == &format!("scratch closed {}", scratch.display())),
-            "the scratch goes with the run: {calls:?}"
+                .all(|call| !call.contains("xcode-select") && !call.contains("sudo"))
         );
-        let parsed = crate::baseline::parse(&CommandLineTools::baseline()).unwrap();
-        assert_eq!(
-            parsed.developer.and_then(|table| table.command_line_tools),
-            Some(true)
+    }
+
+    #[test]
+    fn installer_success_without_a_working_compiler_is_not_complete() {
+        let sys = Fake::default();
+        sys.on(LIST, Ran::ok(CATALOG));
+        sys.on(INSTALL, Ran::ok("Done.")).on_write(
+            INSTALL,
+            std::path::Path::new(crate::items::developer::CLT_GIT),
+            b"",
         );
+        let row = run(
+            &sys,
+            &item(Found::Missing("compiler missing".into())),
+            Mode::Apply,
+        );
+        assert_eq!(row.outcome, Outcome::Failed);
     }
 
     /// In Low Data Mode the item asks no password and runs nothing: the download waits, and
@@ -272,23 +220,6 @@ mod tests {
         );
         sys.low_data = Some(false);
         assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
-    }
-
-    #[test]
-    fn without_a_terminal_the_item_is_blocked_on_init_only_base_clt() {
-        let sys = Fake::default();
-        let item = item(Found::Missing("no developer directory".into()));
-        for mode in [Mode::Plan, Mode::Apply] {
-            let row = run(&sys, &item, mode);
-            assert_eq!(row.outcome, Outcome::Blocked, "{mode:?}: {row:?}");
-            assert!(
-                row.why
-                    .as_deref()
-                    .is_some_and(|why| why.contains("`aterm init --only base.clt`")),
-                "{row:?}"
-            );
-        }
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     }
 
     #[test]

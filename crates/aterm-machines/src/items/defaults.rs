@@ -1481,8 +1481,8 @@ pub(crate) mod tests {
     #[test]
     fn a_system_plist_below_a_directory_others_control_is_neither_read_nor_written() {
         for (dir_path, stat, needle) in [
-            ("/Users//Shared", dir(0, 0, 0o1777), "writable by everyone"),
-            ("/Users//alice", dir(501, 20, 0o755), "owned by uid 501"),
+            ("/Users/Shared", dir(0, 0, 0o1777), "writable by everyone"),
+            ("/Users/alice", dir(501, 20, 0o755), "owned by uid 501"),
             ("/opt/x", dir(0, 20, 0o775), "writable by group 20"),
             (
                 "/var",
@@ -1950,7 +1950,7 @@ scope = "user"
             probe,
             Probe::Change {
                 from: "absent".into(),
-                to: "{n = [1, 2.5], path = \"/Users//bob/x\"}".into(),
+                to: "{n = [1, 2.5], path = \"/Users/bob/x\"}".into(),
             }
         );
         assert_eq!(
@@ -1972,7 +1972,7 @@ scope = "user"
                 "not a process name",
             ),
             (
-                "[[defaults]]\ndomain = \"/Users//x\"\nkey = \"k\"\nvalue = 1\nscope = \"host\"\n",
+                "[[defaults]]\ndomain = \"/Users/x\"\nkey = \"k\"\nvalue = 1\nscope = \"host\"\n",
                 "a name, not a path",
             ),
             (
@@ -2075,8 +2075,8 @@ scope = "user"
         }
         assert!(contained("com.apple.notificationcenterui"));
         for path in [
-            "/Users//alice/Library/Group Containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
-            "/Users//alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
+            "/Users/alice/Library/Group Containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
+            "/Users/alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
         ] {
             assert!(contained(path), "{path}");
             assert!(withheld(path, None).is_some(), "{path}");
@@ -2085,9 +2085,9 @@ scope = "user"
 
     #[test]
     fn a_raw_row_on_another_apps_container_is_read_and_written_only_with_the_grant() {
-        const NC_PATH: &str = "/Users//alice/Library/Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui";
-        const OTHER_PATH: &str = "/Users//alice/library/containers/com.example.Sandboxed/Data/Library/Preferences/com.example.Sandboxed";
-        const GROUP_PATH: &str = "/Users//alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example";
+        const NC_PATH: &str = "/Users/alice/Library/Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui";
+        const OTHER_PATH: &str = "/Users/alice/library/containers/com.example.Sandboxed/Data/Library/Preferences/com.example.Sandboxed";
+        const GROUP_PATH: &str = "/Users/alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example";
         let rows = row(r#"
 [[defaults]]
 domain = "com.apple.notificationcenterui"
@@ -2149,7 +2149,7 @@ scope = "user"
         ];
         let open = [
             "com.apple.dock",
-            "/Users//alice/Library/Preferences/com.apple.dock",
+            "/Users/alice/Library/Preferences/com.apple.dock",
         ];
         for full_disk_access in [None, Some(false), Some(true)] {
             let mut context = ctx(std::slice::from_ref(&alice));

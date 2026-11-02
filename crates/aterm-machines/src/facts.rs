@@ -874,7 +874,7 @@ mod tests {
             name: "owner".into(),
             uid: 501,
             gid: 20,
-            home: "/Users//owner".into(),
+            home: "/Users/owner".into(),
             shell: "/bin/zsh".into(),
             admin: true,
         });
@@ -884,7 +884,7 @@ mod tests {
                  Pages active: 100.\nAnonymous pages: 0.\nPages purgeable: 0.\n\
                  Pages wired down: 0.\nPages occupied by compressor: 0.\n",
             ))
-            .on("/bin/df -k /Users//owner", Ran::ok(
+            .on("/bin/df -k /Users/owner", Ran::ok(
                 "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 600 200 75% /\n",
             ))
             .on("/bin/df -k /", Ran::ok(
@@ -914,7 +914,7 @@ mod tests {
         assert!(
             sys.calls()
                 .iter()
-                .any(|call| call == "/bin/df -k /Users//owner")
+                .any(|call| call == "/bin/df -k /Users/owner")
         );
         assert!(!sys.calls().iter().any(|call| call == "/bin/df -k /"));
         assert_eq!(v.gpu_name.as_deref(), Some("Apple M5 Max"));
@@ -1010,7 +1010,7 @@ nobody                   -2
 root                     0
 ";
 
-    const VM_DSCL_ADMIN: &str = "NFSHomeDirectory: /Users//admin
+    const VM_DSCL_ADMIN: &str = "NFSHomeDirectory: /Users/admin
 PrimaryGroupID: 20
 UniqueID: 501
 UserShell: /bin/zsh
@@ -1083,7 +1083,7 @@ UserShell: /bin/zsh
             Ran::ok(VM_ADMIN_GROUP),
         )
         .on(
-            "/usr/bin/dscl . -read /Users//admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users/admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::ok(VM_DSCL_ADMIN),
         )
         .on(&hidutil_keyboards().display(), Ran::ok(VM_HIDUTIL))
@@ -1135,7 +1135,7 @@ UserShell: /bin/zsh
                 name: "admin".into(),
                 uid: 501,
                 gid: 20,
-                home: "/Users//admin".into(),
+                home: "/Users/admin".into(),
                 shell: "/bin/zsh".into(),
                 admin: true,
             }]
@@ -1329,7 +1329,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         assert_eq!(attrs, vec![("RealName".into(), "Managed via Tart".into())]);
         let attrs = parse_dscl_read(VM_DSCL_ADMIN);
         assert_eq!(attrs.len(), 4);
-        assert_eq!(attrs[0], ("NFSHomeDirectory".into(), "/Users//admin".into()));
+        assert_eq!(attrs[0], ("NFSHomeDirectory".into(), "/Users/admin".into()));
     }
 
     #[test]
@@ -1348,7 +1348,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
             Ran::ok(VM_ADMIN_GROUP),
         )
         .on(
-            "/usr/bin/dscl . -read /Users//nosuchuser UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users/nosuchuser UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::exit(56, "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)"),
         );
         assert_eq!(
@@ -1363,7 +1363,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
     fn one_account_resolves_with_its_admin_bit() {
         let u = user(&vm(), "admin").unwrap();
         assert_eq!((u.uid, u.gid, u.admin), (501, 20, true));
-        assert_eq!(u.home, "/Users//admin");
+        assert_eq!(u.home, "/Users/admin");
     }
 
     #[test]

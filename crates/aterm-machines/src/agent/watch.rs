@@ -533,7 +533,7 @@ mod tests {
             name: "admin".into(),
             uid: 501,
             gid: 20,
-            home: "/Users//admin".into(),
+            home: "/Users/admin".into(),
             shell: "/bin/zsh".into(),
             admin: true,
         }
@@ -548,9 +548,9 @@ mod tests {
             Ran::ok("GroupMembership: root _mbsetupuser admin\n"),
         );
         fake.on(
-            "/usr/bin/dscl . -read /Users//admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users/admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::ok(
-                "NFSHomeDirectory: /Users//admin\nPrimaryGroupID: 20\nUniqueID: 501\nUserShell: /bin/zsh\n",
+                "NFSHomeDirectory: /Users/admin\nPrimaryGroupID: 20\nUniqueID: 501\nUserShell: /bin/zsh\n",
             ),
         );
         fake.stat_of(
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(code, ExitCode::FAILURE);
         let fake = host();
         fake.on(
-            "/usr/bin/dscl . -read /Users//bob UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users/bob UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::exit(56, "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n"),
         );
         let (code, out) = arm_as(&fake, "502", "bob", &starts(&fake));

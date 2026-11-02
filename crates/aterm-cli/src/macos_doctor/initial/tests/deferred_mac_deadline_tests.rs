@@ -85,8 +85,19 @@ fn first_deferred_failure_after_dock_is_spent()
     (root, plan, revision, stages, first)
 }
 
+fn ordinary_due(root: &Path) -> Option<u64> {
+    let revision = revision_at(root).unwrap();
+    Automatic::load(root, revision)
+        .unwrap()
+        .failed
+        .iter()
+        .map(|failure| failure.at + RETRY_AFTER.as_secs())
+        .max()
+}
+
 fn assert_ineligible_debt_does_not_wake(root: &Path, plan: &Plan, due: u64) {
     let pending = progress(root).unwrap().unwrap();
+    let ordinary = ordinary_due(root);
     for retired in [
         Progress {
             completed: true,
@@ -126,8 +137,8 @@ fn assert_ineligible_debt_does_not_wake(root: &Path, plan: &Plan, due: u64) {
     save_progress(root, matched).unwrap();
     assert_eq!(
         park(root, due).mac_settings_retry_due(),
-        None,
-        "Widgets is not selected"
+        ordinary,
+        "Widgets is not selected; the ordinary retry remains due"
     );
     save_plan(root, plan).unwrap();
     save_progress(root, pending).unwrap();
@@ -138,16 +149,16 @@ fn assert_ineligible_debt_does_not_wake(root: &Path, plan: &Plan, due: u64) {
     save_withheld(root, &unrelated).unwrap();
     assert_eq!(
         park(root, due).mac_settings_retry_due(),
-        None,
-        "the failed item is not owed"
+        ordinary,
+        "the failed item is not owed; the ordinary retry remains due"
     );
     let mut other_build = record.clone();
     other_build.failed[0].build = "another-build".into();
     save_withheld(root, &other_build).unwrap();
     assert_eq!(
         park(root, due).mac_settings_retry_due(),
-        None,
-        "another build"
+        ordinary,
+        "another build; the ordinary retry remains due"
     );
     save_withheld(root, &record).unwrap();
 }
@@ -155,10 +166,10 @@ fn assert_ineligible_debt_does_not_wake(root: &Path, plan: &Plan, due: u64) {
 #[test]
 fn deferred_mac_deadline_wakes_a_workstation_whose_other_attempts_are_spent() {
     let (root, plan, revision, mut stages, first) = first_deferred_failure_after_dock_is_spent();
-    let due = first + SECOND_TRY_AFTER.as_secs();
+    let due = first + RETRY_AFTER.as_secs();
     let before = park(root.path(), due - 1);
     let ready = park(root.path(), due);
-    assert_eq!(before.mac_settings_retry_due(), None);
+    assert_eq!(before.mac_settings_retry_due(), ordinary_due(root.path()));
     assert_eq!(before, park(root.path(), due - 2), "no early wake");
     assert!(
         !ready.facts_changed_since(&before),
@@ -168,15 +179,18 @@ fn deferred_mac_deadline_wakes_a_workstation_whose_other_attempts_are_spent() {
 
     // The same recorded follow-up really is eligible after ten minutes. These
     // actual effects run before the final missing-wake assertion on old source.
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    stages.doctor.wait(RETRY_AFTER);
     failed_follow_up(&mut stages, root.path(), 4);
-    assert_eq!(park(root.path(), due + 60).mac_settings_retry_due(), None);
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    assert_eq!(
+        park(root.path(), due + 60).mac_settings_retry_due(),
+        ordinary_due(root.path())
+    );
+    stages.doctor.wait(RETRY_AFTER);
     stages.doctor.follow_up(root.path()).unwrap().unwrap();
     assert_eq!(
         stages.doctor.notification_center_writes(),
-        4,
-        "no third try"
+        6,
+        "the third retry remains automatic"
     );
     assert_eq!(revision_at(root.path()).unwrap(), revision);
     assert_eq!(
@@ -221,18 +235,18 @@ fn deferred_mac_deadline_uses_follow_up_scope_after_a_real_input_only_choice() {
     stages.doctor.grant();
     stages.doctor.notification_center_never_keeps();
     failed_follow_up(&mut stages, root.path(), 2);
-    let due = load_withheld(root.path()).unwrap().failed[0].at + SECOND_TRY_AFTER.as_secs();
+    let due = load_withheld(root.path()).unwrap().failed[0].at + RETRY_AFTER.as_secs();
     let ready = park(root.path(), due);
 
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    stages.doctor.wait(RETRY_AFTER);
     failed_follow_up(&mut stages, root.path(), 4);
     assert_eq!(park(root.path(), due).mac_settings_retry_due(), None);
-    stages.doctor.wait(SECOND_TRY_AFTER);
+    stages.doctor.wait(RETRY_AFTER);
     stages.doctor.follow_up(root.path()).unwrap().unwrap();
     assert_eq!(
         stages.doctor.notification_center_writes(),
-        4,
-        "no third try"
+        6,
+        "the third retry remains automatic"
     );
     assert_eq!(progress(root.path()).unwrap().unwrap(), pending);
     assert_eq!(
@@ -259,7 +273,7 @@ fn unreadable_record<T>(root: &Path, name: &str, read: impl FnOnce() -> T) -> T 
 #[test]
 fn deferred_mac_deadline_known_debt_survives_an_unreadable_automatic_cache() {
     let (root, _, revision, stages, first) = first_deferred_failure_after_dock_is_spent();
-    let due = first + SECOND_TRY_AFTER.as_secs();
+    let due = first + RETRY_AFTER.as_secs();
     let pending = progress(root.path()).unwrap().unwrap();
     assert_eq!(park(root.path(), due).mac_settings_retry_due(), Some(due));
 
@@ -276,8 +290,8 @@ fn deferred_mac_deadline_known_debt_survives_an_unreadable_automatic_cache() {
     unreadable_record(root.path(), WITHHELD_RECORD, || {
         assert_eq!(
             park(root.path(), due).mac_settings_retry_due(),
-            None,
-            "the known ordinary record is spent; an unknown deferred record proves no due try"
+            ordinary_due(root.path()),
+            "the known ordinary retry remains due despite the unreadable deferred record"
         );
     });
     assert_eq!(park(root.path(), due).mac_settings_retry_due(), Some(due));
@@ -302,7 +316,7 @@ fn deferred_mac_deadline_known_ordinary_try_survives_an_unreadable_debt_record()
     assert_eq!(automatic.failed[0].tries, 1);
     assert!(load_withheld(root.path()).unwrap().failed.is_empty());
     let pending = progress(root.path()).unwrap().unwrap();
-    let due = automatic.failed[0].at + SECOND_TRY_AFTER.as_secs();
+    let due = automatic.failed[0].at + RETRY_AFTER.as_secs();
     assert_eq!(park(root.path(), due - 1).mac_settings_retry_due(), None);
 
     unreadable_record(root.path(), WITHHELD_RECORD, || {

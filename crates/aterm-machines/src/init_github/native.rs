@@ -44,8 +44,8 @@ pub(super) fn run_captured(
 
 /// `aterm init`'s repository item for `user` with no `[github]` token source in init.toml: the
 /// same stage the first launch runs, after the secrets item `after` names when one does (the
-/// vault writes the token it reads). With no `[github]` table at all (`unasked`), a Mac with no
-/// token is no stage of this run.
+/// vault writes the token it reads). With no `[github]` table at all (`unasked`), a missing
+/// token leaves the default stage pending until the vault supplies its input.
 pub(super) fn item(user: &User, after: Option<String>, unasked: bool) -> Box<dyn Item> {
     Box::new(NativeRepositories {
         after,
@@ -98,8 +98,8 @@ struct NativeRepositories {
     captured: Option<Captured>,
     /// The secrets item it waits for in `aterm init` ([`item`]).
     after: Option<String>,
-    /// `aterm init`'s default, which nobody configured: no token on this Mac is no stage here,
-    /// not a person's step.
+    /// `aterm init`'s default, which waits for the vault's token without asking for a separate
+    /// GitHub setup step.
     unasked: bool,
     /// What the last probe or apply read, for the step after it: the apply reuses the probe's
     /// inventory and verdicts, and the read-back reads again only what the apply cloned.
@@ -480,11 +480,11 @@ struct Block {
 impl Block {
     /// The probe's answer for this block (System State design §3.6): a person's step where only
     /// their act ends the wait ([`Wait::kind`]), so its row needs them and no pass retries it,
-    /// else a wait that ends by itself. For `aterm init`'s default (`unasked`), a machine the
-    /// vault wrote no token to has no stage to run, which asks nobody anything; `mac` names it.
+    /// else a wait that ends by itself. For `aterm init`'s default (`unasked`), a missing token
+    /// is an unfinished prerequisite, not an inapplicable stage; `mac` names the host.
     fn probe(self, unasked: bool, mac: bool) -> Probe {
         match self.wait {
-            Some(Wait::Token) if unasked => Probe::NotApplicable {
+            Some(Wait::Token) if unasked => Probe::Blocked {
                 why: format!(
                     "no GitHub token on this {} yet: the ALab vault's sync writes ~/{} \
                      (init.toml [github] token_file names another)",
@@ -863,8 +863,8 @@ pub(super) mod tests {
         );
         let rows = run_captured(&sys, &ctx, Mode::Plan, captured, Box::new(|| Ok(true))).unwrap();
         assert_eq!(Reading::of(&rows[0]), Some(Reading::Waits(Wait::Token)));
-        // The vault this Mac reads holds no GitHub token: only a person puts one there.
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Person);
+        // Wait for the vault subscriber to supply the GitHub token.
+        assert_eq!(rows[0].outcome, crate::model::Outcome::Blocked);
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
@@ -1924,14 +1924,14 @@ pub(super) mod tests {
     }
 
     /// `aterm init`'s default stage on a Mac the vault wrote no GitHub token to asks nobody
-    /// anything: its row is not applicable, and neither git nor GitHub is asked. A `[github]`
+    /// anything: its row stays blocked, and neither git nor GitHub is asked. A `[github]`
     /// table that scopes the stage makes the same Mac the person's step (the control).
     #[test]
-    fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
+    fn init_s_default_stage_without_a_token_stays_pending_and_asks_nothing() {
         let (sys, bare) = bare();
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
         match item(&bare.user, None, true).probe(&sys, &context) {
-            Probe::NotApplicable { why } => {
+            Probe::Blocked { why } => {
                 assert!(why.contains("~/.secrets/gh_access_token"), "{why}");
                 assert!(why.contains("on this Mac yet"), "{why}");
             }
@@ -1947,13 +1947,13 @@ pub(super) mod tests {
         );
         assert!(matches!(
             item(&bare.user, None, false).probe(&sys, &context),
-            Probe::Person { .. }
+            Probe::Blocked { .. }
         ));
         // On Linux the row names the machine, not a Mac.
         let (mut linux, _) = self::bare();
         linux.linux = true;
         match item(&bare.user, None, true).probe(&linux, &context) {
-            Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
+            Probe::Blocked { why } => assert!(why.contains("on this machine yet"), "{why}"),
             other => panic!("{other:?}"),
         }
     }

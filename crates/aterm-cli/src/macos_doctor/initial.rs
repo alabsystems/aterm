@@ -5081,11 +5081,16 @@ mod parked_secrets_route_tests {
         assert_eq!(doctor.relaunches(), 2);
         let spent = read(600);
         assert_eq!(spent.mac_settings_retry_due(), None);
-        assert_eq!(spent, read(1_200), "no third attempt is armed");
+        assert_ne!(
+            spent,
+            read(1_200),
+            "the next automatic retry wakes the worker"
+        );
+        assert_eq!(read(1_200).mac_settings_retry_due(), Some(started + 1_200));
         doctor
             .pass_at(root.path(), plan.selection, started + 1_200)
             .unwrap();
-        assert_eq!(doctor.relaunches(), 2, "the per-build cap stays spent");
+        assert_eq!(doctor.relaunches(), 3, "retries continue until verified");
     }
 
     /// A park waits on what a person does in System Settings or macOS only while an admitted
@@ -5712,6 +5717,23 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         self.developer_tools_wanted = false;
         self.repositories_failure = None;
         self.token_wanted = false;
+        if let Err(why) = repositories::prepare_tools(&sys, || {
+            let verdict = atpkg::prereq::probe(std::env::var_os("PATH").as_deref());
+            if matches!(verdict, atpkg::prereq::CcVerdict::Ready { .. }) {
+                Ok(())
+            } else {
+                Err(verdict.line())
+            }
+        }) {
+            // This worker owns installation and retries it. Do not ask the window
+            // to spawn the legacy interactive installer tab.
+            return Ok(vec![Row {
+                name: Stage::Repositories.name().into(),
+                status: "blocked".into(),
+                detail: format!("Waiting for developer tools: {why}"),
+                elapsed_ms: None,
+            }]);
+        }
         let ran = repositories::run_reading(
             &sys,
             &self.context()?,
@@ -9775,7 +9797,7 @@ mod tests {
                 false,
                 true,
                 never,
-                SetupNext::Park,
+                SetupNext::Retry,
                 true,
                 3,
             ),
@@ -9795,7 +9817,7 @@ mod tests {
                 true,
                 false,
                 never,
-                SetupNext::Park,
+                SetupNext::Retry,
                 false,
                 1,
             ),
@@ -10182,8 +10204,8 @@ mod tests {
             assert_eq!(stages.doctor.notification_center_writes(), 0);
             assert_eq!(
                 stages.doctor.dock_relaunches(),
-                docks + 2,
-                "the Dock's second try: its relaunch and its rollback's"
+                docks + 6,
+                "each automatic Dock retry relaunches and rolls back"
             );
             let docks = stages.doctor.dock_relaunches();
             if granted {
@@ -10204,7 +10226,7 @@ mod tests {
             );
             assert_eq!(stages.doctor.window_manager_writes(), 1);
             assert!(stages.doctor.desktop_widgets_shown());
-            assert_eq!(stages.doctor.dock_relaunches(), docks);
+            assert_eq!(stages.doctor.dock_relaunches(), docks + 6);
             assert_eq!(
                 super::super::tests::Withholding::withheld(root.path()).is_empty(),
                 granted
@@ -10858,9 +10880,9 @@ mod tests {
             }
         }
         assert!(!finished_at(root.path()).unwrap(), "the stage is held");
-        assert_eq!(tries.len(), 2, "{tries:?}");
+        assert_eq!(tries.len(), 4, "{tries:?}");
         let apart = tries[1].duration_since(tries[0]).unwrap();
-        assert!(apart >= SECOND_TRY_AFTER, "{apart:?}");
+        assert!(apart >= RETRY_AFTER, "{apart:?}");
     }
 
     #[test]
@@ -10889,7 +10911,10 @@ mod tests {
         stages.doctor.notification_center_never_keeps();
         for run in 0..2 {
             let tried: usize = (0..40).map(|_| retry(&mut stages, revision)).sum();
-            assert_eq!(tried, 4, "run {run}: two tries, each with its rollback");
+            assert_eq!(
+                tried, 8,
+                "run {run}: retries continue, each with its rollback"
+            );
             assert_eq!(
                 Withholding::withheld(root.path()),
                 [super::super::tests::WIDGETS],
@@ -10960,7 +10985,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workstation_stage_that_never_verifies_disrupts_twice_across_worker_retries() {
+    fn a_workstation_stage_keeps_retrying_until_it_verifies() {
         struct Stages {
             doctor: super::super::tests::NeverVerifies,
             rest: Fake,
@@ -11073,8 +11098,18 @@ mod tests {
         let twice = (stages.doctor.changes(), stages.doctor.relaunches());
         assert_eq!(twice.1, 2);
         assert!(twice.0 > once.0);
-        retries(&mut stages, 20, HELD);
-        assert_eq!((stages.doctor.changes(), stages.doctor.relaunches()), twice);
+        for _ in 0..20 {
+            execute_initial_for_revision(
+                &mut stages,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap();
+        }
+        assert_eq!(stages.doctor.relaunches(), 4);
+        assert!(stages.doctor.changes() > twice.0);
         assert_eq!(
             stages
                 .rest

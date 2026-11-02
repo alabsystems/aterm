@@ -224,12 +224,16 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
 
 impl CommandLineTools {
     fn install(sys: &dyn System) -> Result<(), String> {
+        Self::install_with(sys, true)
+    }
+
+    fn install_with(sys: &dyn System, allow_installer: bool) -> Result<(), String> {
         // A closed tab (SIGHUP), a Ctrl-C or a Ctrl-\ reaches this run, never `softwareupdate`
         // (its own process group): deferred, it lets the running step finish and the placeholder
         // guard remove the placeholder, which would otherwise refuse every later install, and
         // then ends the run as it would have, so a stop meant for a whole apply is not lost.
         let _stops = sys.defer_stops();
-        let installed = Self::install_placeheld(sys);
+        let installed = Self::install_placeheld(sys, allow_installer);
         if let Some(signal) = sys.stopped() {
             say(&format!(
                 "stopped by signal {signal} {}; nothing more of this run happens",
@@ -244,7 +248,7 @@ impl CommandLineTools {
     }
 
     /// The install with softwareupdate's on-demand placeholder in place, removed when it ends.
-    fn install_placeheld(sys: &dyn System) -> Result<(), String> {
+    fn install_placeheld(sys: &dyn System, allow_installer: bool) -> Result<(), String> {
         sys.create_new(Path::new(PLACEHOLDER), b"", 0o644)
             .map_err(|e| format!("{PLACEHOLDER}: {e}"))?;
         let _placeholder = Placeholder { sys };
@@ -259,6 +263,9 @@ impl CommandLineTools {
         }
         let labels = parse_labels(&listed);
         let Some(label) = pick(&labels) else {
+            if !allow_installer {
+                return Err("Apple's catalog has no Command Line Tools update yet; automatic setup will retry".into());
+            }
             return Self::through_installer(sys, &list);
         };
         let install = Cmd::new(SOFTWAREUPDATE)
@@ -291,6 +298,12 @@ impl CommandLineTools {
         }
         Ok(())
     }
+}
+
+/// Install through the background update service without a terminal, sudo prompt,
+/// or fallback to Apple's separate installer window. The caller verifies the toolchain.
+pub fn install_automatically(sys: &dyn System) -> Result<(), String> {
+    CommandLineTools::install_with(sys, false)
 }
 
 impl CommandLineTools {

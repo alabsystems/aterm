@@ -43,10 +43,10 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   aterm.app's first launch does this setup by itself; init is for SSH and CLI-only Macs,
   and Linux (the base layer, the vault and --clone; each Mac row reads \"macOS only\").
   Run it as yourself, without sudo; safe to run again. Over SSH too: what `aterm doctor`
-  restores, the ALab toolset and the Command Line Tools if missing (one sudo password). Then,
-  on this Mac's console account (remote or another login defers; preferences need a person):
+  restores, the ALab toolset and missing Command Line Tools automatically. Then,
+  in this Mac's console account (background and agent launches included; remote logins defer):
     {spotlight}
-    {secrets} (open default ALab joins automatically on the LAN; --vault may ask for a password)
+    {secrets} (default ALab joins automatically on the LAN; --vault may ask for a password)
     {permissions} (a row for each grant to switch on)
   and these three, all of them unless a flag names the ones to run:
     --profile   {profile}
@@ -58,7 +58,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   named (base, workstation, init.spotlight, ...); --develop records this checkout as a
   develop machine, fetched and provisioned each run, and --no-develop drops it.
   --converge runs one converge pass now, as the subscriber and window do; it asks nothing.
-  Exit: 0 done (what waits on an admin or a person at the console included); 75 waits on
+  Exit: 0 done; 75 waits on
   a lock (--no-wait) or a step, 77 a permission, 69 the network; 1 otherwise; 2 usage.
 ",
         spotlight = Setting::Spotlight.label(),
@@ -1206,6 +1206,15 @@ fn init_presence(sys: &dyn System) -> Presence {
     }
 }
 
+/// Automatic setup belongs to the console account's local session; a terminal or a
+/// person's keystroke is not a prerequisite for applying its selected defaults.
+const fn local_workstation(presence: Presence) -> bool {
+    matches!(
+        presence,
+        Presence::AtConsole | Presence::NoTerminal | Presence::AgentTab
+    )
+}
+
 /// Converge the requested base, workstation, and develop layers, each step a phase of `laps`:
 /// this login's context (and the develop layer's profile), the questions asked before any
 /// change (the vault's join password), then the layers ([`run_layers`]).
@@ -1221,8 +1230,6 @@ fn converge(
     } else {
         Mode::Plan
     };
-    // Preferences and repository setup remain a person's picks. Account sign-out also runs in
-    // the console user's graphic session with no terminal, but never from SSH or an agent tab.
     let presence = init_presence(sys);
     let restricted = options.choice.is_some_and(|choice| {
         choice.profile
@@ -1231,6 +1238,7 @@ fn converge(
     });
     if restricted
         && sys.macos()
+        && !local_workstation(presence)
         && let Some(why) = presence.why()
     {
         return Err(Refused::Usage(format!(
@@ -1434,22 +1442,32 @@ fn report_json(
 
 /// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`): a run
 /// left only by rows that stood aside exits with the first of 75, 77 and 69 one of them maps to
-/// ([`aterm_converge::StoodAside::exit_status`]). A row waiting on an admin counts as done
-/// ([`counts`]).
+/// ([`aterm_converge::StoodAside::exit_status`]). Pending prerequisites remain incomplete
+/// even when a subscriber will finish them without this process.
 fn status(rows: &[ItemReport], action: Action) -> u8 {
     if complete(rows, action) {
         return 0;
     }
-    let incomplete: Vec<&ItemReport> = rows.iter().filter(|row| !counts(row, action)).collect();
-    let codes: Option<Vec<u8>> = incomplete
+    let incomplete: Vec<&ItemReport> = rows
+        .iter()
+        .filter(|row| !complete(std::slice::from_ref(*row), action))
+        .collect();
+    let codes: Vec<u8> = incomplete
         .iter()
         .map(|row| {
-            row.stood_aside
-                .as_ref()
-                .map(aterm_converge::StoodAside::exit_status)
+            row.stood_aside.as_ref().map_or_else(
+                || match row.outcome {
+                    Outcome::Person => 77,
+                    Outcome::Blocked | Outcome::Deferred => 75,
+                    _ => 1,
+                },
+                aterm_converge::StoodAside::exit_status,
+            )
         })
         .collect();
-    let codes = codes.unwrap_or_default();
+    if codes.contains(&1) {
+        return 1;
+    }
     [75, 77, 69]
         .into_iter()
         .find(|code| codes.contains(code))
@@ -2320,7 +2338,7 @@ fn prepare_groups_with(
         choice,
         reading.only,
     );
-    if person {
+    if local_workstation(presence) {
         groups.push((
             permissions(grants, choice.sign_out),
             workstation_place(Class::Person),
@@ -2496,11 +2514,6 @@ fn away_from_console(presence: Presence) -> Group {
     )
 }
 
-/// Whether `row` is the deferred stand-in for the workstation rows ([`AwayFromConsole`]).
-fn waits_for_a_person(row: &ItemReport) -> bool {
-    row.id == AWAY && row.outcome == Outcome::Deferred
-}
-
 /// A group whose items could not be built (an init.toml that cannot be read, a keyboard list
 /// in words this build does not read): one row says why, and every other group still runs.
 struct Unbuilt {
@@ -2549,11 +2562,11 @@ fn built(
 }
 
 /// Workstation item groups in run order, each paired with its [`Place`]: for a person at the
-/// console (`presence`), the groups `choice` picks, Rust in Spotlight and fseventsd's memory
+/// console session (`presence`), the groups `choice` picks, Rust in Spotlight and fseventsd's memory
 /// ([`crate::init_fseventsd`], restarted only when the run's `only` words name it),
-/// with the keyboard list unread (`keyboards`) the Caps Lock rows one row saying why; with no
-/// terminal the account sign-out still runs, while preferences and agent or remote runs defer
-/// ([`AwayFromConsole`]). Then the vault, and its GitHub profile (`github`, already built) when
+/// with the keyboard list unread (`keyboards`) the Caps Lock rows one row saying why. Agent and
+/// background launches select the same defaults; remote runs defer ([`AwayFromConsole`]).
+/// Then the vault, and its GitHub profile (`github`, already built) when
 /// `choice` clones.
 fn groups(
     ctx: &Ctx,
@@ -2565,13 +2578,12 @@ fn groups(
     only: &[String],
 ) -> Vec<Group> {
     let place = workstation_place;
-    let person = presence == Presence::AtConsole;
-    let account_console = person || (choice.sign_out && presence == Presence::NoTerminal);
+    let local = local_workstation(presence);
     let mut groups = Vec::new();
-    if !account_console {
+    if !local {
         groups.push(away_from_console(presence));
     }
-    if person && choice.profile {
+    if local && choice.profile {
         let preferences = match keyboards {
             None => built(
                 "init.preferences",
@@ -2620,7 +2632,7 @@ fn groups(
             place(Class::Preference),
         ));
     }
-    if person {
+    if local {
         groups.push((
             built(
                 crate::init_spotlight::ID,
@@ -2636,7 +2648,7 @@ fn groups(
             crate::init_fseventsd::place(),
         ));
     }
-    if account_console && choice.sign_out {
+    if local && choice.sign_out {
         groups.push((
             built(
                 ACCOUNTS_GROUP,
@@ -3173,18 +3185,13 @@ fn complete(rows: &[ItemReport], action: Action) -> bool {
     !rows.is_empty() && rows.iter().all(|row| counts(row, action))
 }
 
-/// Whether `row` counts as done for `action`: a row that waits on an admin's approval does
-/// ([`waits_by_itself`]). For a run that is not `--check`, a grant only the person switches on
-/// ([`is_grant`]) and the workstation rows deferred to a person at this Mac's console
-/// ([`waits_for_a_person`]) are not this run's to finish, so an apply or a plan completes with
-/// them, naming them; `--check` still reads them as not verified.
+/// Whether `row` is verified for `action`. Waiting for admission, a permission, or the
+/// console does not complete an item, even when its continuation is already scheduled.
 fn counts(row: &ItemReport, action: Action) -> bool {
     matches!(
         row.outcome,
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     ) || (action == Action::Plan && row.outcome == Outcome::Planned)
-        || waits_by_itself(row)
-        || (action != Action::Check && (is_grant(row) || waits_for_a_person(row)))
 }
 
 /// Whether `row` is one of the Permissions phase's grants ([`Permission`]) waiting for the
@@ -4294,7 +4301,7 @@ mod tests {
         sys.euid = 501;
         let profile =
             b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n";
-        let path = "/Users//alice/.config/aterm/init.toml";
+        let path = "/Users/alice/.config/aterm/init.toml";
         sys.file(path, profile).stat_of(
             path,
             Stat {
@@ -4733,7 +4740,6 @@ mod tests {
             Remedy::Develop.command().unwrap(),
         ];
         for text in [
-            crate::init_clt::NO_TTY,
             crate::items::developer::LOW_DATA,
             crate::init_github::NEEDS_GIT,
             crate::controller::github::NO_GIT,
@@ -4793,7 +4799,7 @@ mod tests {
     }
 
     #[test]
-    fn base_clt_runs_after_the_base_hold_is_released_and_blocks_without_a_terminal() {
+    fn base_clt_runs_after_the_base_hold_is_released_without_a_terminal() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Held(Arc<AtomicBool>);
@@ -4826,17 +4832,25 @@ mod tests {
             ..ctx(&[alice])
         };
         let sys = Fake::default();
+        sys.on(
+            "/usr/sbin/softwareupdate -l",
+            Ran::ok("No new software available."),
+        );
         let rows = run(&sys, &ctx, base, &[], Mode::Apply, &mut NoJournal).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let row = &rows[0];
         assert_eq!(row.id, crate::init_clt::ID);
-        assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+        assert_eq!(
+            row.outcome,
+            Outcome::Failed,
+            "an empty catalog cannot verify the install: {row:?}"
+        );
         assert_eq!(row.layer, Some(Layer::Base));
-        assert_eq!(row.class, Some(Class::Elevate));
+        assert_eq!(row.class, Some(Class::Install));
         assert!(
             row.why
                 .as_deref()
-                .is_some_and(|why| why.ends_with("run `aterm init --only base.clt` in a terminal")),
+                .is_some_and(|why| why.contains("automatic setup will retry")),
             "{row:?}"
         );
         let saw = saw.lock().unwrap();
@@ -4844,7 +4858,16 @@ mod tests {
             !saw.is_empty() && saw.iter().all(|&released| released),
             "{saw:?}"
         );
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        assert!(
+            sys.calls()
+                .iter()
+                .any(|call| call.contains("softwareupdate -l"))
+        );
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("sudo") && !call.starts_with("tty "))
+        );
     }
 
     /// `base.pkg.toolset` READS ONLY ONCE THE BASE LAYER LET THE STORE LOCK GO (its passes
@@ -5112,9 +5135,9 @@ mod tests {
                 assert!(!sys.calls().iter().any(|call| call.contains("defaults")
                     || call.contains("hidutil")
                     || call.contains("accounts.data")));
-                assert_eq!(status(&rows, Action::Apply), 0);
-                assert_eq!(status(&rows, Action::Plan), 0);
-                assert_eq!(status(&rows, Action::Check), 1);
+                assert_eq!(status(&rows, Action::Apply), 75);
+                assert_eq!(status(&rows, Action::Plan), 75);
+                assert_eq!(status(&rows, Action::Check), 75);
             }
         }
         assert!(
@@ -5166,7 +5189,7 @@ mod tests {
             assert_eq!(rows.len(), 1, "{rows:?}");
             assert_eq!(rows[0].outcome, Outcome::Deferred);
             assert_eq!(rows[0].why, Presence::Remote.needs_person());
-            assert_eq!(status(&rows, Action::Apply), 0);
+            assert_eq!(status(&rows, Action::Apply), 75);
             assert!(
                 !sys.calls().iter().any(|call| call.contains("hidutil")),
                 "{:?}",
@@ -5175,42 +5198,23 @@ mod tests {
         }
     }
 
-    /// From an agent's tool call (no terminal), in the console's own session, init runs the
-    /// base layer, account sign-out, and the recorded vault and GitHub profile, but leaves the
-    /// other personal rows to the person. An agent's tab leaves sign-out out too: no `killall`,
-    /// no `rustup set profile`, and the vault is never probed or asked. Control: a person at
-    /// the console gets every row.
+    /// Local background and agent launches select the same defaults as a terminal launch.
     #[test]
-    fn without_a_person_at_the_console_init_runs_only_account_sign_out() {
-        let bound_classes = |sys: &Fake, groups: &[Group], ctx: &Ctx| {
-            crate::engine::bind(
-                groups.iter().flat_map(|(items, place)| {
-                    items.iter().map(move |item| (item.as_ref(), place.clone()))
-                }),
-                sys,
-                ctx,
-            )
-            .iter()
-            .map(|b| (b.id(), b.class()))
-            .collect::<Vec<_>>()
-        };
-        let personal = [Class::Preference, Class::Asked];
-        for (terminal, agent, presence) in [
-            (false, None, Presence::NoTerminal),
-            (true, Some("Claude Code"), Presence::AgentTab),
-            (true, None, Presence::AtConsole),
+    fn local_init_composes_every_group_without_a_person_or_terminal() {
+        for (terminal, agent) in [
+            (false, None),
+            (false, Some("Codex")),
+            (true, Some("Claude Code")),
+            (true, None),
         ] {
             let mut sys = alice_at(501);
             sys.terminal = terminal;
             sys.agent = agent;
-            assert_eq!(crate::console::presence(&sys), presence);
             let (ctx, _) = local_context(&sys).unwrap();
-            assert!(ctx.console.is_some(), "the console's own session");
             let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
                 crate::init_secrets::tests::unconfigured(),
             )]);
-            let port = Arc::clone(&vault);
-            let groups = prepare_groups_with(
+            let (groups, choice) = prepare_groups_with(
                 &sys,
                 &ctx,
                 Mode::Apply,
@@ -5221,71 +5225,31 @@ mod tests {
                     choice: None,
                 },
                 no_grants,
-                move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
-            )
-            .unwrap()
-            .0;
-            let bound = bound_classes(&sys, &groups, &ctx);
-            if presence == Presence::AtConsole {
-                assert!(
-                    bound
-                        .iter()
-                        .any(|(id, _)| id == "init.spotlight.rustup-profile@alice"),
-                    "{bound:?}"
-                );
-                assert!(
-                    bound.iter().any(|(_, class)| *class == Class::Preference),
-                    "{bound:?}"
-                );
-                assert_eq!(vault.probes(), 1, "a person's run looks for the ALab vault");
-                continue;
-            }
-            let personal_rows = bound
-                .iter()
-                .filter(|(_, class)| personal.contains(class))
-                .collect::<Vec<_>>();
-            if presence == Presence::NoTerminal {
-                assert_eq!(personal_rows.len(), 2, "{bound:?}");
-                assert!(
-                    personal_rows
-                        .iter()
-                        .all(|(id, _)| id.contains(".signed-out@")),
-                    "{bound:?}"
-                );
-            } else {
-                assert!(personal_rows.is_empty(), "{bound:?}");
-            }
-            assert_eq!(vault.probes(), 0, "nobody to ask: no look for the vault");
-            let rows = run(
-                &sys,
-                &ctx,
-                Base::none(),
-                &groups,
-                Mode::Apply,
-                &mut NoJournal,
+                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
             )
             .unwrap();
-            let away = rows.iter().find(|row| row.id == AWAY);
-            if presence == Presence::NoTerminal {
-                assert!(away.is_none(), "account sign-out has no stand-in: {rows:?}");
-            } else {
-                let away = away.expect("the stand-in");
-                assert_eq!(away.outcome, Outcome::Deferred);
-                assert_eq!(away.why, presence.needs_person());
+            assert_eq!(choice, Choice::ALL);
+            let ids: Vec<String> = groups
+                .iter()
+                .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+                .collect();
+            assert!(!ids.iter().any(|id| id == AWAY), "{ids:?}");
+            for expected in [
+                "init.spotlight.rustup-profile@alice",
+                "init.messages.signed-out@alice",
+                "init.facetime.signed-out@alice",
+            ] {
+                assert!(ids.iter().any(|id| id == expected), "{expected}: {ids:?}");
             }
-            let calls = sys.calls();
-            for change in ["killall", "set profile", "defaults write"] {
-                assert!(
-                    !calls.iter().any(|call| call.contains(change)),
-                    "{change}: {calls:?}"
-                );
-            }
-            if presence != Presence::NoTerminal {
-                assert!(
-                    !calls.iter().any(|call| call.contains("osascript")),
-                    "{calls:?}"
-                );
-            }
+            assert!(
+                groups
+                    .iter()
+                    .any(|(_, place)| place.class == Class::Preference)
+            );
+            assert!(
+                !sys.calls().iter().any(|call| call.starts_with("ask ")),
+                "background setup asks nothing"
+            );
         }
     }
 
@@ -5430,10 +5394,9 @@ mod tests {
             id: "init.secrets@alice".into(),
             ..row(Outcome::Blocked, waiting())
         };
-        // A vault join an admin has yet to approve, made now or on an earlier run, is done
-        // for this run: the subscriber finishes it.
+        // A vault join remains incomplete until the subscriber verifies admission.
         for action in [Action::Apply, Action::Check] {
-            assert_eq!(status(&[done.clone(), vault()], action), 0);
+            assert_eq!(status(&[done.clone(), vault()], action), 75);
         }
         // A row waiting for that join is left for another run.
         assert_eq!(
@@ -5442,7 +5405,7 @@ mod tests {
         );
         assert_eq!(
             status(&[vault(), row(Outcome::Blocked, offline())], Action::Apply),
-            69
+            75
         );
         assert_eq!(
             status(
@@ -5609,6 +5572,22 @@ mod tests {
                 assert!(!complete(&[row.clone()], action));
             }
         }
+        row.id = "init.secrets@alice".into();
+        row.outcome = Outcome::Blocked;
+        row.stood_aside = Some(aterm_converge::StoodAside::Waiting(
+            "admission pending".into(),
+        ));
+        assert!(!complete(&[row.clone()], Action::Apply));
+        assert_eq!(status(&[row.clone()], Action::Apply), 75);
+        row.id = "init.permissions.full-disk-access".into();
+        row.outcome = Outcome::Person;
+        row.stood_aside = None;
+        assert!(!complete(&[row.clone()], Action::Apply));
+        assert_eq!(status(&[row.clone()], Action::Apply), 77);
+        row.id = AWAY.into();
+        row.outcome = Outcome::Deferred;
+        assert!(!complete(&[row.clone()], Action::Apply));
+        assert_eq!(status(&[row.clone()], Action::Apply), 75);
         row.outcome = Outcome::Planned;
         assert!(complete(&[row.clone()], Action::Plan));
         assert!(!complete(&[row.clone()], Action::Apply));
@@ -5628,8 +5607,8 @@ mod tests {
             len: 0,
         };
         sys.stat_of("/dev/console", owned(console_uid, false));
-        sys.stat_of("/Users//alice", owned(501, true));
-        sys.stat_of("/Users//alice/aterm", owned(501, true));
+        sys.stat_of("/Users/alice", owned(501, true));
+        sys.stat_of("/Users/alice/aterm", owned(501, true));
         sys.on(
             &crate::facts::hidutil_keyboards().display(),
             Ran::ok("Services:\n\nDevices:\n"),
@@ -5637,7 +5616,7 @@ mod tests {
         let alice = user("alice", 501);
         sys.write_user_file(
             &alice,
-            Path::new("/Users//alice/aterm/Cargo.toml"),
+            Path::new("/Users/alice/aterm/Cargo.toml"),
             crate::checkout::tests::manifest(Path::new("/srv/origin.git")).as_bytes(),
             0o644,
         )
@@ -5645,7 +5624,7 @@ mod tests {
         if let Some(profile) = profile {
             sys.write_user_file(
                 &alice,
-                Path::new("/Users//alice/.config/aterm/init.toml"),
+                Path::new("/Users/alice/.config/aterm/init.toml"),
                 profile.as_bytes(),
                 0o600,
             )
@@ -5719,7 +5698,7 @@ mod tests {
                     base: &base,
                     groups: &groups,
                     targo: None,
-                    cwd: Some(Path::new("/Users//alice/aterm")),
+                    cwd: Some(Path::new("/Users/alice/aterm")),
                     records: &NoRecords,
                     on_row: &|_| {},
                 },
@@ -5843,13 +5822,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|call| call == "alice$ write /Users//alice/.config/aterm/init.toml 600"),
+                .any(|call| call == "alice$ write /Users/alice/.config/aterm/init.toml 600"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|call| call.contains("git -C /Users//alice/aterm")),
+                .any(|call| call.contains("git -C /Users/alice/aterm")),
             "{calls:?}"
         );
     }
@@ -5971,7 +5950,7 @@ mod tests {
                 let alice = user("alice", 501);
                 sys.write_user_file(
                     &alice,
-                    Path::new("/Users//alice/.config/aterm/init.toml"),
+                    Path::new("/Users/alice/.config/aterm/init.toml"),
                     profile.as_bytes(),
                     mode,
                 )
@@ -6053,7 +6032,7 @@ mod tests {
                     "",
                 );
                 sys.on(
-                    &crate::checkout::git(&sys, &alice, Some(Path::new("/Users//alice/aterm")))
+                    &crate::checkout::git(&sys, &alice, Some(Path::new("/Users/alice/aterm")))
                         .args(["ls-remote", "--symref", "origin", "HEAD"])
                         .display(),
                     Ran::exit(128, stderr),
@@ -6213,9 +6192,9 @@ mod tests {
     /// own shell the same item is blocked and its apply never runs.
     #[test]
     fn doctor_s_rust_docs_repair_is_a_relay_item_of_the_account_s_own() {
-        const RUSTUP: &str = "alice$ CARGO_HOME=/Users//alice/.cargo \
-                              RUSTUP_HOME=/Users//alice/.rustup /Users//alice/.cargo/bin/rustup";
-        const STABLE: &str = "/Users//alice/.rustup/toolchains/stable-aarch64-apple-darwin";
+        const RUSTUP: &str = "alice$ CARGO_HOME=/Users/alice/.cargo \
+                              RUSTUP_HOME=/Users/alice/.rustup /Users/alice/.cargo/bin/rustup";
+        const STABLE: &str = "/Users/alice/.rustup/toolchains/stable-aarch64-apple-darwin";
         let remove =
             format!("{RUSTUP} component remove rust-docs --toolchain stable-aarch64-apple-darwin");
         let mac = || {
@@ -6225,7 +6204,7 @@ mod tests {
             sys.create_dir_all(Path::new(&format!("{html}/std")), 0o755)
                 .unwrap();
             sys.file(&format!("{html}/std/index.html"), b"<html>")
-                .file("/Users//alice/.cargo/bin/rustup", b"")
+                .file("/Users/alice/.cargo/bin/rustup", b"")
                 .on(
                     &format!("{RUSTUP} toolchain list"),
                     Ran::ok("stable-aarch64-apple-darwin (active, default)\n"),
@@ -6238,7 +6217,7 @@ mod tests {
                 .on_write(&remove, Path::new(&record), b"cargo-aarch64-apple-darwin\n");
             let setup = sys.calls().len();
             (
-                Doctor::over(sys, Some(PathBuf::from("/Users//alice")), None),
+                Doctor::over(sys, Some(PathBuf::from("/Users/alice")), None),
                 setup,
             )
         };
@@ -7080,10 +7059,9 @@ mod tests {
         );
     }
 
-    /// Account sign-out runs in the console user's graphic session with no terminal; an agent
-    /// tab stays refused, and preferences still need a person at the console.
+    /// All local launchers can apply explicitly selected defaults in the console session.
     #[test]
-    fn sign_out_runs_without_a_terminal_but_not_from_an_agent_tab() {
+    fn selected_workstation_defaults_run_from_local_agent_and_background_launches() {
         let options = Options {
             choice: Some(Choice {
                 sign_out: true,
@@ -7099,9 +7077,9 @@ mod tests {
         };
         for (terminal, agent, allowed) in [
             (false, None, true),
-            (false, Some("Claude Code"), false),
-            (false, Some("Codex"), false),
-            (true, Some("Claude Code"), false),
+            (false, Some("Claude Code"), true),
+            (false, Some("Codex"), true),
+            (true, Some("Claude Code"), true),
             (true, None, true),
         ] {
             let mut sys = alice_with_checkout(501, None);
@@ -7134,6 +7112,7 @@ mod tests {
         let ids: Vec<String> = accounts
             .iter()
             .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+            .filter(|id| id.contains(".signed-out@"))
             .collect();
         assert_eq!(
             ids,
@@ -7151,10 +7130,7 @@ mod tests {
         };
         let mut sys = alice_with_checkout(501, None);
         sys.terminal = false;
-        assert!(matches!(
-            converge_with(&sys, &preferences, &groups, &NoRecords),
-            Err(Refused::Usage(_))
-        ));
+        assert!(converge_with(&sys, &preferences, &groups, &NoRecords).is_ok());
     }
 
     #[test]
@@ -7261,9 +7237,10 @@ mod tests {
             .iter()
             .find(|row| row.outcome == Outcome::Person)
             .expect("the grant only the person switches on");
-        assert!(counts(person, Action::Apply) && !counts(person, Action::Check));
+        assert!(!counts(person, Action::Apply) && !counts(person, Action::Check));
         assert!(tally(&reported, Action::Apply).ends_with("needs you: Full Disk Access"));
-        assert_eq!(status(&reported, Action::Apply), 0, "{reported:?}");
+        assert!(!complete(&reported, Action::Apply));
+        assert_eq!(status(&reported, Action::Apply), 77, "{reported:?}");
     }
 
     #[test]

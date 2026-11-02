@@ -4567,7 +4567,7 @@ fn subscriber_pass_saying(
 const LONG_POLL: Duration = crate::server::DEFAULT_HOLD;
 
 /// How often a machine still waiting asks again ([`ask_again_if_due`]).
-const REASK: u64 = 60 * 60;
+const REASK: u64 = 30;
 
 /// How long a join has, from saving the vault, to post its own request ([`in_flight`]).
 const JOIN_GRACE: u64 = 5 * 60;
@@ -4577,7 +4577,7 @@ const JOIN_GRACE: u64 = 5 * 60;
 /// without the join's proof, would make the join's own request a change the server refuses for
 /// a while; a join cut off before it posts is asked for after the grace, not an hour on.
 fn in_flight() -> u64 {
-    now().saturating_sub(REASK - JOIN_GRACE)
+    now().saturating_add(JOIN_GRACE.saturating_sub(REASK))
 }
 
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
@@ -4594,7 +4594,7 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
         // post of the `Allowed` can miss.
         let waiting = state.membership == Stored::Pending
             || (state.membership == Stored::In && handover::holds_allowed(paths));
-        Ok((waiting && now().saturating_sub(state.requested) >= REASK)
+        Ok((waiting && now() >= state.requested.saturating_add(REASK))
             .then_some((current, state.proof)))
     };
     let Ok(Some((current, proof))) = due() else {
@@ -4640,7 +4640,9 @@ fn admin_here(
     config: &Config,
     state: &State,
 ) -> crate::Result<Option<Option<Approval>>> {
-    Ok(admin_text_here(paths, config, state)?.map(|opened| Approval::of(&opened.doc)))
+    Ok(admin_text_here(paths, config, state)?.map(|opened| {
+        Approval::of(&opened.doc).or_else(|| alab_vault(config).then_some(Approval::Open))
+    }))
 }
 
 /// The admin text of the recorded vault from the local cache, when this machine is its admin.
@@ -5555,8 +5557,8 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         }
     };
     let by = match approval {
+        _ if alab_vault(&config) => "by the default ALab LAN policy",
         Some(Approval::Password) => "by the join password",
-        Some(Approval::Open) if alab_vault(&config) => "by the default ALab LAN policy",
         Some(Approval::Open) | None => ALLOWED_BY,
     };
     let judged: std::collections::BTreeSet<Judged> = pending.iter().map(Judged::of).collect();
@@ -5971,8 +5973,9 @@ fn auto_approve_listed_in(
                     &request,
                 )
             });
+        let lan = default_alab && request.lan && !code_only.contains(&request.recipient);
         let approval = policy.filter(|approval| approval.reads(&request));
-        if !allowed && approval.is_none() {
+        if !allowed && !lan && approval.is_none() {
             if !members.contains(&request.recipient) {
                 done.asking.push(Asking::of(&request));
             }
@@ -5982,11 +5985,7 @@ fn auto_approve_listed_in(
         if !members.contains(&request.recipient) {
             let method = if allowed {
                 Some(AdmissionMethod::Manual)
-            } else if default_alab
-                && approval == Some(Approval::Open)
-                && request.lan
-                && !code_only.contains(&request.recipient)
-            {
+            } else if lan {
                 Some(AdmissionMethod::Open)
             } else if approval == Some(Approval::Password)
                 && key.zip(request.proof.as_ref()).is_some_and(|(key, proof)| {
@@ -12885,7 +12884,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_lan_admission_requires_the_default_pin_open_policy_and_an_unrevoked_key() {
+    fn automatic_lan_admission_requires_the_default_pin_and_an_unrevoked_key() {
         let root = aterm_tempfile::tempdir().unwrap();
         let socket = bound();
         let server = serve(&root.path().join("store"), &socket);
@@ -12926,9 +12925,10 @@ mod tests {
             "no personal-vault admission"
         );
         admin.published_doc.set_open(false).unwrap();
+        requests[0].lan = false;
         assert!(
             judge(&admin, &requests, true).approved.is_empty(),
-            "closed policy"
+            "a non-LAN request still needs admission"
         );
         admin
             .published_doc
@@ -12936,9 +12936,10 @@ mod tests {
             .unwrap();
         assert!(
             judge(&admin, &requests, true).approved.is_empty(),
-            "password policy"
+            "a non-LAN request without the password stays out"
         );
         admin.published_doc.set_open(true).unwrap();
+        requests[0].lan = true;
         admin
             .published_doc
             .add_code_only(&requests[0].recipient)
@@ -12951,6 +12952,47 @@ mod tests {
         let done = retiring(Vec::new(), signer, || auto_approve(&paths)).unwrap();
         assert_eq!(done.approved, ["m2"]);
         server.stop();
+    }
+
+    #[test]
+    fn default_lan_admission_does_not_require_the_legacy_join_opt_in() {
+        for policy in ["absent", "password", "open"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let socket = bound();
+            let server = serve(&root.path().join("store"), &socket);
+            let url = format!("http://{}/v1/alab", server.addr);
+            let paths = Paths::for_home(&root.path().join("m1"));
+            let created = create(&paths, &url, None, Some("m1")).unwrap();
+            let newcomer = Paths::for_home(&root.path().join("m2"));
+            join_pinned(&newcomer, &format!("{url}#{}", created.signer), "m2");
+            let mut admin = admin_open(&paths).unwrap();
+            admin.published_doc.set_open(false).unwrap();
+            admin.published_doc.set_join_password(None).unwrap();
+            if policy == "password" {
+                admin
+                    .published_doc
+                    .set_join_password(Some(b"fixture-password-for-automatic-lan-tests"))
+                    .unwrap();
+            } else if policy == "open" {
+                admin.published_doc.set_open(true).unwrap();
+            }
+            let pending = requests_for(&admin.config, None).unwrap();
+            assert!(pending[0].lan);
+            assert!(pending[0].allowed.is_none() && pending[0].proof.is_none());
+            let done = auto_approve_listed_in(
+                &paths,
+                &admin,
+                &pending,
+                &mut false,
+                &mut BTreeSet::new(),
+                &mut JoinKeys::default(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(done.approved, ["m2"], "legacy policy: {policy}");
+            assert!(done.asking.is_empty(), "no manual admission: {policy}");
+            server.stop();
+        }
     }
 
     fn serve_apart(

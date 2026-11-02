@@ -39,7 +39,7 @@ fn spent_init_follow_ups(root: &Path) -> Withholding {
         );
         assert!(!doctor.notification_center_cleared());
         if attempt == 1 {
-            doctor.wait(SECOND_TRY_AFTER);
+            doctor.wait(RETRY_AFTER);
         }
     }
     let owed = load_withheld(root).unwrap();
@@ -129,7 +129,7 @@ fn automatic_withheld_readable_debt_holds_the_same_admitted_run() {
     let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
     assert_eq!(
         (row.status.as_str(), row.detail.as_str()),
-        ("blocked", HELD)
+        ("blocked", WAITING)
     );
     assert_eq!(doctor.notification_center_writes(), 4);
     assert_eq!(

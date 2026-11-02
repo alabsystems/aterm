@@ -1749,31 +1749,31 @@ mod tests {
         };
         let (mut named, mut pending) = (BTreeSet::new(), Vec::new());
         let settings = [
-            include("file:/Users//alice/.gitconfig", Some("~/work.inc")),
-            include("file:/Users//alice/.config/git/config", Some("work.inc")),
+            include("file:/Users/alice/.gitconfig", Some("~/work.inc")),
+            include("file:/Users/alice/.config/git/config", Some("work.inc")),
             include("file:/etc/gitconfig", Some("/opt/shared.inc")),
-            include("file:/Users//alice/.gitconfig", Some("~/work.inc")),
+            include("file:/Users/alice/.gitconfig", Some("~/work.inc")),
             listed(&[("credential.helper", Some("x"))]).remove(0),
         ];
         includes(&settings, &who, 1, &mut named, &mut pending).unwrap();
         assert_eq!(
             pending,
             [
-                (PathBuf::from("/Users//alice/work.inc"), 1),
-                (PathBuf::from("/Users//alice/.config/git/work.inc"), 1),
+                (PathBuf::from("/Users/alice/work.inc"), 1),
+                (PathBuf::from("/Users/alice/.config/git/work.inc"), 1),
                 (PathBuf::from("/opt/shared.inc"), 1),
             ]
         );
         for unresolvable in [
-            include("file:/Users//alice/.gitconfig", Some("~other/work.inc")),
-            include("file:/Users//alice/.gitconfig", Some("%(prefix)/work.inc")),
+            include("file:/Users/alice/.gitconfig", Some("~other/work.inc")),
+            include("file:/Users/alice/.gitconfig", Some("%(prefix)/work.inc")),
             include("command line:", Some("work.inc")),
-            include("file:/Users//alice/.gitconfig", None),
+            include("file:/Users/alice/.gitconfig", None),
         ] {
             let why = includes(&[unresolvable], &who, 1, &mut named, &mut pending).unwrap_err();
             assert!(why.contains("cannot resolve"), "{why}");
         }
-        let deep = include("file:/Users//alice/.gitconfig", Some("/deep.inc"));
+        let deep = include("file:/Users/alice/.gitconfig", Some("/deep.inc"));
         assert!(
             includes(
                 std::slice::from_ref(&deep),
@@ -1795,7 +1795,7 @@ mod tests {
         let who = alice();
         let mut every = script::configured_settings(&who, "bot");
         every.push_str(&script::printed(&[(
-            "/Users//alice/.gitconfig",
+            "/Users/alice/.gitconfig",
             "includeif.hasconfig:remote.*.url:https://github.com/**.path",
             "~/github.inc",
         )]));
@@ -1806,7 +1806,7 @@ mod tests {
         ] {
             let sys = Fake::default();
             sys.on(&script::helpers(&who), Ran::ok(&every));
-            let inc = "/Users//alice/github.inc";
+            let inc = "/Users/alice/github.inc";
             sys.on(
                 &script::included(&who, inc),
                 Ran::ok(&format!("file:{inc}\0{file}\0")),
